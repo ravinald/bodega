@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -13,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/plannedfs"
 	"sigs.k8s.io/yaml"
 )
 
@@ -430,7 +430,7 @@ func (e GoEnv) Uncertified(u *url.URL) string {
 	data, planned := e.Planned[file]
 	if !planned {
 		// An absent file assigns nothing, and GOROOT/go.env still applies.
-		data, _ = os.ReadFile(file)
+		data, _ = plannedfs.ReadFile(file)
 	}
 	if u := GoEnvUncertified(file, data, u); u != "" {
 		return u

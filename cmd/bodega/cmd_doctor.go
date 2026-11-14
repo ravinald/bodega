@@ -29,6 +29,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/provenance"
 )
@@ -740,6 +741,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			return fmt.Errorf("--ca-file: %w. Nothing was written", err)
 		}
 		changes, caStep, caOSStore = in.Changes, in.Step, in.System
+		if err := plannedCA(changes, *ca, caOwed, caOSStore, h.Base); err != nil {
+			return fmt.Errorf("--ca-file: %w", err)
+		}
 	}
 	changed := 0
 	for _, c := range changes {
@@ -1019,11 +1023,54 @@ func owedTrustChecks(records []clientconf.PlanRecord) []string {
 // judged against what it reads today: the store as it stands and the files
 // the plan wrote for it.
 func unreadCA(owed, osStore []string, base string) error {
+	parts, err := judgeCA(owed, osStore, base, doctorRebuiltRoots)
+	if err != nil {
+		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the CA is written, and %s", strings.Join(parts, "\nAlso, "))
+}
+
+// plannedCA judges the plan before anything is written: the same verdicts
+// unreadCA reads after the install, over the host's files as changes would
+// leave them and a system store holding ca beside what it holds today. A
+// client the install would leave refusing, unchecked or unverified is
+// refused here instead, so a refusal never follows a write.
+func plannedCA(changes []clientconf.Change, ca clientconf.CA, owed, osStore []string, base string) error {
+	files := map[string][]byte{}
+	for _, c := range changes {
+		if !c.Unchanged() {
+			files[c.Target] = c.New
+		}
+	}
+	var parts []string
+	err := plannedfs.With(files, func() error {
+		var err error
+		parts, err = judgeCA(owed, osStore, base, func() []*x509.Certificate {
+			return append(doctorRebuiltRoots(), ca.Certs...)
+		})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("whether the clients this plan installs the CA for would verify bodega's certificate could not be checked: %w. Nothing was written. Re-run once bodega answers", err)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("with this plan applied, %s\nNothing was written", strings.Join(parts, "\nAlso, "))
+}
+
+// judgeCA is each owed check's verdict, as the lines of the error they make,
+// none when every client verifies bodega. rebuilt is the system store the
+// clients in osStore read once the rebuild has run.
+func judgeCA(owed, osStore []string, base string, rebuilt func() []*x509.Certificate) ([]string, error) {
 	checks := host.TrustSystems()
-	var rebuilt, own []string
+	var rebuiltChecks, own []string
 	for _, check := range owed {
 		if slices.Contains(osStore, checks[check]) {
-			rebuilt = append(rebuilt, check)
+			rebuiltChecks = append(rebuiltChecks, check)
 		} else {
 			own = append(own, check)
 		}
@@ -1031,7 +1078,7 @@ func unreadCA(owed, osStore []string, base string) error {
 	probe := doctorTrustProbe()
 	verdicts, err := probe.Judge(own, base)
 	if err != nil {
-		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
+		return nil, err
 	}
 	loaded := probe.System
 	if loaded == nil {
@@ -1042,15 +1089,15 @@ func unreadCA(owed, osStore []string, base string) error {
 		if err == nil {
 			return nil
 		}
-		roots := doctorRebuiltRoots()
+		roots := rebuilt()
 		if len(roots) == 0 {
 			return err
 		}
 		return host.VerifyServed(chain, name, roots)
 	}
-	more, err := probe.Judge(rebuilt, base)
+	more, err := probe.Judge(rebuiltChecks, base)
 	if err != nil {
-		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
+		return nil, err
 	}
 	verdicts = append(verdicts, more...)
 	slices.SortFunc(verdicts, func(a, b host.TrustVerdict) int { return strings.Compare(a.Check, b.Check) })
@@ -1086,10 +1133,7 @@ func unreadCA(owed, osStore []string, base string) error {
 			"  Unset the variable or correct the setting that sends the client elsewhere (a registry or index the environment names, a configuration file read in place of the one written), then re-run",
 			len(absent), strings.Join(absent, "\n")))
 	}
-	if len(parts) == 0 {
-		return nil
-	}
-	return fmt.Errorf("the CA is written, and %s", strings.Join(parts, "\nAlso, "))
+	return parts, nil
 }
 
 // doctorRebuiltRoots reads the system trust store from the files its rebuild

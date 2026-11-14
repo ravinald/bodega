@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // Plan actions. install is a file to write; refuse is a system the host's
@@ -226,7 +227,7 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 		return Change{}, fmt.Errorf("%s: %w", rec.System, err)
 	}
 	c := Change{Record: rec, Target: target, New: content, planned: content}
-	info, err := os.Stat(target)
+	info, err := plannedfs.Stat(target)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return c, nil
@@ -235,7 +236,7 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	case !info.Mode().IsRegular():
 		return Change{}, fmt.Errorf("%s exists and is not a regular file; move it aside, then re-run. Nothing was written", target)
 	}
-	if c.Old, err = os.ReadFile(target); err != nil {
+	if c.Old, err = plannedfs.ReadFile(target); err != nil {
 		return Change{}, fmt.Errorf("read %s: %w", target, err)
 	}
 	c.Existed = true
@@ -372,14 +373,14 @@ const wOK = 0x2
 // writable asks whether this process could write path, creating its parent
 // directories if they are missing.
 func writable(path string) error {
-	if _, err := os.Stat(path); err == nil {
+	if _, err := plannedfs.Stat(path); err == nil {
 		if err := syscall.Access(path, wOK); err != nil {
 			return err
 		}
 	}
 	dir := filepath.Dir(path)
 	for {
-		if _, err := os.Stat(dir); err == nil {
+		if _, err := plannedfs.Stat(dir); err == nil {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -393,11 +394,11 @@ func writable(path string) error {
 
 // copyFile copies src to dst with src's mode, refusing to overwrite dst.
 func copyFile(src, dst string) error {
-	info, err := os.Stat(src)
+	info, err := plannedfs.Stat(src)
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(src)
+	data, err := plannedfs.ReadFile(src)
 	if err != nil {
 		return err
 	}

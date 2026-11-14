@@ -2,11 +2,12 @@ package clientconf
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // This file ports APT 3.0.3's configuration loader: ReadConfigFile and
@@ -86,7 +87,7 @@ func isRegular(path string) bool {
 }
 
 func isDir(path string) bool {
-	info, err := os.Stat(path)
+	info, err := plannedfs.Stat(path)
 	return err == nil && info.IsDir()
 }
 
@@ -96,7 +97,7 @@ type aptLoader struct {
 }
 
 func (l *aptLoader) file(name string, depth int) error {
-	data, err := os.ReadFile(name)
+	data, err := plannedfs.ReadFile(name)
 	if err != nil {
 		return fmt.Errorf("%s could not be read (%w), so what apt loads from it is unknown", name, err)
 	}
@@ -106,7 +107,7 @@ func (l *aptLoader) file(name string, depth int) error {
 // dir reads the files of one configuration directory in the order
 // GetListOfFilesInDir sorts them.
 func (l *aptLoader) dir(dir string, depth int) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := plannedfs.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("%s could not be read (%w), so what apt loads from it is unknown", dir, err)
 	}
@@ -574,7 +575,7 @@ func (c AptConfig) HTTPSError(host, root string) error {
 		if !filepath.IsAbs(v.Value) {
 			return fmt.Errorf("%s names the relative path %s (%s), which apt opens against the directory it is started in and doctor does not interpret", f.option, v.Value, v.File)
 		}
-		if _, err := os.ReadFile(filepath.Join(root, v.Value)); err != nil {
+		if _, err := plannedfs.ReadFile(filepath.Join(root, v.Value)); err != nil {
 			return fmt.Errorf("%s (%s, %s option in %s): %w", f.what, v.Value, f.option, v.File, err)
 		}
 	}

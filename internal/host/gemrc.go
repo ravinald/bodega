@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // The gemrc reader below ports RubyGems 3.5.22, the release Ubuntu 26.04's
@@ -169,7 +171,7 @@ func loadGemrc(path string) (map[string]*gemrcValue, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%s is relative, so the file gem loads depends on the directory it runs in", path)
 	}
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -223,7 +225,7 @@ func gemrcFiles(e gemrcEnv) ([]string, error) {
 		return nil, errors.New("the home directory holding .gemrc is unknown")
 	}
 	user := filepath.Join(e.home, ".gemrc")
-	switch _, err := os.Stat(user); {
+	switch _, err := plannedfs.Stat(user); {
 	case err == nil:
 	case errors.Is(err, fs.ErrNotExist):
 		configHome, ok := e.lookupEnv("XDG_CONFIG_HOME")

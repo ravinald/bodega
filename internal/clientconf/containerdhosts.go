@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	toml "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224"
 	tomlu "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224/unstable"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // containerdHostFile is one host of a hosts.toml as containerd decodes it:
@@ -83,7 +83,7 @@ func (f *ContainerdHostsFile) TLSError(planned string) error {
 	for _, h := range f.Hosts {
 		if h.Key != planned || planned == "" {
 			for _, ca := range h.CA {
-				data, err := os.ReadFile(ca)
+				data, err := plannedfs.ReadFile(ca)
 				if err != nil {
 					return fmt.Errorf("unable to read CA cert %q: %w", ca, err)
 				}
@@ -93,13 +93,13 @@ func (f *ContainerdHostsFile) TLSError(planned string) error {
 			}
 		}
 		for _, pair := range h.ClientPairs {
-			cert, err := os.ReadFile(pair[0])
+			cert, err := plannedfs.ReadFile(pair[0])
 			if err != nil {
 				return fmt.Errorf("unable to read CERT file %q: %w", pair[0], err)
 			}
 			key := cert
 			if pair[1] != "" {
-				if key, err = os.ReadFile(pair[1]); err != nil {
+				if key, err = plannedfs.ReadFile(pair[1]); err != nil {
 					return fmt.Errorf("unable to read CERT file %q: %w", pair[1], err)
 				}
 			}
@@ -282,7 +282,7 @@ func containerdHost(server, dir string, c containerdHostFile) (ContainerdRegistr
 // nil and no error. Any other failure is a file containerd discards, falling
 // back to the registry's own server, and the error names the file.
 func LoadContainerdHostsFile(path string) (*ContainerdHostsFile, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) || (err == nil && len(data) == 0) {
 		return nil, nil
 	}
@@ -310,9 +310,9 @@ func ContainerdHostsFiles(root string, roots []string) []string {
 		if r == "" {
 			continue
 		}
-		dirs, _ := filepath.Glob(filepath.Join(root, r, "*"))
+		dirs, _ := plannedfs.Glob(filepath.Join(root, r, "*"))
 		for _, dir := range dirs {
-			if info, err := os.Stat(dir); err != nil || !info.IsDir() || seen[filepath.Base(dir)] {
+			if info, err := plannedfs.Stat(dir); err != nil || !info.IsDir() || seen[filepath.Base(dir)] {
 				continue
 			}
 			seen[filepath.Base(dir)] = true

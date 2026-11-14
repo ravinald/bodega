@@ -4,10 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // GoEnv is the host the go command resolves GOPROXY on.
@@ -122,7 +123,7 @@ func (e GoEnv) read(path string) map[string]string {
 	data, planned := e.Planned[path]
 	if !planned {
 		var err error
-		if data, err = os.ReadFile(path); err != nil {
+		if data, err = plannedfs.ReadFile(path); err != nil {
 			return out
 		}
 	}
@@ -155,7 +156,7 @@ func findGoroot(fromUserFile string, getenv func(string) string) string {
 	around := func(exe string) string {
 		for _, up := range []string{"../..", "../../.."} {
 			root := filepath.Join(exe, up)
-			if info, err := os.Stat(filepath.Join(root, "pkg", "tool")); err == nil && info.IsDir() {
+			if info, err := plannedfs.Stat(filepath.Join(root, "pkg", "tool")); err == nil && info.IsDir() {
 				return root
 			}
 		}
@@ -163,7 +164,7 @@ func findGoroot(fromUserFile string, getenv func(string) string) string {
 	}
 	for _, dir := range filepath.SplitList(getenv("PATH")) {
 		exe := filepath.Join(dir, "go")
-		if info, err := os.Stat(exe); err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+		if info, err := plannedfs.Stat(exe); err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
 			continue
 		}
 		exe, err := filepath.Abs(exe)

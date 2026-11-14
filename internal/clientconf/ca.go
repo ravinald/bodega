@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // SystemCA is the system a CA file is listed under when no one client owns
@@ -115,7 +116,7 @@ type shadow struct {
 }
 
 func regularFile(path string) (os.FileInfo, bool) {
-	info, err := os.Stat(path)
+	info, err := plannedfs.Stat(path)
 	return info, err == nil && info.Mode().IsRegular()
 }
 
@@ -139,7 +140,7 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 		}
 		return ""
 	}
-	own, _ := os.Stat(target)
+	own, _ := plannedfs.Stat(target)
 	same := func(path string, info os.FileInfo) bool {
 		return path == target || own != nil && os.SameFile(info, own)
 	}
@@ -187,7 +188,7 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 			if !ok || same(f, info) {
 				continue
 			}
-			if data, err := os.ReadFile(f); err == nil && len(gitShadowHeaders(splitBody(data), h.Base)) > 0 {
+			if data, err := plannedfs.ReadFile(f); err == nil && len(gitShadowHeaders(splitBody(data), h.Base)) > 0 {
 				add(f, false)
 			}
 		}
@@ -207,7 +208,7 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 			if !ok || same(f, info) {
 				continue
 			}
-			data, err := os.ReadFile(f)
+			data, err := plannedfs.ReadFile(f)
 			if err != nil {
 				continue
 			}
@@ -247,7 +248,7 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 	}
 	var layers []PipLayer
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -282,7 +283,7 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 		return uncertified(rec.System, "pip's configuration sets "+u, target)
 	}
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -317,7 +318,7 @@ func (h CAHost) goProxyRefused(rec PlanRecord, target string, planned []byte) er
 	onDisk := GoEnv{Getenv: h.Getenv, ConfigDir: h.goConfigDir}
 	u := onDisk.Uncertified(base)
 	for _, file := range append([]string{target}, slices.Sorted(maps.Keys(env.Planned))...) {
-		if data, err := os.ReadFile(file); u == "" && err == nil {
+		if data, err := plannedfs.ReadFile(file); u == "" && err == nil {
 			u = GoEnvUncertified(file, data, base)
 		}
 	}
@@ -599,7 +600,7 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 				continue
 			}
 			base, _ := url.Parse(h.Base)
-			if data, err := os.ReadFile(f); err == nil {
+			if data, err := plannedfs.ReadFile(f); err == nil {
 				if u := HelmUncertified(f, data, base); u != "" {
 					return uncertified(rec.System, "helm reads "+u, target)
 				}
@@ -679,7 +680,7 @@ func helmForeignCAFile(file string, data []byte, base *url.URL, ca CA) string {
 		if r == nil || r.CAFile == "" || !namesBodega(r.URL, base) {
 			continue
 		}
-		held, _ := os.ReadFile(r.CAFile)
+		held, _ := plannedfs.ReadFile(r.CAFile)
 		if inFile, err := ParseCA(held); err == nil && slices.ContainsFunc(inFile.Certs, func(c *x509.Certificate) bool {
 			return slices.ContainsFunc(ca.Certs, c.Equal)
 		}) {
@@ -753,7 +754,7 @@ func (h CAHost) dockerReads(changes []Change) error {
 		return nil
 	}
 	path := filepath.Join(h.Root, DockerDaemonPath)
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	for _, c := range changes {
 		if c.Record.System == manifest.TypeOCI && strings.HasSuffix(c.Record.Path, "/docker/daemon.json") {
 			path, data, err = c.Target, c.New, nil
@@ -822,7 +823,7 @@ func (h CAHost) containerdReads(changes []Change) error {
 		return nil
 	}
 	path := filepath.Join(h.Root, ContainerdConfigPath)
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	for _, c := range changes {
 		if c.Record.System == manifest.TypeOCI && strings.HasSuffix(c.Record.Path, "/containerd/config.toml") {
 			path, data, err = c.Target, c.New, nil
@@ -973,9 +974,9 @@ func systemStoreFor(h CAHost) (systemStore, error) {
 func (s systemStore) roots(root string) []*x509.Certificate {
 	var out []*x509.Certificate
 	for _, pattern := range s.live {
-		files, _ := filepath.Glob(filepath.Join(root, pattern))
+		files, _ := plannedfs.Glob(filepath.Join(root, pattern))
 		for _, f := range files {
-			data, err := os.ReadFile(f)
+			data, err := plannedfs.ReadFile(f)
 			if err != nil {
 				continue
 			}
@@ -1212,7 +1213,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 					return CAInstall{}, err
 				}
 				for _, sh := range h.shadows(rec, c.Target, c.New) {
-					if old, err := os.ReadFile(sh.path); err == nil {
+					if old, err := plannedfs.ReadFile(sh.path); err == nil {
 						if err := helmDuplicate(rec, sh.path, old, planned); err != nil {
 							return CAInstall{}, err
 						}
@@ -1250,7 +1251,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				if !sh.whole || kind.whole() || slices.ContainsFunc(selected, func(o Change) bool { return o.Target == sh.path }) {
 					continue
 				}
-				old, err := os.ReadFile(sh.path)
+				old, err := plannedfs.ReadFile(sh.path)
 				if err != nil {
 					return CAInstall{}, fmt.Errorf("%s: read %s, which this client reads in place of %s: %w", rec.System, sh.path, c.Target, err)
 				}
@@ -1361,7 +1362,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			if slices.ContainsFunc(selected, func(o Change) bool { return o.Target == sh.path }) {
 				continue
 			}
-			old, err := os.ReadFile(sh.path)
+			old, err := plannedfs.ReadFile(sh.path)
 			if err != nil {
 				return CAInstall{}, fmt.Errorf("%s: read %s, which this client reads ahead of %s: %w", rec.System, sh.path, c.Target, err)
 			}

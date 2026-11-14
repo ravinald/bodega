@@ -19,6 +19,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // TrustProbe asks, for each doctor row whose client is configured for
@@ -305,7 +306,7 @@ func (t TrustProbe) systemStore(openssl bool) trustStore {
 // certsDir is a certs.d directory for one registry host, whose *.crt files
 // Docker adds to the system store.
 func certsDir(dir string) trustStore {
-	files, _ := filepath.Glob(filepath.Join(dir, "*.crt"))
+	files, _ := plannedfs.Glob(filepath.Join(dir, "*.crt"))
 	return trustStore{name: dir, system: true, files: files}
 }
 
@@ -371,7 +372,7 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	files := pipFiles(t, ask)
 	var layers []clientconf.PipLayer
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -424,7 +425,7 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	var global, install [2]string
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -509,7 +510,7 @@ func sameHost(raw string, u *url.URL) bool {
 func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
 	merged := map[string]string{}
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -577,7 +578,7 @@ func npmFiles(t TrustProbe) []string {
 // leaves npm unchecked first.
 func npmFileLayer(path string) npmLayer {
 	l := npmLayer{from: path}
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return l
 	}
@@ -697,7 +698,7 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 			if rest, ok := strings.CutPrefix(file, "~/"); ok {
 				file = filepath.Join(t.home(), rest)
 			}
-			if data, err := os.ReadFile(file); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			if data, err := plannedfs.ReadFile(file); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 				store = &trustStore{name: fmt.Sprintf("%s, which npm's cafile setting names in %s in place of the roots Node bundles,", file, l.from), files: []string{file}}
 			}
 		}
@@ -770,7 +771,7 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	var prefixes []string
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -847,7 +848,7 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 	reaches := slices.ContainsFunc(doc.Repositories, func(r *clientconf.HelmEntry) bool {
 		return r != nil && clientconf.NamesBodega(r.URL, u)
 	})
-	if data, err := os.ReadFile(path); reaches && err == nil {
+	if data, err := plannedfs.ReadFile(path); reaches && err == nil {
 		if what := clientconf.HelmUncertified(path, data, u); what != "" {
 			return uncertified("helm", "helm reads "+what)
 		}
@@ -897,7 +898,7 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("%s %s, so which hosts.toml files containerd reads, and whether it verifies bodega's certificate, is unchecked", path, why)}}
 	}
 	roots := []string{clientconf.ContainerdCertsDir}
-	switch data, err := os.ReadFile(path); {
+	switch data, err := plannedfs.ReadFile(path); {
 	case errors.Is(err, fs.ErrNotExist):
 	case err != nil:
 		return blind(fmt.Sprintf("could not be read (%v)", err))
@@ -931,7 +932,7 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		if key := doc.SkipsVerify(atBodega); key != "" {
 			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
 		}
-		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return clientconf.NamesBodega(h.Key, u) }) {
+		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return atBodega(h.Key) }) {
 			continue
 		}
 		if key := doc.SkipsVerify(atBodega); key != "" {
@@ -1180,7 +1181,7 @@ func (t TrustProbe) Judge(checks []string, base string) ([]TrustVerdict, error) 
 func poolOf(files []string) *x509.CertPool {
 	pool := x509.NewCertPool()
 	for _, f := range files {
-		if data, err := os.ReadFile(f); err == nil {
+		if data, err := plannedfs.ReadFile(f); err == nil {
 			pool.AppendCertsFromPEM(data)
 		}
 	}

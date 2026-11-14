@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io/fs"
 	"net/url"
-	"os"
 	"path/filepath"
 	"slices"
 	"time"
 
+	"github.com/ravinald/bodega/internal/plannedfs"
 	"sigs.k8s.io/yaml"
 )
 
@@ -91,7 +91,7 @@ func HelmRepositoryFileIn(env Environ, goos, home string) string {
 // path holding no file is a helm with no repositories: nil and no error. Any
 // other failure is one helm stops on too, and the error names the file.
 func LoadHelmFile(path string) (*HelmFile, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -167,11 +167,11 @@ func (e *HelmEntry) ClientTLSError(withCA bool) error {
 			return fmt.Errorf("repository %q: %s is the relative path %s, which helm opens against the directory it is started in and doctor does not interpret", e.Name, f.field, f.path)
 		}
 	}
-	cert, err := os.ReadFile(e.CertFile)
+	cert, err := plannedfs.ReadFile(e.CertFile)
 	if err != nil {
 		return fmt.Errorf("repository %q: can't create TLS config for client: unable to read cert file: %q: %w", e.Name, e.CertFile, err)
 	}
-	key, err := os.ReadFile(e.KeyFile)
+	key, err := plannedfs.ReadFile(e.KeyFile)
 	if err != nil {
 		return fmt.Errorf("repository %q: can't create TLS config for client: unable to read key file: %q: %w", e.Name, e.KeyFile, err)
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // The keys Composer's global config.json disables Packagist under. Composer
@@ -100,7 +101,7 @@ func ComposerHome(getenv func(string) string, environ []string, home string, isD
 // the account whose home directory is home.
 func HostComposerHome(home string) string {
 	return ComposerHome(os.Getenv, os.Environ(), home, func(p string) bool {
-		info, err := os.Stat(p)
+		info, err := plannedfs.Stat(p)
 		return err == nil && info.IsDir()
 	})
 }

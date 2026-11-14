@@ -2368,6 +2368,8 @@ The system trust store takes one file per certificate, named `bodega-ca` and the
 
 The Linux family comes from `ID` and `ID_LIKE` in `/etc/os-release`. On any other host, macOS included, a `--configure` list naming `apt`, `gomod` or `helm` is refused with nothing written; name only the systems that read their own, or add the CA to that host's store by hand.
 
+Before anything is written, the preview and `--apply` alike judge the plan with the check the install is judged by afterwards: every selected client's row, read over the host's files as the plan would leave them and a system store holding the CA beside its current roots. A client that would still refuse bodega's certificate, read a store the plan does not write, or be left unchecked or unverified stops the run there, naming the client and the setting, with nothing written. The same check runs again after the install, against what was written.
+
 A second `--apply` with the same file changes nothing and runs no command. Whether the command is owed is read from the store the clients open, not from the anchor file: `/etc/ssl/certs/ca-certificates.crt` on Debian and Ubuntu, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` on the RHEL family, `/etc/ssl/cert.pem` and every numbered entry of `/etc/ssl/certs` on FreeBSD (`<hash>.0`, and `<hash>.1` and up where two certificates share a subject). If the command failed (it needs root), the anchor is written and the store is not rebuilt, and the next `--apply` runs it again.
 
 Under `--ca-file`, every file the plan edits that already exists keeps what the plan does not set, whether its client reads a CA setting or the system store. The plan's settings still replace the host's, and the merge follows each format:

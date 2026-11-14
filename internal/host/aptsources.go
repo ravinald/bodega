@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 const (
@@ -21,7 +23,7 @@ const (
 // it reads them: sources.list, then sources.list.d's .list and .sources files.
 func aptSourcePaths(root string) []string {
 	paths := []string{aptSourcesList}
-	entries, err := os.ReadDir(filepath.Join(root, aptSourcesDir))
+	entries, err := plannedfs.ReadDir(filepath.Join(root, aptSourcesDir))
 	if err != nil {
 		return paths
 	}
@@ -59,7 +61,7 @@ type AptSource struct {
 func AptSources(root string) ([]AptSource, error) {
 	var out []AptSource
 	for _, p := range aptSourcePaths(root) {
-		data, err := os.ReadFile(filepath.Join(root, p))
+		data, err := plannedfs.ReadFile(filepath.Join(root, p))
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
@@ -297,7 +299,7 @@ func aptLinesAt(lines []string, i int, want []string) bool {
 
 func (e AptEdit) read(root string) (string, []string, error) {
 	path := filepath.Join(root, e.Path)
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return path, nil, fmt.Errorf("read %s: %w", path, err)
 	}

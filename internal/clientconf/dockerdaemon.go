@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,6 +19,8 @@ import (
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // dockerDaemonConfig is Config in daemon/config/config_linux.go at moby
@@ -519,7 +520,7 @@ func ParseDockerDaemonFile(data []byte) (*DockerDaemonFile, error) {
 // LoadDockerDaemonFile reads the daemon.json at path. A missing file is a dockerd
 // running on its defaults: nil and no error. Any other failure names the file.
 func LoadDockerDaemonFile(path string) (*DockerDaemonFile, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -1003,7 +1004,7 @@ func dockerValidateMirror(mirrorURL string) error {
 // planned names a .crt a plan is about to write there, which is not read
 // since the plan replaces it. "" reads every one.
 func DockerCertsDirError(dir, planned string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := plannedfs.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -1025,7 +1026,7 @@ func DockerCertsDirError(dir, planned string) error {
 			if name == planned {
 				continue
 			}
-			if _, err := os.ReadFile(filepath.Join(dir, name)); err != nil {
+			if _, err := plannedfs.ReadFile(filepath.Join(dir, name)); err != nil {
 				return err
 			}
 		case ".cert":

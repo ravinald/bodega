@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // The functions here answer, for a value that names where a client fetches
@@ -47,7 +48,7 @@ func NpmRegistries(getenv func(string) string, files []string) []NpmRegistry {
 	scoped := map[string]NpmRegistry{}
 	var order []string
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}

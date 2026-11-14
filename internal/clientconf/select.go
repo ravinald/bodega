@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // The functions here answer one question for a client that can take its
@@ -74,13 +76,13 @@ func PipConfigFiles(h PipHost) (files []string, global int) {
 	global = len(files)
 	skipUser := false
 	if explicit != "" {
-		_, err := os.Stat(explicit)
+		_, err := plannedfs.Stat(explicit)
 		skipUser = err == nil
 	}
 	if h.Home != "" && !skipUser {
 		user := filepath.Join(h.Home, ".config", "pip")
 		mac := filepath.Join(h.Home, "Library", "Application Support", "pip")
-		switch info, err := os.Stat(mac); {
+		switch info, err := plannedfs.Stat(mac); {
 		case h.GOOS == OSDarwin && err == nil && info.IsDir():
 			user = mac
 		case h.GOOS != OSDarwin && h.env("XDG_CONFIG_HOME") != "":
@@ -256,7 +258,7 @@ func GitUnread(getenv func(string) string, files []string) []string {
 		}
 	}
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -279,7 +281,7 @@ func GitUnread(getenv func(string) string, files []string) []string {
 func GitIncludes(files []string) []string {
 	var out []string
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -556,7 +558,7 @@ func NpmCAOf(opts []NpmOption) NpmCA {
 }
 
 func npmFileOptions(path string) []NpmOption {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return nil
 	}
@@ -927,7 +929,7 @@ func parseGitURL(s string, pattern bool) (gitURL, bool) {
 // not an endpoint a certificate is verified at and is passed over.
 func GitRewriteUnread(files []string) string {
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}
@@ -998,7 +1000,7 @@ func GitCAInfo(files []string, base, home string) (own *GitCA, narrower []GitCA)
 	byPattern := map[string]GitCA{}
 	var order []string
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}

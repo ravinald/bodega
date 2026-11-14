@@ -21,6 +21,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // publicUpstreams maps each package-manager check to the substrings that, if
@@ -51,7 +52,7 @@ func checkAptSources(root, goos string) Finding {
 		f.Detail = "apt is Linux-only; check not applicable on this platform"
 		return f
 	}
-	if _, err := os.Stat(filepath.Join(root, "/etc/apt")); errors.Is(err, fs.ErrNotExist) {
+	if _, err := plannedfs.Stat(filepath.Join(root, "/etc/apt")); errors.Is(err, fs.ErrNotExist) {
 		f.Status = StatusNA
 		f.Detail = "/etc/apt is absent; apt is not installed on this host"
 		return f
@@ -120,7 +121,7 @@ type aptMirrorError struct {
 // deb822 stanzas for a .sources file, one-line entries for anything else.
 // Comments and stanzas with Enabled: no are dropped, as apt drops them.
 func aptSourceURIs(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +252,7 @@ func aptMirrorFile(uri string) (string, bool) {
 // aptMirrorURIs reads a mirror list: one URI per line, optionally followed by
 // tab-separated metadata, with '#' lines as comments.
 func aptMirrorURIs(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -501,7 +502,7 @@ func bundlerMirror(getenv func(string) string, home string) (mirror, from string
 	default:
 		return "", "", nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", "", nil
 	}
@@ -619,7 +620,7 @@ func toolPresent(lookPath func(string) (string, error), name, home string) bool 
 	if home == "" {
 		return false
 	}
-	entries, err := os.ReadDir(filepath.Join(home, "wrapper", "dists"))
+	entries, err := plannedfs.ReadDir(filepath.Join(home, "wrapper", "dists"))
 	return err == nil && len(entries) > 0
 }
 
@@ -628,7 +629,7 @@ func toolPresent(lookPath func(string) (string, error), name, home string) bool 
 // the repositories it names ahead of a * pattern. A missing file has no
 // mirror and is no error.
 func mavenMirror(path string) (mirror string, others []string, err error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil, nil
 	}
@@ -659,7 +660,7 @@ func mavenMirror(path string) (mirror string, others []string, err error) {
 // gradleInitURL is the repository bodega's init script at path sets, or ""
 // when the file sets none.
 func gradleInitURL(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -702,7 +703,7 @@ func checkComposer(t composerTools) (Finding, bool) {
 		return f, true
 	}
 	path := filepath.Join(dir, "config.json")
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		f.Status = StatusWarn
@@ -852,7 +853,7 @@ type scanHit struct {
 // — the check is best-effort.
 func firstHit(paths, markers []string) scanHit {
 	for _, p := range paths {
-		data, err := os.ReadFile(p)
+		data, err := plannedfs.ReadFile(p)
 		if err != nil {
 			continue
 		}
@@ -980,7 +981,7 @@ func checkDockerMirror(path, host string) Finding {
 
 func checkContainerdHosts(root, host string) Finding {
 	cfgPath := filepath.Join(root, clientconf.ContainerdConfigPath)
-	data, err := os.ReadFile(cfgPath)
+	data, err := plannedfs.ReadFile(cfgPath)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return Finding{Status: StatusWarn, Detail: "no " + cfgPath + ", so containerd's CRI plugin has no config_path and reads no hosts.toml; bypasses bodega's registry"}
@@ -1017,7 +1018,7 @@ func checkContainerdHosts(root, host string) Finding {
 		roots = append(roots, r)
 		for _, ns := range []string{"docker.io", "_default"} {
 			if p := filepath.Join(root, r, ns); dir == "" {
-				if _, err := os.Stat(p); err == nil {
+				if _, err := plannedfs.Stat(p); err == nil {
 					dir = p
 				}
 			}
@@ -1089,8 +1090,8 @@ func (t OCIHost) registriesConfFiles() []string {
 	if t.Home != "" {
 		userDir = filepath.Join(t.Home, ".config/containers/registries.conf.d")
 		if user := filepath.Join(t.Home, ".config/containers/registries.conf"); t.RegistriesConf == "" {
-			if _, err := os.Stat(user); err == nil {
-				drop, _ := filepath.Glob(filepath.Join(userDir, "*.conf"))
+			if _, err := plannedfs.Stat(user); err == nil {
+				drop, _ := plannedfs.Glob(filepath.Join(userDir, "*.conf"))
 				return append([]string{user}, drop...)
 			}
 		}
@@ -1100,10 +1101,10 @@ func (t OCIHost) registriesConfFiles() []string {
 		main = t.RegistriesConf
 	}
 	files := []string{main}
-	drop, _ := filepath.Glob(filepath.Join(t.Root, filepath.Dir(clientconf.RegistriesConfDropIn), "*.conf"))
+	drop, _ := plannedfs.Glob(filepath.Join(t.Root, filepath.Dir(clientconf.RegistriesConfDropIn), "*.conf"))
 	files = append(files, drop...)
 	if userDir != "" {
-		drop, _ = filepath.Glob(filepath.Join(userDir, "*.conf"))
+		drop, _ = plannedfs.Glob(filepath.Join(userDir, "*.conf"))
 		files = append(files, drop...)
 	}
 	return files
@@ -1118,7 +1119,7 @@ func (t OCIHost) checkRegistriesConf(host string) Finding {
 	effective := map[string]containersRegistry{}
 	files := t.registriesConfFiles()
 	for i, path := range files {
-		data, err := os.ReadFile(path)
+		data, err := plannedfs.ReadFile(path)
 		switch {
 		case i == 0 && errors.Is(err, fs.ErrNotExist):
 			continue

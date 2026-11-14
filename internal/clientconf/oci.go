@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -18,6 +17,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // Container runtimes the oci system configures. Each reads its own file, so
@@ -597,7 +597,7 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 			continue
 		}
 		loaded[p] = true
-		b, err := os.ReadFile(filepath.Join(root, p))
+		b, err := plannedfs.ReadFile(filepath.Join(root, p))
 		if err != nil {
 			return eff, fmt.Errorf("it imports %s, which could not be read (%w); containerd will not start while an import fails to load", p, err)
 		}
@@ -664,7 +664,7 @@ func containerdImports(root, parent string, imports []string) ([]string, error) 
 			out = append(out, p)
 			continue
 		}
-		matches, err := filepath.Glob(filepath.Join(root, p))
+		matches, err := plannedfs.Glob(filepath.Join(root, p))
 		if err != nil {
 			return nil, fmt.Errorf("%s imports %q, which is not a pattern containerd can expand: %w", parent, p, err)
 		}

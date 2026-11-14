@@ -2,9 +2,10 @@ package clientconf
 
 import (
 	"fmt"
-	"os"
 	"slices"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // GitEntry is one variable of a git configuration file.
@@ -296,7 +297,7 @@ func (e GitEntry) Key() string {
 // else it holds is configuration git runs with.
 func GitLoadError(files []string) string {
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := plannedfs.ReadFile(f)
 		if err != nil {
 			continue
 		}

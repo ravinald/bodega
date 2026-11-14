@@ -4,12 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // AptSourcesList and AptSourcesParts are where apt reads its sources from
@@ -56,7 +57,7 @@ func LoadAptSources(root string) ([]AptSourceEntry, error) {
 	var out []AptSourceEntry
 	var firstErr error
 	read := func(path string) {
-		data, err := os.ReadFile(path)
+		data, err := plannedfs.ReadFile(path)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("opening %s: %w", path, err)
@@ -72,11 +73,11 @@ func LoadAptSources(root string) ([]AptSourceEntry, error) {
 		}
 		out = append(out, entries...)
 	}
-	if info, err := os.Stat(filepath.Join(root, AptSourcesList)); err == nil && info.Mode().IsRegular() {
+	if info, err := plannedfs.Stat(filepath.Join(root, AptSourcesList)); err == nil && info.Mode().IsRegular() {
 		read(filepath.Join(root, AptSourcesList))
 	}
 	parts := filepath.Join(root, AptSourcesParts)
-	names, err := os.ReadDir(parts)
+	names, err := plannedfs.ReadDir(parts)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("list %s: %w", parts, err)
 	}
@@ -91,7 +92,7 @@ func LoadAptSources(root string) ([]AptSourceEntry, error) {
 		}) {
 			continue
 		}
-		if info, err := os.Stat(filepath.Join(parts, name)); err != nil || !info.Mode().IsRegular() {
+		if info, err := plannedfs.Stat(filepath.Join(parts, name)); err != nil || !info.Mode().IsRegular() {
 			continue
 		}
 		files = append(files, filepath.Join(parts, name))
