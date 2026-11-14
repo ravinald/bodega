@@ -3020,3 +3020,45 @@ func TestTrustUnchecksGoDistributionBypassReport(t *testing.T) {
 		t.Errorf("ordinary row certifies Go's distribution-file bypass: %+v", row)
 	}
 }
+
+func TestTrustUnchecksGoPaddedPortRetainsTrustObligation(t *testing.T) {
+	p, _, base := auditTrust(t)
+	p.System = func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }
+	proxy := "https://bodega.internal:08443/gomod,off"
+	p.Getenv = func(key string) string {
+		if key == "GOPROXY" {
+			return proxy
+		}
+		return ""
+	}
+	row := checkGoproxy(p.Getenv, p.ConfigDir)
+	if row.Status != StatusOK {
+		t.Fatalf("fixture does not reach the trust check: %+v", row)
+	}
+	got := p.Apply([]Finding{row}, base)[0]
+	if got.Status != StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
+		t.Errorf("report certifies a proxy whose certificate Go cannot verify: %+v", got)
+	}
+}
+
+func TestTrustUnchecksPipPaddedPortCannotHideVerificationBypass(t *testing.T) {
+	python := oracletest.Pip(t)
+	native := exec.Command(python, "-c", `
+from pip._internal.network.session import PipSession, InsecureHTTPAdapter
+from pip._vendor.requests import Request
+request = Request("GET", "https://bodega.internal:08443/pypi/simple/").prepare()
+assert request.url == "https://bodega.internal:8443/pypi/simple/", request.url
+session = PipSession(trusted_hosts=["bodega.internal"])
+assert isinstance(session.get_adapter(request.url), InsecureHTTPAdapter)
+`)
+	if out, err := native.CombinedOutput(); err != nil {
+		t.Fatalf("native pip did not reproduce the verification bypass: %v\n%s", err, out)
+	}
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".config/pip/pip.conf")
+	writeTrustFile(t, file, "[global]\nindex-url = https://bodega.internal:08443/pypi/simple/\ncert = "+ca+"\ntrusted-host = bodega.internal\n")
+	got := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if got.Status != StatusWarn || !strings.Contains(got.Detail, "trusted-host") {
+		t.Errorf("report hides trusted-host at bodega's equivalent port spelling: %+v", got)
+	}
+}

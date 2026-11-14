@@ -392,6 +392,28 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		return fmt.Errorf("%s: npm reads %s, so which registry npm asks, which npmrc it loads and which CA list it verifies with cannot be told. "+
 			"Nothing was written. Unset one of the two, or give both the same value, then re-run", rec.System, conflict)
 	}
+	if rec.System == manifest.TypePypi || rec.System == manifest.TypeGit {
+		// A variable naming a CA file outranks the setting this command
+		// writes: PIP_CERT outranks pip.conf's cert, and requests reads
+		// REQUESTS_CA_BUNDLE and CURL_CA_BUNDLE; GIT_SSL_CAINFO outranks
+		// http.sslCAInfo. One naming another file decides what the client
+		// trusts, so the install is refused before anything is written.
+		keys := []string{"GIT_SSL_CAINFO"}
+		if rec.System == manifest.TypePypi {
+			keys = []string{"PIP_CERT", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}
+		}
+		installed, err := h.caTarget(rec.Path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", rec.System, err)
+		}
+		for _, key := range keys {
+			v := env(key)
+			if abs, err := filepath.Abs(v); v != "" && (err != nil || abs != installed) {
+				return fmt.Errorf("%s: %s is set to %s, and the client reads that file in place of the CA this command writes for %s, so it would not verify bodega's certificate with the CA installed. "+
+					"Nothing was written. Unset %s, or add the CA to that file yourself and re-run without --ca-file", rec.System, key, v, target, key)
+			}
+		}
+	}
 	switch {
 	case rec.System == manifest.TypePypi && env("PIP_CONFIG_FILE") == os.DevNull:
 		return fmt.Errorf("%s: PIP_CONFIG_FILE is set to %s, which tells pip to load no configuration file, so it would read neither the index nor the CA written to %s. "+
@@ -588,7 +610,7 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 				if r == nil || base == nil {
 					continue
 				}
-				if u, perr := url.Parse(r.URL); perr != nil || u.Host != base.Host {
+				if !namesBodega(r.URL, base) {
 					continue
 				}
 				if err := r.ClientTLSError(true); err != nil {
@@ -710,7 +732,7 @@ func (h CAHost) helmClientTLS(rec PlanRecord, target string, planned []byte) err
 		if r == nil {
 			continue
 		}
-		if u, perr := url.Parse(r.URL); perr != nil || u.Host != base.Host {
+		if !namesBodega(r.URL, base) {
 			continue
 		}
 		if err := r.ClientTLSError(true); err != nil {
@@ -757,6 +779,16 @@ func (h CAHost) dockerReads(changes []Change) error {
 		}
 		if base, perr := url.Parse(h.Base); err == nil && perr == nil && doc.Insecure(base) != "" {
 			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", path, doc.Insecure(base)), filepath.Join(filepath.Dir(path), "certs.d"))
+		}
+		// dockerd looks up certs.d by the mirror's host as spelled, and this
+		// command writes only certs.d/<bodega's host>: another spelling of
+		// bodega reads a directory without the CA.
+		if base, perr := url.Parse(h.Base); err == nil && perr == nil {
+			for _, m := range doc.Mirrors {
+				if p, perr := url.Parse(m); perr == nil && namesBodega(m, base) && p.Host != base.Host {
+					return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists the mirror %s, which reaches bodega under another spelling of %s, and dockerd reads certificates for it from certs.d/%s, not the certs.d/%s this command writes", path, m, base.Host, p.Host, base.Host), filepath.Join(filepath.Dir(path), "certs.d"))
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -1249,6 +1281,12 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		// would end the setting and start another one the client reads.
 		if strings.ContainsFunc(caPath, unicode.IsControl) {
 			return CAInstall{}, fmt.Errorf("%s: the CA's path %q holds a control character, which would split the setting written to %s into lines the client reads as settings of their own. Nothing was written. Use a home directory and CA path without one, then re-run", rec.System, caPath, c.Target)
+		}
+		// npm/ini ends an unquoted value at # or ;, so cafile would name a
+		// truncated path.
+		// It also unescapes a backslash.
+		if rec.System == manifest.TypeNpm && strings.ContainsAny(caPath, `#;\`) {
+			return CAInstall{}, fmt.Errorf("%s: the CA's path %q holds #, ; or a backslash, which npm reads as a comment or an escape in the cafile line written to %s, so npm would look for a file that does not exist. Nothing was written. Use a home directory and CA path without them, then re-run", rec.System, caPath, c.Target)
 		}
 		set := []string{line(caPath)}
 		// outranking lists the sections of body whose own CA setting the

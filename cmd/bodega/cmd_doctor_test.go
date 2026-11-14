@@ -1700,8 +1700,8 @@ func TestDoctorConfigureFailsWhenAnotherStoreOutranksTheCA(t *testing.T) {
 	}
 	t.Setenv("PIP_CERT", "/missing/site-ca.pem")
 	out, err = runDoctor(t, append(args, "--apply")...)
-	if err == nil || !strings.Contains(err.Error(), "pypi: ") || !strings.Contains(err.Error(), "the environment's PIP_CERT") {
-		t.Fatalf("PIP_CERT outranks the cert setting the plan wrote; want the run to fail naming pypi and the variable, got %v:\n%s", err, out)
+	if err == nil || !strings.Contains(err.Error(), "pypi: ") || !strings.Contains(err.Error(), "PIP_CERT") || !strings.Contains(err.Error(), "Nothing was written") {
+		t.Fatalf("PIP_CERT outranks the cert setting the plan would write; want a refusal before writes naming pypi and the variable, got %v:\n%s", err, out)
 	}
 	unsetEnv(t, "PIP_CERT")
 
@@ -4575,5 +4575,42 @@ func TestCARefusesHelmRetainedRepositoryCARefusesBeforeWrites(t *testing.T) {
 	}
 	if ran != 0 {
 		t.Errorf("doctor rebuilt the trust store %d times before refusing the retained repository's CA", ran)
+	}
+}
+
+func TestCARefusesNpmEscapedCAPathRefusesBeforeWrites(t *testing.T) {
+	npm := oracletest.Npm(t)
+	home := filepath.Join(t.TempDir(), `account\\corp`)
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, applyErr := runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	config := filepath.Join(home, ".npmrc")
+	if _, err := os.Stat(config); os.IsNotExist(err) && applyErr != nil {
+		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+			t.Error("wrote the CA before refusing its escaped path")
+		}
+		return
+	}
+	native := exec.Command(npm, "config", "get", "cafile")
+	native.Dir = t.TempDir()
+	native.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "npm_config_userconfig=" + config, "npm_config_globalconfig=" + os.DevNull}
+	got, err := native.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if strings.TrimSpace(string(got)) != want {
+		t.Errorf("native npm shortened the written CA path to %q; installed %q; apply: %v\n%s", strings.TrimSpace(string(got)), want, applyErr, out)
+	}
+	if applyErr != nil {
+		t.Errorf("doctor refused only after writing %s: %v", config, applyErr)
 	}
 }

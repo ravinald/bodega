@@ -140,12 +140,6 @@ func envCA(t TrustProbe, keys ...string) *trustStore {
 	return nil
 }
 
-// namesHost reports whether raw is a URL at host, port included.
-func namesHost(raw, host string) bool {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	return err == nil && strings.EqualFold(u.Host, host)
-}
-
 // goStores is the system trust store when a proxy the go command can reach
 // is at bodega's host. The list is the effective GOPROXY, resolved as the
 // goproxy-env row resolves it: a non-empty value in the environment hides
@@ -162,7 +156,7 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	if set.err != nil {
 		return []trustStore{{name: "the go command's GOPROXY", blind: fmt.Sprintf("the go command refuses the GOPROXY list from %s (%v) before it asks any proxy, so whether go reaches bodega or verifies its certificate is unchecked", set.source, set.err)}}
 	}
-	if !slices.ContainsFunc(set.reached, func(entry string) bool { return namesHost(entry, u.Host) }) {
+	if !slices.ContainsFunc(set.reached, func(entry string) bool { return sameHost(entry, u) }) {
 		return nil
 	}
 	if what := (clientconf.GoEnv{Getenv: t.Getenv, ConfigDir: configDir}).Uncertified(u); what != "" {
@@ -205,7 +199,7 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd refuses to load its configuration (%v) and does not start, so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
 	case doc != nil && doc.StartError != "":
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd loads its configuration and exits as it starts (%s), so whether dockerd reaches bodega or verifies its certificate is unchecked", doc.StartError)}}
-	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return mirrorIsBodega(m, u.Host) }):
+	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return clientconf.NamesBodega(m, u) }):
 		return nil
 	}
 	if doc.StartUnmodeled != "" {
@@ -217,11 +211,24 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	if entry := doc.Insecure(u); entry != "" {
 		return uncertified("dockerd", fmt.Sprintf("dockerd's configuration lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents", entry))
 	}
-	dir := filepath.Join(t.Root, "/etc/docker/certs.d", u.Host)
-	if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
-		return []trustStore{{name: dir, blind: fmt.Sprintf("dockerd does not load the certificates in %s (%v) and sends that host nothing while it cannot, so whether dockerd verifies bodega's certificate is unchecked", dir, err)}}
+	// dockerd looks up certs.d by the mirror's host as the mirror spells
+	// it, so each spelling of bodega's endpoint owes its own directory.
+	var out []trustStore
+	for _, m := range doc.Mirrors {
+		p, err := url.Parse(m)
+		if err != nil || !clientconf.NamesBodega(m, u) {
+			continue
+		}
+		dir := filepath.Join(t.Root, "/etc/docker/certs.d", p.Host)
+		if slices.ContainsFunc(out, func(s trustStore) bool { return s.name == dir }) {
+			continue
+		}
+		if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
+			return []trustStore{{name: dir, blind: fmt.Sprintf("dockerd does not load the certificates in %s (%v) and sends that host nothing while it cannot, so whether dockerd verifies bodega's certificate is unchecked", dir, err)}}
+		}
+		out = append(out, certsDir(dir))
 	}
-	return []trustStore{certsDir(dir)}
+	return out
 }
 
 // aptStores is the store apt verifies bodega at u against, for a host one of
@@ -484,7 +491,10 @@ func sameHost(raw string, u *url.URL) bool {
 		}
 		return x.Port()
 	}
-	return strings.EqualFold(p.Hostname(), u.Hostname()) && port(p) == port(u)
+	// Clients parse the port as a number, so 08443 is 8443.
+	a, errA := strconv.Atoi(port(p))
+	b, errB := strconv.Atoi(port(u))
+	return strings.EqualFold(p.Hostname(), u.Hostname()) && errA == nil && errB == nil && a == b
 }
 
 // pipReaches reports whether pip install, as its effective configuration
@@ -832,9 +842,10 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 		return nil
 	}
 	var out []trustStore
+	// helm reaches bodega under any spelling its URL parser and dialer
+	// accept (case, an explicit or padded port), so each one owes a store.
 	reaches := slices.ContainsFunc(doc.Repositories, func(r *clientconf.HelmEntry) bool {
-		p, err := url.Parse(r.URL)
-		return err == nil && p.Host == u.Host
+		return r != nil && clientconf.NamesBodega(r.URL, u)
 	})
 	if data, err := os.ReadFile(path); reaches && err == nil {
 		if what := clientconf.HelmUncertified(path, data, u); what != "" {
@@ -845,7 +856,7 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 		if r == nil {
 			continue
 		}
-		if p, err := url.Parse(r.URL); err != nil || p.Host != u.Host {
+		if !clientconf.NamesBodega(r.URL, u) {
 			continue
 		}
 		if err := r.ClientTLSError(r.CAFile != ""); err != nil {
@@ -930,7 +941,7 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd cannot load a certificate %s names (%v) and resolves no host for that registry while it cannot, the bodega host included, so whether containerd reaches bodega or verifies its certificate is unchecked", path, err)}}
 		}
 		for _, h := range doc.Hosts {
-			if mirrorIsBodega(h.Key, u.Host) {
+			if atBodega(h.Key) {
 				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA})
 			}
 		}
