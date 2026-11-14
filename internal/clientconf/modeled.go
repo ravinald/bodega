@@ -255,13 +255,14 @@ func PipUncertified(layers []PipLayer, getenv func(string) string, u *url.URL) s
 			continue
 		}
 		for _, s := range f.settings() {
-			if s.option == "trusted-host" && slices.ContainsFunc(pyFields(s.value), func(w string) bool { return namesBodega(w, u) }) {
+			// pip's is_secure_origin takes * as every host.
+			if s.option == "trusted-host" && slices.ContainsFunc(pyFields(s.value), func(w string) bool { return w == "*" || namesBodega(w, u) }) {
 				return fmt.Sprintf("trusted-host (%s under [%s], %s line %d), which names bodega's host: pip then verifies no certificate that host presents for that section's commands, so no CA decides what it trusts and none can be certified for it", s.raw, s.section, l.File, s.line)
 			}
 		}
 	}
 	for _, s := range all {
-		if s.key == "trusted-host" && u != nil && slices.ContainsFunc(pyFields(s.value), func(w string) bool { return namesBodega(w, u) }) {
+		if s.key == "trusted-host" && u != nil && slices.ContainsFunc(pyFields(s.value), func(w string) bool { return w == "*" || namesBodega(w, u) }) {
 			return fmt.Sprintf("trusted-host (%s), which names bodega's host: pip then verifies no certificate that host presents, so no CA decides what it trusts and none can be certified for it", s.from)
 		}
 	}
@@ -724,6 +725,36 @@ func (d *DockerDaemonFile) Insecure(u *url.URL) string {
 		}
 		if namesBodega(r, u) {
 			return r
+		}
+	}
+	return ""
+}
+
+// PipPlainIndex is the first index-url or extra-index-url, in any section of
+// layers or in the environment, that reaches bodega's host over plain http,
+// "" for none. pip checks no certificate on such an index, so a verdict
+// reached through an https index says nothing about it.
+func PipPlainIndex(layers []PipLayer, getenv func(string) string, u *url.URL) string {
+	var words []string
+	for _, l := range layers {
+		f, err := readPipFile(l.Data)
+		if err != nil {
+			continue
+		}
+		for _, s := range f.settings() {
+			if s.option == "index-url" || s.option == "extra-index-url" {
+				words = append(words, pyFields(s.value)...)
+			}
+		}
+	}
+	if getenv != nil {
+		for _, key := range []string{"PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"} {
+			words = append(words, pyFields(getenv(key))...)
+		}
+	}
+	for _, w := range words {
+		if p, err := url.Parse(w); err == nil && strings.EqualFold(p.Scheme, "http") && namesBodega(w, u) {
+			return w
 		}
 	}
 	return ""

@@ -27,13 +27,13 @@ func review41HTTPPolicy(t *testing.T, mixed bool) {
 	t.Helper()
 	const plain = "http://bodega.internal:8443"
 	for _, tc := range []review41Policy{
-		{"npm-config", "home/.npmrc", "registry=" + plain + "/npm/\ncafile=CA\n", "registry=BASE/npm/\ncafile=CA\n@plain:registry=" + plain + "/npm/\n"},
-		{"git-config", "home/.gitconfig", "[url \"" + plain + "/git/\"]\n insteadOf=https://github.com/\n[http]\n sslCAInfo=CA\n", "[url \"BASE/git/\"]\n insteadOf=https://github.com/\n[url \"" + plain + "/git/\"]\n insteadOf=https://gitlab.com/\n[http]\n sslCAInfo=CA\n"},
+		{"npm-config", "home/.npmrc", "registry=" + plain + "/npm/\ncafile=@CA@\n", "registry=BASE/npm/\ncafile=@CA@\n@plain:registry=" + plain + "/npm/\n"},
+		{"git-config", "home/.gitconfig", "[url \"" + plain + "/git/\"]\n insteadOf=https://github.com/\n[http]\n sslCAInfo=@CA@\n", "[url \"BASE/git/\"]\n insteadOf=https://github.com/\n[url \"" + plain + "/git/\"]\n insteadOf=https://gitlab.com/\n[http]\n sslCAInfo=@CA@\n"},
 		{"goproxy-env", "home/.config/go/env", "GOPROXY=" + plain + "/go\n", "GOPROXY=BASE/go," + plain + "/go\n"},
-		{"helm-repos", "home/.config/helm/repositories.yaml", "repositories:\n- name: plain\n  url: " + plain + "/helm\n  caFile: CA\n", "repositories:\n- name: plain\n  url: " + plain + "/helm\n  caFile: CA\n- name: secure\n  url: BASE/helm\n  caFile: CA\n"},
+		{"helm-repos", "home/.config/helm/repositories.yaml", "repositories:\n- name: plain\n  url: " + plain + "/helm\n  caFile: @CA@\n", "repositories:\n- name: plain\n  url: " + plain + "/helm\n  caFile: @CA@\n- name: secure\n  url: BASE/helm\n  caFile: @CA@\n"},
 		{"apt-sources", "etc/apt/sources.list.d/corp.sources", "Types: deb\nURIs: " + plain + "/apt\nSuites: stable\nComponents: main\n", "Types: deb\nURIs: BASE/apt " + plain + "/apt\nSuites: stable\nComponents: main\n"},
 		{"oci-docker", "etc/docker/daemon.json", `{"registry-mirrors":["` + plain + `"]}`, `{"registry-mirrors":["BASE","` + plain + `"]}`},
-		{"oci-containerd", "etc/containerd/certs.d/docker.io/hosts.toml", "server=\"https://registry-1.docker.io\"\n[host.\"" + plain + "\"]\ncapabilities=[\"pull\",\"resolve\"]\n", "server=\"https://registry-1.docker.io\"\n[host.\"" + plain + "\"]\ncapabilities=[\"pull\",\"resolve\"]\n[host.\"BASE\"]\nca=\"CA\"\ncapabilities=[\"pull\",\"resolve\"]\n"},
+		{"oci-containerd", "etc/containerd/certs.d/docker.io/hosts.toml", "server=\"https://registry-1.docker.io\"\n[host.\"" + plain + "\"]\ncapabilities=[\"pull\",\"resolve\"]\n", "server=\"https://registry-1.docker.io\"\n[host.\"" + plain + "\"]\ncapabilities=[\"pull\",\"resolve\"]\n[host.\"BASE\"]\nca=\"@CA@\"\ncapabilities=[\"pull\",\"resolve\"]\n"},
 	} {
 		t.Run(tc.check, func(t *testing.T) {
 			p, ca, base := auditTrust(t)
@@ -42,7 +42,7 @@ func review41HTTPPolicy(t *testing.T, mixed bool) {
 			if mixed {
 				body = tc.mixed
 			}
-			writeTrustFile(t, filepath.Join(p.Root, tc.path), strings.NewReplacer("BASE", base, "CA", ca).Replace(body))
+			writeTrustFile(t, filepath.Join(p.Root, tc.path), strings.NewReplacer("BASE", base, "@CA@", ca).Replace(body))
 			if tc.check == "oci-containerd" {
 				writeTrustFile(t, filepath.Join(p.Root, clientconf.ContainerdConfigPath), "version=3\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path=\"/etc/containerd/certs.d\"\n")
 			}

@@ -451,6 +451,11 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	if from := clientconf.PipIndexAlias(layers, t.Getenv); from != "" {
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's configuration sets pypi-url (%s), a second name for index-url that doctor does not interpret, so which index pip install asks, and whether it reaches bodega or verifies its certificate, is unchecked", from)}}
 	}
+	if loopbackNote("", u) == "" {
+		if route := clientconf.PipPlainIndex(layers, t.Getenv, u); route != "" {
+			return plainUncertified("pip", "an index pip reads", route)
+		}
+	}
 	if !pipReaches(t, files, u) {
 		if t.env("PIP_CONFIG_FILE") != os.DevNull {
 			return nil
@@ -863,6 +868,9 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	if len(prefixes) == 0 {
 		return nil
+	}
+	if route := plainRoute(prefixes, u); route != "" {
+		return plainUncertified("git", "a url rewrite", route)
 	}
 	if unmodeled := clientconf.GitEnvUnmodeledIn(t.environ()); unmodeled != "" {
 		return []trustStore{{name: "git's environment", blind: fmt.Sprintf("git reads %s, so whether git accepts bodega's certificate is unchecked", unmodeled)}}
