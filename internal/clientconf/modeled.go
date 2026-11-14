@@ -1,13 +1,16 @@
 package clientconf
 
 import (
+	"cmp"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sigs.k8s.io/yaml"
@@ -62,8 +65,21 @@ func namesBodega(word string, u *url.URL) bool {
 		host, port = h, p
 	}
 	host = strings.Trim(host, "[]")
-	return strings.EqualFold(host, u.Hostname()) && (port == "" || port == bodegaPort(u))
+	if !strings.EqualFold(host, u.Hostname()) {
+		return false
+	}
+	if port == "" {
+		return true
+	}
+	// Clients parse the port as a number, so 08443 is 8443.
+	n, err := strconv.Atoi(port)
+	want, _ := strconv.Atoi(bodegaPort(u))
+	return err == nil && n == want
 }
+
+// NamesBodega is namesBodega for the report path, which judges the same
+// spellings of bodega's endpoint the install path refuses.
+func NamesBodega(word string, u *url.URL) bool { return namesBodega(word, u) }
 
 // NpmModeled is the npm options doctor certifies npm under at any value npm
 // accepts. Every other option npm 11.20.0 defines must sit at npmDefaults.
@@ -231,9 +247,33 @@ func PipUncertified(layers []PipLayer, getenv func(string) string, u *url.URL) s
 			}
 		}
 	}
+	// trusted-host lifts verification for the commands of the section that
+	// sets it, so every section counts, not only the ones pip install reads.
+	for _, l := range layers {
+		f, err := readPipFile(l.Data)
+		if err != nil || u == nil {
+			continue
+		}
+		for _, s := range f.settings() {
+			if s.option == "trusted-host" && slices.ContainsFunc(pyFields(s.value), func(w string) bool { return namesBodega(w, u) }) {
+				return fmt.Sprintf("trusted-host (%s under [%s], %s line %d), which names bodega's host: pip then verifies no certificate that host presents for that section's commands, so no CA decides what it trusts and none can be certified for it", s.raw, s.section, l.File, s.line)
+			}
+		}
+	}
 	for _, s := range all {
 		if s.key == "trusted-host" && u != nil && slices.ContainsFunc(pyFields(s.value), func(w string) bool { return namesBodega(w, u) }) {
 			return fmt.Sprintf("trusted-host (%s), which names bodega's host: pip then verifies no certificate that host presents, so no CA decides what it trusts and none can be certified for it", s.from)
+		}
+	}
+	// A timeout converts as a float, then reaches urllib3's Timeout, which
+	// rejects a value at or below zero before pip opens a connection
+	// (util/timeout.py:130, as vendored by pip 26.2.1).
+	for _, s := range all {
+		if s.key != "timeout" && s.key != "default-timeout" || !pyFloat(s.value) {
+			continue
+		}
+		if f, err := strconv.ParseFloat(strings.ReplaceAll(pyNumeral(s.value), "_", ""), 64); err == nil && f <= 0 {
+			return fmt.Sprintf("%s (%s), which is at or below zero: pip's HTTP library refuses that timeout before it opens any connection", s.key, s.from)
 		}
 	}
 	for _, s := range all {
@@ -264,6 +304,20 @@ var (
 	// -modcacherw is a boolean flag, set through strconv.ParseBool.
 	goFlagsModeled = []string{"-mod=mod", "-mod=readonly", "-modcacherw", "-modcacherw=true", "-modcacherw=false"}
 )
+
+// goInsecureHost reports whether a GOINSECURE pattern's first path element
+// matches host: a module path below bodega's host, fetched directly as
+// GONOPROXY or GOPRIVATE allow, is then fetched from that host without a
+// verified certificate.
+func goInsecureHost(globs, host string) bool {
+	for _, glob := range strings.Split(globs, ",") {
+		first, _, _ := strings.Cut(glob, "/")
+		if ok, _ := path.Match(first, host); ok && first != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // goMatchPrefixPatterns is module.MatchPrefixPatterns of golang.org/x/mod as
 // go1.27.4 vendors it: a comma-separated list of globs, each matched against
@@ -332,7 +386,7 @@ func GoEnvUncertified(file string, data []byte, u *url.URL) string {
 				why = "which quotes an argument, a form doctor does not split as the go command does"
 				break
 			}
-			for _, f := range strings.Fields(val) {
+			for _, f := range goFlagsFields(val) {
 				if !slices.Contains(goFlagsModeled, f) {
 					why = "which holds an argument other than -mod=mod, -mod=readonly and -modcacherw: the go command exits on a flag it does not know before it asks any proxy, and doctor interprets no other flag it does"
 					break
@@ -343,7 +397,7 @@ func GoEnvUncertified(file string, data []byte, u *url.URL) string {
 				why = "which names a checksum database other than " + strings.Join(goSumdbModeled, ", ") + ": the key or URL it holds is one the go command verifies or connects to in a way doctor does not interpret"
 			}
 		case key == "GOINSECURE":
-			if u != nil && goMatchPrefixPatterns(val, u.Hostname()+strings.TrimRight(u.Path, "/")) {
+			if u != nil && (goMatchPrefixPatterns(val, u.Hostname()+strings.TrimRight(u.Path, "/")) || goInsecureHost(val, u.Hostname())) {
 				why = "which holds a pattern matching bodega's host: the go command then fetches what it matches without requiring https or a verified certificate"
 			}
 		case !slices.ContainsFunc(GoEnvModeled, func(m ModeledSetting) bool { return m.Name == key }):
@@ -356,6 +410,16 @@ func GoEnvUncertified(file string, data []byte, u *url.URL) string {
 	return ""
 }
 
+// goFlagsFields splits GOFLAGS on the four bytes quoted.Split treats as
+// separators (go1.27.4, cmd/internal/quoted/quoted.go:15-55). strings.Fields
+// also splits on Unicode spaces, so a no-break space the go command keeps
+// inside a flag, and exits on, would vanish here and admit the flag.
+func goFlagsFields(val string) []string {
+	return strings.FieldsFunc(val, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+}
+
 // Uncertified is GoEnvUncertified for the user's go env file as this host
 // has it, a planned file read as planned.
 func (e GoEnv) Uncertified(u *url.URL) string {
@@ -365,12 +429,26 @@ func (e GoEnv) Uncertified(u *url.URL) string {
 	}
 	data, planned := e.Planned[file]
 	if !planned {
-		var err error
-		if data, err = os.ReadFile(file); err != nil {
-			return ""
+		// An absent file assigns nothing, and GOROOT/go.env still applies.
+		data, _ = os.ReadFile(file)
+	}
+	if u := GoEnvUncertified(file, data, u); u != "" {
+		return u
+	}
+	// GOROOT/go.env supplies what the user's file does not assign. Only its
+	// GOINSECURE is judged: a distribution's own file sets GOTOOLCHAIN and
+	// GOSUMDB, which are its defaults rather than a host's choices.
+	user := e.read(file)
+	if _, set := user["GOINSECURE"]; set {
+		return ""
+	}
+	if goroot := findGoroot(user["GOROOT"], e.env); goroot != "" {
+		dist := filepath.Join(goroot, "go.env")
+		if val := e.read(dist)["GOINSECURE"]; val != "" {
+			return GoEnvUncertified(dist, []byte("GOINSECURE="+val+"\n"), u)
 		}
 	}
-	return GoEnvUncertified(file, data, u)
+	return ""
 }
 
 // HelmModeled is the keys of a repositories.yaml doctor certifies helm
@@ -408,7 +486,7 @@ func HelmUncertified(file string, data []byte, u *url.URL) string {
 		if r == nil || !r.InsecureSkipTLSVerify || u == nil {
 			continue
 		}
-		if p, err := url.Parse(r.URL); err == nil && p.Host == u.Host {
+		if namesBodega(r.URL, u) {
 			return fmt.Sprintf("insecure_skip_tls_verify of the repository %s in %s, which is true: helm then accepts any certificate that repository presents, so no CA decides what it trusts and none can be certified for it", r.Name, file)
 		}
 	}
@@ -616,7 +694,9 @@ func (f *ContainerdHostsFile) SkipsVerify(is func(key string) bool) string {
 	}
 	for _, h := range f.Hosts {
 		if h.SkipVerify != nil && *h.SkipVerify && is(h.Key) {
-			return h.Key
+			// The top-level table's key is empty: its server comes from the
+			// registry directory, and "" would read as no match.
+			return cmp.Or(h.Key, "the registry's own server")
 		}
 	}
 	return ""
@@ -633,6 +713,8 @@ func (d *DockerDaemonFile) Insecure(u *url.URL) string {
 	if d == nil || u == nil {
 		return ""
 	}
+	// dockerd adds 127.0.0.0/8 to the insecure registries whatever the file
+	// says (registry/config.go at moby v28.5.2, newServiceConfig).
 	for _, r := range d.InsecureRegistries {
 		if _, network, err := net.ParseCIDR(r); err == nil {
 			if ip := net.ParseIP(u.Hostname()); ip == nil || network.Contains(ip) {

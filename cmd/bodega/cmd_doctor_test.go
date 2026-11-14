@@ -4396,3 +4396,184 @@ func TestUsageDocListsModeledSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit39GoFlagsLexingRefusesBeforeWrites(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	unsetEnv(t, "GOFLAGS")
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".config/go/env")
+	before := "GOFLAGS=-modcacherw\u00a0\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	release := filepath.Join(t.TempDir(), "os-release")
+	for f, b := range map[string][]byte{caFile: caPEM, release: []byte("ID=ubuntu\n")} {
+		if err := os.WriteFile(f, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, caPEM, 0600)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+	})
+	for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "gomod", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil || !strings.Contains(err.Error(), "GOFLAGS") {
+			t.Errorf("%v accepted Go's startup failure: err=%v\n%s", apply, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("%v wrote Go policy before refusal: %v %s", apply, err, got)
+		}
+		if _, err := os.Stat(filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")); !os.IsNotExist(err) {
+			t.Errorf("%v wrote a CA before refusal: %v", apply, err)
+		}
+		if ran != 0 {
+			t.Errorf("%v rebuilt the store %d times before refusing GOFLAGS", apply, ran)
+		}
+	}
+}
+
+func TestAudit39PipModeledTimeoutRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/pip.conf")
+	before := "[global]\ntimeout=-1\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "pypi", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil {
+			t.Errorf("%v certified a timeout pip cannot use: err=%v\n%s", apply, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("%v changed pip policy before refusal: %v %q", apply, err, got)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+			t.Errorf("%v wrote a CA before refusing timeout=-1: %v", apply, err)
+		}
+	}
+}
+
+func TestAudit39HelmMovedBypassRefusesBeforeWrites(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".config/helm/repositories.yaml")
+	before := clientconf.HelmDocument("- name: bodega\n  url: https://old.example/charts\n  insecure_skip_tls_verify: true\n  username: kept\n")
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	for f, data := range map[string][]byte{file: []byte(before), caFile: caPEM, release: []byte("ID=ubuntu\n")} {
+		if err := os.MkdirAll(filepath.Dir(f), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, caPEM, 0600)
+	}
+	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
+	for phase, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "helm", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil || !strings.Contains(err.Error(), "insecure_skip_tls_verify") {
+			t.Errorf("phase %d: want preflight refusal naming insecure_skip_tls_verify; err=%v\n%s", phase, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("phase %d: changed Helm policy before refusal: %v\n%s", phase, err, got)
+		}
+		if _, err := os.Stat(filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")); !os.IsNotExist(err) {
+			t.Errorf("phase %d: wrote CA before refusing moved repository's bypass: %v", phase, err)
+		}
+		if ran != 0 {
+			t.Errorf("phase %d: ran %d rebuilds before refusal", phase, ran)
+		}
+	}
+}
+
+func TestCARefusesHelmRetainedRepositoryCARefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(31), Subject: pkix.Name{CommonName: "previous registry CA"}, IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(home, ".config/helm/repositories.yaml")
+	previousCA := filepath.Join(home, "previous-ca.pem")
+	before := clientconf.HelmDocument("- name: internal-charts\n  url: " + srv.URL + "/helm\n  caFile: " + previousCA + "\n")
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	for f, data := range map[string][]byte{file: []byte(before), previousCA: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), caFile: caPEM, release: []byte("ID=ubuntu\n")} {
+		if err := os.MkdirAll(filepath.Dir(f), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, home, release
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		bundle := filepath.Join(home, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, caPEM, 0600)
+	}
+	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
+	out, applyErr := runDoctor(t, "--configure", "helm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if applyErr == nil || !strings.Contains(applyErr.Error(), "internal-charts") {
+		t.Fatalf("want a refusal naming the retained repository's CA, got %v\n%s", applyErr, out)
+	}
+	if got, err := os.ReadFile(file); err != nil || string(got) != before {
+		t.Errorf("doctor rewrote repositories.yaml before refusing its retained caFile: %v\n%s\nrefusal: %v", err, got, applyErr)
+	}
+	if _, err := os.Stat(filepath.Join(home, "usr/local/share/ca-certificates/bodega-ca.crt")); !os.IsNotExist(err) {
+		t.Errorf("doctor installed the system CA before refusing the retained repository's CA: %v", err)
+	}
+	if ran != 0 {
+		t.Errorf("doctor rebuilt the trust store %d times before refusing the retained repository's CA", ran)
+	}
+}

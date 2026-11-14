@@ -2855,3 +2855,168 @@ func TestCommonConfigurationsVerifyAndAnUnlistedSettingIsUnchecked(t *testing.T)
 		})
 	}
 }
+
+func TestAudit39GoFlagsLexingIsUnchecked(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	file := filepath.Join(root, "go.env")
+	for _, flags := range []string{"", "-modcacherw\u00a0"} {
+		writeTrustFile(t, file, "GOPROXY="+srv.URL+"\nGOFLAGS="+flags+"\n")
+		cmd := exec.Command(goBin, "mod", "download", "example.com/audit@v1.0.0")
+		cmd.Dir = root
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "GOENV=" + file, "GOTOOLCHAIN=go1.27.4", "GOSUMDB=off", "GOPATH=" + filepath.Join(root, "gopath"), "GOWORK=off"}
+		requests.Store(0)
+		out, err := cmd.CombinedOutput()
+		if flags == "" && requests.Load() == 0 {
+			t.Fatalf("native control reached no proxy: %v %s", err, out)
+		}
+		if flags != "" && (err == nil || !strings.Contains(string(out), "unknown flag -modcacherw") || requests.Load() != 0) {
+			t.Fatalf("native failure: err=%v requests=%d out=%s", err, requests.Load(), out)
+		}
+		t.Logf("native GOFLAGS=%q: err=%v requests=%d out=%s", flags, err, requests.Load(), out)
+	}
+	p, _, base := auditTrust(t)
+	p.ConfigDir = func() (string, error) { return filepath.Join(p.Home, ".config"), nil }
+	file = filepath.Join(p.Home, ".config/go/env")
+	writeTrustFile(t, file, "GOPROXY="+base+"/go\n")
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, "GOPROXY="+base+"/go\nGOFLAGS=-modcacherw\u00a0\n")
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "GOFLAGS") {
+		t.Errorf("selected verdict certifies Go that exits before any request: %+v", v)
+	}
+	row := p.Apply([]Finding{checkGoproxy(p.Getenv, p.ConfigDir)}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, "GOFLAGS") {
+		t.Errorf("ordinary row certifies Go that exits before any request: %+v", row)
+	}
+}
+
+func TestAudit39PipModeledTimeoutIsUnchecked(t *testing.T) {
+	python := oracletest.Pip(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>"))
+	}))
+	defer srv.Close()
+	home := t.TempDir()
+	file := filepath.Join(home, "pip.conf")
+	for _, timeout := range []string{"30", "-1"} {
+		writeTrustFile(t, file, "[global]\nindex-url="+srv.URL+"/simple\ntimeout="+timeout+"\nretries=0\ndisable-pip-version-check=true\n")
+		cmd := exec.Command(python, "-m", "pip", "install", "--dry-run", "--no-deps", "bodega-audit-does-not-exist")
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + file, "PIP_BREAK_SYSTEM_PACKAGES=true"}
+		requests.Store(0)
+		out, err := cmd.CombinedOutput()
+		if timeout == "30" && requests.Load() == 0 {
+			t.Fatalf("native control: %v %s", err, out)
+		}
+		if timeout == "-1" && (requests.Load() != 0 || err == nil || !strings.Contains(string(out), "timeout cannot be set to a value less than or equal to 0")) {
+			t.Fatalf("native negative timeout: requests=%d err=%v %s", requests.Load(), err, out)
+		}
+		t.Logf("native timeout=%s: requests=%d err=%v", timeout, requests.Load(), err)
+	}
+	p, ca, base := auditTrust(t)
+	file = filepath.Join(p.Home, ".config/pip/pip.conf")
+	before := "[global]\nindex-url=" + base + "/simple\ncert=" + ca + "\ntimeout=30\n"
+	writeTrustFile(t, file, before)
+	if v := auditState(t, p, "pip-config", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, strings.ReplaceAll(before, "timeout=30", "timeout=-1"))
+	if v := auditState(t, p, "pip-config", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "timeout") {
+		t.Errorf("selected verdict certifies pip that rejects its timeout before TLS: %+v", v)
+	}
+	row := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, "timeout") {
+		t.Errorf("ordinary row certifies pip that rejects its timeout: %+v", row)
+	}
+}
+
+func TestTrustUnchecksContainerdEquivalentHostReport(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml")
+	writeTrustFile(t, file, "server=\"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca=\""+ca+"\"\ncapabilities=[\"pull\",\"resolve\"]\n")
+	if v := auditState(t, p, "oci-containerd", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/ghcr.io/hosts.toml"), "server=\"https://ghcr.io\"\n[host.\"https://BODEGA.internal:8443/v2\"]\ncapabilities=[\"pull\",\"resolve\"]\nskip_verify=true\n")
+	if v := auditState(t, p, "oci-containerd", base); v.State != TrustUnchecked {
+		t.Errorf("selected verdict ignores skip_verify at bodega's case-equivalent host in another registry file: %+v", v)
+	}
+	row := p.Apply([]Finding{{Check: "oci-containerd", Status: StatusOK}}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+		t.Errorf("ordinary row certifies a containerd bypass that AddCA refuses: %+v", row)
+	}
+}
+
+func TestTrustUnchecksPipPaddedEndpointPortReport(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	base = strings.Replace(base, ":8443", ":08443", 1)
+	file := filepath.Join(p.Home, ".config/pip/pip.conf")
+	body := "[global]\nindex-url=" + base + "/simple\ncert=" + ca + "\n"
+	writeTrustFile(t, file, body)
+	if v := auditState(t, p, "pip-config", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, body+"[download]\ntrusted-host=bodega.internal:8443\n")
+	if v := auditState(t, p, "pip-config", base); v.State != TrustUnchecked {
+		t.Errorf("selected verdict certifies trusted-host for the normalized endpoint port: %+v", v)
+	}
+	row := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+		t.Errorf("ordinary row certifies pip's trusted-host bypass: %+v", row)
+	}
+}
+
+func TestTrustUnchecksHelmPaddedEndpointPortReport(t *testing.T) {
+	p, _, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".config/helm/repositories.yaml")
+	body := "- name: bodega\n  url: " + base + "/helm\n"
+	writeTrustFile(t, file, clientconf.HelmDocument(body))
+	if v := auditState(t, p, "helm-repos", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	body += "- name: insecure-alias\n  url: https://bodega.internal:08443/helm\n  insecure_skip_tls_verify: true\n"
+	writeTrustFile(t, file, clientconf.HelmDocument(body))
+	if v := auditState(t, p, "helm-repos", base); v.State != TrustUnchecked {
+		t.Errorf("selected verdict certifies an insecure repository at the same numeric port: %+v", v)
+	}
+	row := p.Apply([]Finding{{Check: "helm-repos", Status: StatusOK}}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+		t.Errorf("ordinary row certifies Helm's insecure alias: %+v", row)
+	}
+}
+
+func TestTrustUnchecksGoDistributionBypassReport(t *testing.T) {
+	p, _, base := auditTrust(t)
+	base = strings.Replace(base, ":8443", "", 1)
+	p.ConfigDir = func() (string, error) { return filepath.Join(p.Home, ".config"), nil }
+	goroot := filepath.Join(p.Root, "go")
+	p.Getenv = func(key string) string {
+		if key == "GOROOT" {
+			return goroot
+		}
+		return ""
+	}
+	writeTrustFile(t, filepath.Join(p.Home, ".config/go/env"), "GOPROXY="+base+"/go\n")
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, filepath.Join(goroot, "go.env"), "GONOPROXY=bodega.internal/private\nGOINSECURE=bodega.internal/private\n")
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustUnchecked {
+		t.Errorf("selected verdict ignores GOINSECURE in GOROOT/go.env: %+v", v)
+	}
+	row := p.Apply([]Finding{checkGoproxy(p.Getenv, p.ConfigDir)}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+		t.Errorf("ordinary row certifies Go's distribution-file bypass: %+v", row)
+	}
+}

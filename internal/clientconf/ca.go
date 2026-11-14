@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -608,6 +609,65 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 	return nil
 }
 
+// plannedUncertified runs the certification checks over each file as the
+// plan would write it, after every merge and before anything is written. The
+// checks on the host's files judge settings against the URL they hold today,
+// and a merge can move an entry to bodega carrying settings scoped to it,
+// such as a helm repository's insecure_skip_tls_verify; containerd and
+// Docker read their merged documents again for the same reason.
+func (h CAHost) plannedUncertified(changes []Change, ca CA) error {
+	base, _ := url.Parse(h.Base)
+	for _, c := range changes {
+		what := ""
+		switch c.Record.System {
+		case manifest.TypeHelm:
+			if u := HelmUncertified(c.Target, c.New, base); u != "" {
+				what = "helm would read " + u
+			} else if u := helmForeignCAFile(c.Target, c.New, base, ca); u != "" {
+				what = "helm would read " + u
+			}
+		case manifest.TypeGomod:
+			if u := GoEnvUncertified(c.Target, c.New, base); u != "" {
+				what = "the go env file would set " + u
+			}
+		case manifest.TypePypi:
+			if u := PipUncertified([]PipLayer{{File: c.Target, Data: c.New}}, h.Getenv, base); u != "" {
+				what = "pip's configuration would set " + u
+			}
+		}
+		if what != "" {
+			return uncertified(c.Record.System, what, c.Target)
+		}
+	}
+	if err := h.containerdReads(changes); err != nil {
+		return err
+	}
+	return h.dockerReads(changes)
+}
+
+// helmForeignCAFile names a repository at bodega whose caFile holds none of
+// the certificates being installed: helm verifies that repository against
+// its caFile alone, not the system store this command rebuilds.
+func helmForeignCAFile(file string, data []byte, base *url.URL, ca CA) string {
+	doc, err := ParseHelmFile(data)
+	if err != nil || doc == nil || base == nil {
+		return ""
+	}
+	for _, r := range doc.Repositories {
+		if r == nil || r.CAFile == "" || !namesBodega(r.URL, base) {
+			continue
+		}
+		held, _ := os.ReadFile(r.CAFile)
+		if inFile, err := ParseCA(held); err == nil && slices.ContainsFunc(inFile.Certs, func(c *x509.Certificate) bool {
+			return slices.ContainsFunc(ca.Certs, c.Equal)
+		}) {
+			continue
+		}
+		return fmt.Sprintf("the caFile %s of the repository %s in %s, which holds none of the certificates being installed: helm verifies that repository against its caFile alone, so the CA this command installs decides nothing for it", r.CAFile, r.Name, file)
+	}
+	return ""
+}
+
 // uncertified is the refusal for a setting one of the modeled lists does not
 // hold, or one that turns verification off: what names it, and the file the
 // plan would have written.
@@ -771,8 +831,24 @@ func (h CAHost) containerdReads(changes []Change) error {
 			}
 		}
 	}
+	plannedData := map[string][]byte{}
+	for _, c := range changes {
+		if slices.Contains(planned, c.Target) && c.New != nil {
+			plannedData[c.Target] = c.New
+		}
+	}
+	base, _ := url.Parse(h.Base)
 	for _, f := range files {
 		doc, err := LoadContainerdHostsFile(f)
+		if data, ok := plannedData[f]; ok {
+			doc, err = ParseContainerdHostsFile(filepath.Dir(f), data)
+		}
+		// A file with no server key takes its server from the registry
+		// directory it sits in, so its top-level table is bodega's when that
+		// directory names bodega.
+		atBodega := func(key string) bool {
+			return base != nil && (namesBodega(key, base) || key == "" && namesBodega(filepath.Base(filepath.Dir(f)), base))
+		}
 		if err != nil {
 			return fmt.Errorf("%s: containerd discards its registry configuration (%w) and pulls from the registry's own server instead, so it would use neither the bodega host nor the ca this command writes, and the install could not be verified. "+
 				"Nothing was written. Fix that field so containerd loads the file (its log names the same error at each pull), then re-run", manifest.TypeOCI, err)
@@ -782,11 +858,11 @@ func (h CAHost) containerdReads(changes []Change) error {
 		// the verdict reads. The ca of bodega's own host table is the plan's
 		// to replace; every other file such a hosts.toml names has to load
 		// as it stands.
-		reaches := slices.Contains(planned, f) || doc != nil && slices.ContainsFunc(doc.Hosts, func(host ContainerdRegistryHost) bool { return host.Key == trim(h.Base) })
+		reaches := slices.Contains(planned, f) || doc != nil && slices.ContainsFunc(doc.Hosts, func(host ContainerdRegistryHost) bool { return atBodega(host.Key) })
 		if !reaches {
 			continue
 		}
-		if key := doc.SkipsVerify(func(key string) bool { return key == trim(h.Base) }); key != "" {
+		if key := doc.SkipsVerify(atBodega); key != "" {
 			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents, so no CA decides what it trusts", f, key), f)
 		}
 		if err := doc.TLSError(trim(h.Base)); err != nil {
@@ -1169,6 +1245,11 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if err != nil {
 			return CAInstall{}, fmt.Errorf("%s: %w", rec.System, err)
 		}
+		// The path is written into a line-based file, where a line break
+		// would end the setting and start another one the client reads.
+		if strings.ContainsFunc(caPath, unicode.IsControl) {
+			return CAInstall{}, fmt.Errorf("%s: the CA's path %q holds a control character, which would split the setting written to %s into lines the client reads as settings of their own. Nothing was written. Use a home directory and CA path without one, then re-run", rec.System, caPath, c.Target)
+		}
 		set := []string{line(caPath)}
 		// outranking lists the sections of body whose own CA setting the
 		// client reads ahead of the one under header: for pip a command's
@@ -1290,6 +1371,9 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		}
 	}
 
+	if err := h.plannedUncertified(append(slices.Clone(in.Changes), selected...), ca); err != nil {
+		return CAInstall{}, err
+	}
 	if len(system) > 0 {
 		store, err := systemStoreFor(h)
 		if err != nil {

@@ -912,10 +912,18 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		if doc == nil {
 			continue
 		}
-		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return mirrorIsBodega(h.Key, u.Host) }) {
+		// A file with no server key takes its server from its registry
+		// directory, so its top-level table is bodega's when that names bodega.
+		atBodega := func(key string) bool {
+			return clientconf.NamesBodega(key, u) || key == "" && clientconf.NamesBodega(filepath.Base(filepath.Dir(path)), u)
+		}
+		if key := doc.SkipsVerify(atBodega); key != "" {
+			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
+		}
+		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return clientconf.NamesBodega(h.Key, u) }) {
 			continue
 		}
-		if key := doc.SkipsVerify(func(key string) bool { return mirrorIsBodega(key, u.Host) }); key != "" {
+		if key := doc.SkipsVerify(atBodega); key != "" {
 			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
 		}
 		if err := doc.TLSError(""); err != nil {

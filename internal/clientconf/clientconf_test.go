@@ -15,8 +15,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"maps"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -3058,6 +3060,11 @@ func TestPipInstallErrorMatchesNativePip(t *testing.T) {
 		global("timeout = 5."),
 		global("timeout = ."),
 		global("timeout = +inf"),
+		global("timeout = -1"),
+		global("timeout = 0"),
+		global("timeout = -0.0"),
+		global("timeout = nan"),
+		global("timeout = 0.001"),
 		global("timeout = -NaN"),
 		global("timeout = Infinity"),
 		global("timeout = 0x10"),
@@ -5203,4 +5210,496 @@ func TestGoFlagsModeledStartNativeGo(t *testing.T) {
 		}
 		t.Logf("GOFLAGS=%q: modeled=%v requests=%d", flags, modeled, requests.Load())
 	}
+}
+
+// TestPlannedFilesAreCertifiedBeforeWrites drives the gate AddCA runs over
+// each file as the plan would write it: a setting the host's file scopes to
+// another URL, or a value the merge carries in, refuses there for every
+// reader whose settings can travel with a merged entry, and the same files
+// without it pass.
+func TestPlannedFilesAreCertifiedBeforeWrites(t *testing.T) {
+	h := CAHost{Base: testBase, Getenv: func(string) string { return "" }, GOOS: OSLinux}
+	cases := []struct {
+		system, target, bad, good, names string
+	}{
+		{manifest.TypeHelm, "/home/u/.config/helm/repositories.yaml",
+			"apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- name: bodega\n  url: " + testBase + "/helm\n  insecure_skip_tls_verify: true\n",
+			"apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- name: bodega\n  url: " + testBase + "/helm\n",
+			"insecure_skip_tls_verify"},
+		{manifest.TypeGomod, "/home/u/.config/go/env",
+			"GOPROXY=" + testBase + "/go\nGOFLAGS=-modcacherw \n",
+			"GOPROXY=" + testBase + "/go\nGOFLAGS=-modcacherw\n",
+			"GOFLAGS"},
+		{manifest.TypePypi, "/home/u/.config/pip/pip.conf",
+			"[global]\nindex-url = " + testBase + "/pypi/simple/\ntimeout = -1\n",
+			"[global]\nindex-url = " + testBase + "/pypi/simple/\ntimeout = 30\n",
+			"timeout"},
+	}
+	for _, c := range cases {
+		change := func(body string) []Change {
+			return []Change{{Record: PlanRecord{System: c.system, Path: c.target}, Target: c.target, New: []byte(body)}}
+		}
+		if err := h.plannedUncertified(change(c.bad), CA{}); err == nil || !strings.Contains(err.Error(), c.names) || !strings.Contains(err.Error(), "Nothing was written") {
+			t.Errorf("%s: planned file with %s: err = %v, want a refusal naming it", c.system, c.names, err)
+		}
+		if err := h.plannedUncertified(change(c.good), CA{}); err != nil {
+			t.Errorf("%s: planned file without %s refused: %v", c.system, c.names, err)
+		}
+	}
+}
+
+func TestCARefusesContainerdEquivalentHostBypass(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/containerd/certs.d/docker.io/hosts.toml"
+	writeUnder(t, home, map[string]string{file: "server = \"https://registry-1.docker.io\"\n\n[host.\"" + testBase + "/v2\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n"})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, file))
+	doc, err := ParseContainerdHostsFile(filepath.Dir(c.Target), c.New)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := doc.Hosts[0]
+	if first.Host != "bodega.example.com" || first.Path != "/v2" || !first.Pull || first.SkipVerify == nil || !*first.SkipVerify {
+		t.Fatalf("fixture no longer reaches bodega without verification: %+v", first)
+	}
+	t.Fatal("AddCA accepted a first-choice bodega host with skip_verify=true because its table key includes /v2")
+}
+
+func TestCARefusesContainerdMergedServerBypass(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/containerd/certs.d/bodega.example.com/hosts.toml"
+	writeUnder(t, home, map[string]string{file: "server = \"https://old.example.com\"\nskip_verify = true\n"})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "bodega.example.com", testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, file))
+	doc, err := ParseContainerdHostsFile(filepath.Dir(c.Target), c.New)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key := doc.SkipsVerify(func(key string) bool { return key == testBase }); key == "" {
+		t.Fatalf("fixture lost the merged server's bypass:\n%s", c.New)
+	}
+	t.Fatal("AddCA accepted a merged server pointing to bodega with skip_verify=true; its second hosts.toml check still reads the old server")
+}
+
+func TestCARefusesHelmEquivalentHostBypass(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/helm/repositories.yaml"
+	writeUnder(t, home, map[string]string{file: HelmDocument("- name: insecure-alias\n  url: https://bodega.example.com:443/helm\n  insecure_skip_tls_verify: true\n")})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, file))
+	doc, err := ParseHelmFile(c.New)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Repositories) != 2 || !doc.Repositories[0].InsecureSkipTLSVerify || doc.Repositories[0].URL != "https://bodega.example.com:443/helm" {
+		t.Fatalf("fixture lost the unverified alias:\n%s", c.New)
+	}
+	t.Fatal("AddCA accepted an insecure Helm repository at bodega's endpoint because its URL spells the default HTTPS port explicitly")
+}
+
+func TestCARefusesNpmCAPathInjectsVerificationBypass(t *testing.T) {
+	npm := oracletest.Npm(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer srv.Close()
+	home := filepath.Join(t.TempDir(), "home\nstrict-ssl=false\n#")
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeUnder(t, home, map[string]string{".npmrc": "audit=false\n"})
+	h := CAHost{Base: srv.URL, Home: home, Root: t.TempDir(), GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Npm(srv.URL, nil)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, ".npmrc"))
+	if !slices.ContainsFunc(NpmOptions(c.New), func(o NpmOption) bool { return o.Key == "strict-ssl" && o.Value == "false" }) {
+		t.Fatalf("fixture did not produce a TLS bypass:\n%s", c.New)
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, npm, "ping", "--fetch-retries=0", "--fetch-timeout=3000", "--loglevel=error", "--cache="+t.TempDir())
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native npm did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted strict-ssl=false injected by its CA path; native npm sent %d requests to an HTTPS server whose certificate the installed CA does not sign", requests.Load())
+}
+
+func TestCARefusesPipDownloadTrustedHostBypass(t *testing.T) {
+	python := oracletest.Pip(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>"))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "unrelated.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/pip.conf"
+	writeUnder(t, home, map[string]string{file: "[global]\nretries=0\ndisable-pip-version-check=true\n[download]\ntrusted-host=" + u.Host + "\n"})
+	h := CAHost{Base: srv.URL, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Pip(srv.URL)), ca, h)
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, python, "-m", "pip", "download", "--no-deps", "--dest", filepath.Join(home, "downloads"), "bodega-loop1-does-not-exist")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + filepath.Join(home, file)}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native pip did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted [download] trusted-host; native pip sent %d requests to an HTTPS server whose certificate the installed CA does not sign", requests.Load())
+}
+
+func TestCARefusesGoModuleSubpathBypass(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "bodega.example.com:443" {
+			http.Error(w, "unexpected proxy target", http.StatusBadRequest)
+			return
+		}
+		upstream, err := net.DialTimeout("tcp", strings.TrimPrefix(srv.URL, "https://"), 5*time.Second)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		client, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go func() {
+			_, _ = io.Copy(upstream, buffered)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(client, upstream)
+	}))
+	defer proxy.Close()
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/go/env"
+	writeUnder(t, home, map[string]string{file: "GONOPROXY=bodega.example.com/private\nGOINSECURE=bodega.example.com/private\n"})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, goBin, "mod", "download", "bodega.example.com/private@v1.0.0")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GOENV=" + filepath.Join(home, file), "GOTOOLCHAIN=local", "GOSUMDB=off", "GOWORK=off", "GOPATH=" + filepath.Join(home, "gopath"), "HTTPS_PROXY=" + proxy.URL}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native Go did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted GOINSECURE scoped below bodega's host; native Go sent %d requests through GONOPROXY without verifying the server certificate", requests.Load())
+}
+
+// TestStockUbuntuAptConfigurationCertifies loads the apt.conf.d an Ubuntu
+// 26.04 cloud image ships (copied from one, hooks and all) and asserts doctor
+// certifies apt under it: the stock hooks outside Acquire decide no trust.
+func TestStockUbuntuAptConfigurationCertifies(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "etc", "apt", "apt.conf.d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stock, err := filepath.Glob(filepath.Join("testdata", "ubuntu-26.04-apt.conf.d", "*"))
+	if err != nil || len(stock) < 10 {
+		t.Fatalf("stock apt.conf.d fixture: %d files, %v", len(stock), err)
+	}
+	for _, f := range stock {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, filepath.Base(f)), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf, err := LoadAptConfig(root, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("LoadAptConfig: %v", err)
+	}
+	if u := conf.Uncertified("bodega.example.com"); u != "" {
+		t.Errorf("stock Ubuntu apt.conf.d is not certified: %s", u)
+	}
+	if u := conf.TLSUnmodeled("bodega.example.com"); u != "" {
+		t.Errorf("stock Ubuntu apt.conf.d is unmodeled for TLS: %s", u)
+	}
+	if err := conf.HTTPSError("bodega.example.com", root); err != nil {
+		t.Errorf("stock Ubuntu apt.conf.d stops apt's https method: %v", err)
+	}
+}
+
+func TestCARefusesPipPaddedEndpointPort(t *testing.T) {
+	python := oracletest.Pip(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>"))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "https://" + net.JoinHostPort(u.Hostname(), "0"+u.Port())
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "unrelated.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/pip.conf"
+	writeUnder(t, home, map[string]string{file: "[global]\nretries=0\ndisable-pip-version-check=true\ntrusted-host=" + u.Host + "\n"})
+	h := CAHost{Base: base, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Pip(base)), ca, h)
+	if err != nil {
+		if !strings.Contains(err.Error(), "trusted-host") {
+			t.Fatalf("unexpected refusal: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, python, "-m", "pip", "download", "--no-deps", "--dest", filepath.Join(home, "downloads"), "bodega-loop2-does-not-exist")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + filepath.Join(home, file)}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native pip did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted trusted-host=%s for %s; native pip sent %d requests with an unrelated installed CA", u.Host, base, requests.Load())
+}
+
+func TestCARefusesHelmPaddedEndpointPort(t *testing.T) {
+	helm := oracletest.Helm(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte("apiVersion: v1\nentries: {}\n"))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := "https://" + net.JoinHostPort(u.Hostname(), "0"+u.Port()) + "/helm"
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "unrelated.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/helm/repositories.yaml"
+	writeUnder(t, home, map[string]string{file: HelmDocument("- name: insecure-alias\n  url: " + alias + "\n  insecure_skip_tls_verify: true\n")})
+	h := CAHost{Base: srv.URL, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Helm(srv.URL)), ca, h)
+	if err != nil {
+		if !strings.Contains(err.Error(), "insecure_skip_tls_verify") {
+			t.Fatalf("unexpected refusal: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, helm, "repo", "update", "insecure-alias")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "HELM_REPOSITORY_CONFIG=" + filepath.Join(home, file), "HELM_REPOSITORY_CACHE=" + filepath.Join(home, "cache")}
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil || requests.Load() == 0 {
+		t.Fatalf("native Helm did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted insecure_skip_tls_verify at %s; native Helm fetched %d indexes without trusting the installed CA", alias, requests.Load())
+}
+
+func TestCARefusesGoDistributionBypass(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "bodega.example.com:443" {
+			http.Error(w, "unexpected proxy target", http.StatusBadRequest)
+			return
+		}
+		upstream, err := net.DialTimeout("tcp", strings.TrimPrefix(srv.URL, "https://"), 5*time.Second)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		client, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go func() {
+			_, _ = io.Copy(upstream, buffered)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(client, upstream)
+	}))
+	defer proxy.Close()
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/go/env"
+	rootOut, err := exec.Command(goBin, "env", "GOROOT").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualRoot := strings.TrimSpace(string(rootOut))
+	goroot := t.TempDir()
+	entries, err := os.ReadDir(actualRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != "go.env" {
+			if err := os.Symlink(filepath.Join(actualRoot, entry.Name()), filepath.Join(goroot, entry.Name())); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeUnder(t, goroot, map[string]string{"go.env": "GONOPROXY=bodega.example.com/private\nGOINSECURE=bodega.example.com/private\n"})
+	getenv := func(key string) string {
+		if key == "GOROOT" {
+			return goroot
+		}
+		return ""
+	}
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: getenv}
+	in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, goBin, "mod", "download", "bodega.example.com/private@v1.0.0")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GOENV=" + filepath.Join(home, file), "GOTOOLCHAIN=local", "GOROOT=" + goroot, "GOSUMDB=off", "GOWORK=off", "GOPATH=" + filepath.Join(home, "gopath"), "HTTPS_PROXY=" + proxy.URL}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native Go did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA ignored GOINSECURE in GOROOT/go.env; native Go sent %d requests through GONOPROXY without verifying the server certificate", requests.Load())
+}
+
+func TestCARefusesContainerdImplicitRegistryServer(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/containerd/certs.d/bodega.example.com/hosts.toml"
+	const before = "skip_verify = true\n"
+	writeUnder(t, home, map[string]string{file: before})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"), ContainerdConfig(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml"))
+	if !strings.Contains(string(c.New), "ca = ") {
+		t.Fatalf("fixture did not install the mirror CA:\n%s", c.New)
+	}
+	doc, err := LoadContainerdHostsFile(filepath.Join(home, file))
+	if err != nil || doc == nil || len(doc.Hosts) != 1 {
+		t.Fatalf("fixture does not load: %+v, %v", doc, err)
+	}
+	server := doc.Hosts[0]
+	if !server.Server || server.Key != "" || server.SkipVerify == nil || !*server.SkipVerify {
+		t.Fatalf("fixture lost its implicit server's skip_verify: %+v", server)
+	}
+	t.Fatal("AddCA accepted skip_verify=true for bodega's own registry directory; containerd fills an omitted server from the registry name, but preflight matches only the empty server key")
 }
