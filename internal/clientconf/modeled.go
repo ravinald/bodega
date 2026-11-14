@@ -214,8 +214,8 @@ func NpmUncertified(getenv func(string) string, files []string) string {
 // variable sets it to anything but the empty string, which pip reads as no
 // setting. An option the parser does not declare is one pip skips.
 var PipModeled = []ModeledSetting{
-	{"index-url", "PipIndexURL: a location pip ignores or sends no TLS request to"},
-	{"extra-index-url", "PipIndexURL, per word"},
+	{"index-url", "PipEndpoint.Dest: a location pip resolves to no host, or one it cannot be resolved as pip does"},
+	{"extra-index-url", "PipEndpoint.Dest, per word"},
 	{"trusted-host", "none: an append of text; refused where a word names bodega"},
 	{"timeout", "PipInstallError: not a float"},
 	{"default-timeout", "PipInstallError, as timeout"},
@@ -756,15 +756,114 @@ type PipEndpoint struct {
 	Setting, From, Raw string
 }
 
+// PipDest is where pip sends its request for a location. Scheme is "http"
+// or "https", or "" for a location pip fetches from no host: a local path, a
+// file: URL, a VCS link or any other scheme pip does not request. Port is 0
+// when the location names none.
+type PipDest struct {
+	Scheme, Host string
+	Port         int
+}
+
+// Dest resolves the location the way pip 26.2.1 does before it connects.
+// build_source (pip/_internal/index/sources.py, lines 227-253) asks is_url
+// (pip/_internal/vcs/versioncontrol.py, lines 44-51), which reads the scheme
+// as urlsplit does; a location with no scheme is a path or is ignored, a VCS
+// one is skipped by the collector and requests has no adapter for ftp, so
+// only http and https reach a server. For those, CPython's
+// urllib.parse.urlsplit splits the authority (the last @ ends the userinfo,
+// the first : after the host or ] starts the port, which must be ASCII
+// digits within 0-65535) and the host is percent-decoded and lowercased, so
+// http://bodega%2einternal/ is a request to bodega.internal. A location in
+// a form this does not follow is an error, never an absent endpoint: the
+// caller reports it unchecked, because pip may reach bodega through it.
+func (e PipEndpoint) Dest() (PipDest, error) {
+	raw := strings.TrimSpace(e.Raw)
+	scheme, rest, ok := strings.Cut(raw, ":")
+	if !ok {
+		return PipDest{}, nil
+	}
+	scheme = strings.ToLower(scheme)
+	if scheme != "http" && scheme != "https" {
+		return PipDest{}, nil
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] <= ' ' || raw[i] > '~' || raw[i] == '\\' {
+			return PipDest{}, fmt.Errorf("it holds a byte outside printable ASCII or a backslash, which pip's URL handling rewrites")
+		}
+	}
+	if !strings.HasPrefix(rest, "//") {
+		return PipDest{}, fmt.Errorf("it names the %s scheme with no // authority", scheme)
+	}
+	netloc := rest[2:]
+	if i := strings.IndexAny(netloc, "/?#"); i >= 0 {
+		netloc = netloc[:i]
+	}
+	if at := strings.LastIndex(netloc, "@"); at >= 0 {
+		netloc = netloc[at+1:]
+	}
+	var host, port string
+	if strings.HasPrefix(netloc, "[") {
+		end := strings.Index(netloc, "]")
+		if end < 0 {
+			return PipDest{}, fmt.Errorf("its [ IPv6 host is not closed")
+		}
+		host = netloc[1:end]
+		after := netloc[end+1:]
+		if after != "" && !strings.HasPrefix(after, ":") {
+			return PipDest{}, fmt.Errorf("text follows its ] IPv6 host")
+		}
+		port = strings.TrimPrefix(after, ":")
+		if ip := net.ParseIP(host); ip == nil || ip.To4() != nil {
+			return PipDest{}, fmt.Errorf("its bracketed host %q is not an IPv6 address", host)
+		}
+	} else {
+		host, port, _ = strings.Cut(netloc, ":")
+		decoded, err := url.PathUnescape(host)
+		if err != nil {
+			return PipDest{}, fmt.Errorf("its host %q holds a percent escape pip decodes and doctor cannot", host)
+		}
+		host = decoded
+		for i := 0; i < len(host); i++ {
+			c := host[i]
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '-' || c == '_') {
+				return PipDest{}, fmt.Errorf("its host %q decodes to a character outside a DNS name", decoded)
+			}
+		}
+	}
+	if host == "" {
+		return PipDest{}, fmt.Errorf("it names no host")
+	}
+	d := PipDest{Scheme: scheme, Host: strings.TrimSuffix(strings.ToLower(host), ".")}
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || strings.TrimLeft(port, "0123456789") != "" || n > 65535 {
+			return PipDest{}, fmt.Errorf("its port %q is not one pip accepts", port)
+		}
+		d.Port = n
+	}
+	return d, nil
+}
+
 // TLS is the https URL pip fetches the endpoint from, nil when pip sends no
-// TLS request to it.
-func (e PipEndpoint) TLS() *url.URL { return PipIndexURL(e.Raw) }
+// TLS request to it or Dest cannot say where it goes.
+func (e PipEndpoint) TLS() *url.URL {
+	d, err := e.Dest()
+	if err != nil || d.Scheme != "https" {
+		return nil
+	}
+	port := d.Port
+	if port == 0 {
+		port = 443
+	}
+	return &url.URL{Scheme: "https", Host: net.JoinHostPort(d.Host, strconv.Itoa(port))}
+}
 
 // Plain reports whether pip fetches the endpoint over plain http, where no
 // certificate is checked.
 func (e PipEndpoint) Plain() bool {
-	p, err := url.Parse(strings.TrimSpace(e.Raw))
-	return err == nil && strings.EqualFold(p.Scheme, "http") && p.Host != ""
+	d, err := e.Dest()
+	return err == nil && d.Scheme == "http"
 }
 
 // PipEndpoints is every location pip install fetches from under layers and the
@@ -802,9 +901,30 @@ func PipEndpoints(layers []PipLayer, getenv func(string) string) []PipEndpoint {
 // the location; "" for none.
 func PipPlainRoute(eps []PipEndpoint, u *url.URL) (setting, route string) {
 	for _, e := range eps {
-		if e.Plain() && namesBodega(e.Raw, u) {
+		d, err := e.Dest()
+		if err != nil || d.Scheme != "http" {
+			continue
+		}
+		at := d.Host
+		if d.Port != 0 {
+			at = net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
+		}
+		if namesBodega(at, u) {
 			return fmt.Sprintf("%s (%s)", e.Setting, e.From), e.Raw
 		}
 	}
 	return "", ""
+}
+
+// PipUnresolved is the first endpoint of eps whose destination Dest cannot
+// resolve as pip does, as a phrase naming its setting, where it was set, the
+// location and why; "" for none. Any one of them may be a request to bodega
+// over either transport, so it leaves pip unchecked whatever the others say.
+func PipUnresolved(eps []PipEndpoint) string {
+	for _, e := range eps {
+		if _, err := e.Dest(); err != nil {
+			return fmt.Sprintf("%s (%s) is %s, and %v", e.Setting, e.From, e.Raw, err)
+		}
+	}
+	return ""
 }

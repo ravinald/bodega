@@ -5756,3 +5756,88 @@ func TestPipModeledLocationsFeedEndpoints(t *testing.T) {
 		t.Errorf("the second word of PIP_FIND_LINKS: setting=%q route=%q", setting, route)
 	}
 }
+
+// A pip location resolves to the host pip connects to, or is reported
+// unresolved: no form pip may send to bodega drops out of the endpoint list.
+func TestPipEndpointDestResolvesAsPip(t *testing.T) {
+	base, _ := url.Parse("https://bodega.example.com:8443")
+	for _, c := range []struct {
+		raw        string
+		plain, tls bool
+		unresolved bool
+	}{
+		{raw: "http://bodega%2eexample%2ecom:8443/x", plain: true},
+		{raw: "HTTP://user@BODEGA.example.com:8443/x", plain: true},
+		{raw: "http://bodega.example.com./x", plain: true},
+		{raw: "https://bodega%2eexample.com:8443/simple/", tls: true},
+		{raw: "https://bodega.example.com:08443/simple/", tls: true},
+		{raw: "https://elsewhere.example/simple/"},
+		{raw: "/srv/wheels"},
+		{raw: "file:///srv/wheels"},
+		{raw: "git+https://bodega.example.com/x"},
+		{raw: "http://bodega%zzexample.com/x", unresolved: true},
+		{raw: "http://bödega.example.com/x", unresolved: true},
+		{raw: "https://bodega%c3%a9.example.com/x", unresolved: true},
+		{raw: "https:bodega.example.com/x", unresolved: true},
+		{raw: "http://bodega.example.com:84a3/x", unresolved: true},
+		{raw: "http://bodega.example.com:99999/x", unresolved: true},
+		{raw: "http://[::1/x", unresolved: true},
+		{raw: "http:///x", unresolved: true},
+	} {
+		e := PipEndpoint{Setting: "find-links", From: "pip.conf", Raw: c.raw}
+		eps := []PipEndpoint{e}
+		_, route := PipPlainRoute(eps, base)
+		tls := e.TLS()
+		reaches := tls != nil && tls.Hostname() == base.Hostname() && tls.Port() == base.Port()
+		unresolved := PipUnresolved(eps)
+		if (route != "") != c.plain || reaches != c.tls || (unresolved != "") != c.unresolved {
+			t.Errorf("%s: plain route %q, TLS to bodega %v, unresolved %q", c.raw, route, reaches, unresolved)
+		}
+		if c.unresolved && !strings.Contains(unresolved, "find-links (pip.conf)") {
+			t.Errorf("%s: the unresolved report names no setting and source: %q", c.raw, unresolved)
+		}
+	}
+}
+
+// The preflight's system store is the one the rebuild leaves: an anchor the
+// plan rewrites takes its old certificate out, rather than keeping it beside
+// the new one.
+func TestProposedSystemRootsDropsReplacedAnchor(t *testing.T) {
+	oldPEM, _, _ := testCA(t, "old.example.com")
+	newPEM, _, _ := testCA(t, "new.example.com")
+	otherPEM, _, _ := testCA(t, "other.example.com")
+	root := t.TempDir()
+	h := CAHost{Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+	bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	for path, data := range map[string][]byte{bundle: append(append([]byte{}, oldPEM...), otherPEM...), anchor: oldPEM} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(certs []*x509.Certificate) []string {
+		var out []string
+		for _, c := range certs {
+			sum := sha256.Sum256(c.Raw)
+			out = append(out, hex.EncodeToString(sum[:]))
+		}
+		slices.Sort(out)
+		return out
+	}
+	replace := []Change{{Target: anchor, Old: oldPEM, Existed: true, New: newPEM}}
+	got, err := ProposedSystemRoots(h, replace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNames, oldCA, newCA, otherCA := names(got), names(pemCerts(oldPEM)), names(pemCerts(newPEM)), names(pemCerts(otherPEM))
+	if slices.Contains(gotNames, oldCA[0]) || !slices.Contains(gotNames, newCA[0]) || !slices.Contains(gotNames, otherCA[0]) {
+		t.Errorf("replacing the anchor: store %v, want %v and %v without %v", gotNames, newCA, otherCA, oldCA)
+	}
+	idle := []Change{{Target: anchor, Old: oldPEM, Existed: true, New: oldPEM}}
+	if got, _ := ProposedSystemRoots(h, idle); !slices.Contains(names(got), oldCA[0]) {
+		t.Errorf("an unchanged anchor lost its certificate: %v", names(got))
+	}
+}

@@ -451,8 +451,12 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	if from := clientconf.PipIndexAlias(layers, t.Getenv); from != "" {
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's configuration sets pypi-url (%s), a second name for index-url that doctor does not interpret, so which index pip install asks, and whether it reaches bodega or verifies its certificate, is unchecked", from)}}
 	}
+	endpoints := clientconf.PipEndpoints(layers, t.Getenv)
+	if what := clientconf.PipUnresolved(endpoints); what != "" {
+		return uncertified("pip", "pip's "+what+", so doctor cannot tell whether pip reaches bodega through it or over which transport")
+	}
 	if loopbackNote("", u) == "" {
-		if setting, route := clientconf.PipPlainRoute(clientconf.PipEndpoints(layers, t.Getenv), u); route != "" {
+		if setting, route := clientconf.PipPlainRoute(endpoints, u); route != "" {
 			return plainUncertified("pip", setting, route)
 		}
 	}
@@ -583,7 +587,8 @@ func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
 		}
 	}
 	return slices.ContainsFunc(clientconf.PipEndpoints(layers, t.Getenv), func(e clientconf.PipEndpoint) bool {
-		return e.TLS() != nil && sameHost(e.Raw, u)
+		tls := e.TLS()
+		return tls != nil && sameHost(tls.String(), u)
 	})
 }
 

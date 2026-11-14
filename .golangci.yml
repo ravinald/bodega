@@ -82,7 +82,7 @@ linters:
     rules:
       # A review's regression test is committed as the reviewer wrote it, so
       # the evidence it carries cannot be edited to pass.
-      - path: internal/host/review43_test\.go
+      - path: internal/host/review4[34]_test\.go
         linters: [staticcheck]
         text: ST1013
 

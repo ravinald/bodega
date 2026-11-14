@@ -200,39 +200,6 @@ func NpmRegistryUnread(regs []NpmRegistry) string {
 	return ""
 }
 
-// PipIndexURL is the URL pip fetches an index-url or extra-index-url value
-// from, or nil when pip fetches nothing over TLS through it. pip accepts any
-// string for either option; the check is where it builds its sources: pip
-// 26.2.1's build_source (pip/_internal/index/sources.py, lines 227-253)
-// takes a location that is an existing local path as that path, and
-// otherwise asks is_url (pip/_internal/vcs/versioncontrol.py, lines 44-51),
-// which reads the scheme as urlsplit does and accepts http, https, file, ftp
-// and the VCS schemes. A location with no
-// scheme is logged and ignored ("it is either a non-existing path or lacks a
-// specific scheme"), a VCS one is skipped by the collector, and requests has
-// no adapter for ftp, so only http and https reach a server, and only https
-// verifies a certificate.
-//
-// urlsplit lowercases the scheme and takes the authority between "//" and
-// the next '/', '?' or '#', which is where net/url takes it for a value this
-// accepts: printable ASCII with no backslash, opening with https://.
-func PipIndexURL(raw string) *url.URL {
-	raw = strings.TrimSpace(raw)
-	for i := 0; i < len(raw); i++ {
-		if raw[i] <= ' ' || raw[i] > '~' || raw[i] == '\\' {
-			return nil
-		}
-	}
-	if len(raw) < len("https://") || !strings.EqualFold(raw[:len("https://")], "https://") {
-		return nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return nil
-	}
-	return u
-}
-
 // PipCertPath is the bundle a pip cert setting names, as pip reads it: the
 // option's type is "path", whose check (_path_option_check in
 // pip/_internal/cli/cmdoptions.py at pip 26.2.1, lines 174-175, on the

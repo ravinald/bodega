@@ -980,11 +980,7 @@ func (s systemStore) roots(root string) []*x509.Certificate {
 			if err != nil {
 				continue
 			}
-			for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
-				if c, err := x509.ParseCertificate(block.Bytes); err == nil {
-					out = append(out, c)
-				}
-			}
+			out = append(out, pemCerts(data)...)
 		}
 	}
 	return out
@@ -1017,6 +1013,49 @@ func SystemRoots(h CAHost) ([]*x509.Certificate, error) {
 		return nil, err
 	}
 	return store.roots(h.Root), nil
+}
+
+// ProposedSystemRoots is the system trust store as its rebuild would leave
+// it once changes are written. The rebuild regenerates the store from its
+// anchors, so an anchor file a change rewrites takes the certificates it held
+// out of the store, and every anchor changes write puts its own in. Run under
+// plannedfs.With(changes), the store's other files read as they stand.
+func ProposedSystemRoots(h CAHost, changes []Change) ([]*x509.Certificate, error) {
+	store, err := systemStoreFor(h)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(h.Root, store.dir)
+	gone := map[[sha256.Size]byte]bool{}
+	var added []*x509.Certificate
+	for _, c := range changes {
+		if filepath.Dir(c.Target) != dir {
+			continue
+		}
+		if c.Existed && !c.Unchanged() {
+			for _, old := range pemCerts(c.Old) {
+				gone[sha256.Sum256(old.Raw)] = true
+			}
+		}
+		added = append(added, pemCerts(c.New)...)
+	}
+	var out []*x509.Certificate
+	for _, r := range store.roots(h.Root) {
+		if !gone[sha256.Sum256(r.Raw)] {
+			out = append(out, r)
+		}
+	}
+	return append(out, added...), nil
+}
+
+func pemCerts(data []byte) []*x509.Certificate {
+	var out []*x509.Certificate
+	for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
+		if c, err := x509.ParseCertificate(block.Bytes); err == nil {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // osReleaseFamily is ID followed by each ID_LIKE entry, the order os-release

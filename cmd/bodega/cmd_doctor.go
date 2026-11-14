@@ -741,7 +741,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			return fmt.Errorf("--ca-file: %w. Nothing was written", err)
 		}
 		changes, caStep, caOSStore = in.Changes, in.Step, in.System
-		if err := plannedCA(changes, *ca, caOwed, caOSStore, h.Base); err != nil {
+		if err := plannedCA(changes, caOwed, caOSStore, h.Base); err != nil {
 			return fmt.Errorf("--ca-file: %w", err)
 		}
 	}
@@ -1015,15 +1015,17 @@ func owedTrustChecks(records []clientconf.PlanRecord) []string {
 //
 // osStore names the systems whose anchors the plan put in the operating
 // system's trust store. This process loaded that store before the rebuild,
-// so where its own copy refuses the chain those systems are verified again
-// against the store's files as the rebuild left them. Either way the served
+// so those systems are verified against the store's files as the rebuild
+// left them and never against the loaded copy. Either way the served
 // chain is verified in full for the plan's hostname: an install says which
 // roots exist, never that the certificate bodega serves is valid under them.
 // For every other system the plan left that store alone, so the client is
 // judged against what it reads today: the store as it stands and the files
 // the plan wrote for it.
 func unreadCA(owed, osStore []string, base string) error {
-	parts, err := judgeCA(owed, osStore, base, doctorRebuiltRoots)
+	parts, err := judgeCA(owed, osStore, base, func() ([]*x509.Certificate, error) {
+		return clientconf.SystemRoots(doctorCAHost())
+	})
 	if err != nil {
 		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
 	}
@@ -1035,10 +1037,11 @@ func unreadCA(owed, osStore []string, base string) error {
 
 // plannedCA judges the plan before anything is written: the same verdicts
 // unreadCA reads after the install, over the host's files as changes would
-// leave them and a system store holding ca beside what it holds today. A
+// leave them and the system store as the rebuild would leave it, an anchor
+// the plan replaces taking its old certificates out with it. A
 // client the install would leave refusing, unchecked or unverified is
 // refused here instead, so a refusal never follows a write.
-func plannedCA(changes []clientconf.Change, ca clientconf.CA, owed, osStore []string, base string) error {
+func plannedCA(changes []clientconf.Change, owed, osStore []string, base string) error {
 	files := map[string][]byte{}
 	for _, c := range changes {
 		if !c.Unchanged() {
@@ -1048,8 +1051,8 @@ func plannedCA(changes []clientconf.Change, ca clientconf.CA, owed, osStore []st
 	var parts []string
 	err := plannedfs.With(files, func() error {
 		var err error
-		parts, err = judgeCA(owed, osStore, base, func() []*x509.Certificate {
-			return append(doctorRebuiltRoots(), ca.Certs...)
+		parts, err = judgeCA(owed, osStore, base, func() ([]*x509.Certificate, error) {
+			return clientconf.ProposedSystemRoots(doctorCAHost(), changes)
 		})
 		return err
 	})
@@ -1065,7 +1068,7 @@ func plannedCA(changes []clientconf.Change, ca clientconf.CA, owed, osStore []st
 // judgeCA is each owed check's verdict, as the lines of the error they make,
 // none when every client verifies bodega. rebuilt is the system store the
 // clients in osStore read once the rebuild has run.
-func judgeCA(owed, osStore []string, base string, rebuilt func() []*x509.Certificate) ([]string, error) {
+func judgeCA(owed, osStore []string, base string, rebuilt func() ([]*x509.Certificate, error)) ([]string, error) {
 	checks := host.TrustSystems()
 	var rebuiltChecks, own []string
 	for _, check := range owed {
@@ -1080,18 +1083,16 @@ func judgeCA(owed, osStore []string, base string, rebuilt func() []*x509.Certifi
 	if err != nil {
 		return nil, err
 	}
-	loaded := probe.System
-	if loaded == nil {
-		loaded = host.VerifySystem
-	}
+	// This process loaded the system store before the write, and Go never
+	// reloads it, so its pool would still hold a root the rebuild removed.
+	// Only the store's files decide here, as a client started now reads them.
 	probe.System = func(chain []*x509.Certificate, name string) error {
-		err := loaded(chain, name)
-		if err == nil {
-			return nil
+		roots, err := rebuilt()
+		if err != nil {
+			return fmt.Errorf("the system trust store's files could not be read: %w", err)
 		}
-		roots := rebuilt()
 		if len(roots) == 0 {
-			return err
+			return errors.New("the system trust store's files hold no certificate")
 		}
 		return host.VerifyServed(chain, name, roots)
 	}
@@ -1139,9 +1140,14 @@ func judgeCA(owed, osStore []string, base string, rebuilt func() []*x509.Certifi
 // doctorRebuiltRoots reads the system trust store from the files its rebuild
 // command writes, nil on a host whose store doctor does not install into.
 var doctorRebuiltRoots = func() []*x509.Certificate {
-	osRelease, _ := os.ReadFile(doctorOSRelease)
-	roots, _ := clientconf.SystemRoots(clientconf.CAHost{Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease})
+	roots, _ := clientconf.SystemRoots(doctorCAHost())
 	return roots
+}
+
+// doctorCAHost is the host whose system trust store doctor installs into.
+func doctorCAHost() clientconf.CAHost {
+	osRelease, _ := os.ReadFile(doctorOSRelease)
+	return clientconf.CAHost{Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease}
 }
 
 // doctorDnfConf and doctorYumReposDirs are where doctor reads dnf's
