@@ -108,6 +108,34 @@ type trustStore struct {
 	// takes its configuration from an input this probe does not read, or is
 	// told to read none. It names that input. No verification settles it.
 	blind string
+	// note qualifies a store that verifies: what the verdict does not cover
+	// for it, carried into the row and the verdict's detail.
+	note string
+}
+
+// loopbackNote is the note on a Docker or containerd store when bodega is at
+// a loopback address. Both clients skip certificate checks there by their own
+// defaults (moby v28.5.2 registry/config.go adds 127.0.0.0/8 and ::1/128 to
+// the insecure registries; containerd v2.2.0 ConfigureHosts sets skipVerify
+// for a local implicit server), so the CA decides nothing for that address.
+// By the operator's 2026-11-13 decision a loopback bodega is outside what
+// --ca-file certifies or refuses: its traffic never crosses a network.
+func loopbackNote(client string, u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return fmt.Sprintf("bodega is at a loopback address, where %s does not check certificates by its own default; traffic stays on this host", client)
+	}
+	return ""
+}
+
+func notesOf(stores []trustStore) string {
+	var notes []string
+	for _, s := range stores {
+		if s.note != "" && !slices.Contains(notes, s.note) {
+			notes = append(notes, s.note)
+		}
+	}
+	return strings.Join(notes, "; ")
 }
 
 // trustRow is one doctor row's client.
@@ -227,7 +255,9 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
 			return []trustStore{{name: dir, blind: fmt.Sprintf("dockerd does not load the certificates in %s (%v) and sends that host nothing while it cannot, so whether dockerd verifies bodega's certificate is unchecked", dir, err)}}
 		}
-		out = append(out, certsDir(dir))
+		s := certsDir(dir)
+		s.note = loopbackNote("dockerd", u)
+		out = append(out, s)
 	}
 	return out
 }
@@ -282,10 +312,8 @@ func aptStores(t TrustProbe, u *url.URL) []trustStore {
 			return uncertified("apt", "apt's configuration sets "+what)
 		}
 	}
-	for _, key := range []string{"acquire::https::" + strings.ToLower(u.Hostname()) + "::cainfo", "acquire::https::cainfo"} {
-		if v := conf[key]; v.Value != "" {
-			return []trustStore{*named(v.Value, "Acquire::https::CAInfo in "+v.File, true)}
-		}
+	if key, v := conf.HTTPSOption(u.Hostname(), "cainfo"); v.Value != "" {
+		return []trustStore{*named(v.Value, key+" in "+v.File, true)}
 	}
 	return []trustStore{t.systemStore(true)}
 }
@@ -935,15 +963,12 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return atBodega(h.Key) }) {
 			continue
 		}
-		if key := doc.SkipsVerify(atBodega); key != "" {
-			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
-		}
 		if err := doc.TLSError(""); err != nil {
 			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd cannot load a certificate %s names (%v) and resolves no host for that registry while it cannot, the bodega host included, so whether containerd reaches bodega or verifies its certificate is unchecked", path, err)}}
 		}
 		for _, h := range doc.Hosts {
 			if atBodega(h.Key) {
-				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA})
+				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA, note: loopbackNote("containerd", u)})
 			}
 		}
 	}
@@ -1089,6 +1114,9 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 		}
 		failed, unread := srv.weigh(stores)
 		if len(failed)+len(unread) == 0 {
+			if note := notesOf(stores); note != "" {
+				out[i].Detail = strings.TrimPrefix(f.Detail+"; "+note, "; ")
+			}
 			continue
 		}
 		install := fmt.Sprintf("bodega doctor --configure %s --ca-file <CA certificate PEM> --apply --url %s", row.system, strings.TrimRight(base, "/"))
@@ -1167,7 +1195,7 @@ func (t TrustProbe) Judge(checks []string, base string) ([]TrustVerdict, error) 
 			case len(unread) > 0:
 				v.State, v.Detail = TrustUnchecked, strings.Join(unread, "; ")
 			default:
-				v.State = TrustVerified
+				v.State, v.Detail = TrustVerified, notesOf(stores)
 			}
 		}
 		out = append(out, v)

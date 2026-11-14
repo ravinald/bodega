@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3060,5 +3061,36 @@ assert isinstance(session.get_adapter(request.url), InsecureHTTPAdapter)
 	got := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
 	if got.Status != StatusWarn || !strings.Contains(got.Detail, "trusted-host") {
 		t.Errorf("report hides trusted-host at bodega's equivalent port spelling: %+v", got)
+	}
+}
+
+// TestLoopbackBodegaIsNotedNotRefused pins the operator's 2026-11-13 loopback
+// decision: a bodega at a loopback address is neither certified as checked
+// nor refused for Docker and containerd, whose own defaults skip
+// verification there. The store carries a note the row and verdict show.
+func TestLoopbackBodegaIsNotedNotRefused(t *testing.T) {
+	for _, c := range []struct {
+		base string
+		note bool
+	}{
+		{"https://127.0.0.1:8443", true},
+		{"https://[::1]:8443", true},
+		{"https://localhost:8443", true},
+		{"https://registry.localhost:8443", true},
+		{"https://bodega.internal:8443", false},
+		{"https://10.0.0.5:8443", false},
+	} {
+		u, err := url.Parse(c.base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := loopbackNote("dockerd", u)
+		if (got != "") != c.note {
+			t.Errorf("loopbackNote(%s) = %q, want a note: %v", c.base, got, c.note)
+		}
+	}
+	stores := []trustStore{{name: "a", note: "n1"}, {name: "b", note: "n1"}, {name: "c"}, {name: "d", note: "n2"}}
+	if got := notesOf(stores); got != "n1; n2" {
+		t.Errorf("notesOf = %q, want each note once", got)
 	}
 }

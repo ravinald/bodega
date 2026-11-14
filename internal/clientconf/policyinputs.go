@@ -147,13 +147,33 @@ func GitEnvUnmodeledIn(env Environ) string {
 	return ""
 }
 
-// https is ConfigFind of apt's https method for one option: the value scoped
-// to host, else the unscoped one. option is lowercase.
+// https is ConfigFind of apt's https method for one option. option is
+// lowercase.
 func (c AptConfig) https(host, option string) AptOption {
-	if v := c["acquire::https::"+strings.ToLower(host)+"::"+option]; v.Value != "" {
-		return v
+	_, v := c.HTTPSOption(host, option)
+	return v
+}
+
+// HTTPSOption is ConfigFind of apt's https method for one option, and the
+// key it was found under, "" with none. The https method registers http as
+// a second method name and scopes both to the host, and ConfigFind searches
+// them newest first (methods/http.cc:961-974 and methods/aptmethod.h:47-81
+// at APT 3.0.3): https for the host, http for the host, https, then http.
+// So an Acquire::http option reaches the https method where no https one
+// is set. option is lowercase.
+func (c AptConfig) HTTPSOption(host, option string) (string, AptOption) {
+	host = strings.ToLower(host)
+	for _, key := range []string{
+		"acquire::https::" + host + "::" + option,
+		"acquire::http::" + host + "::" + option,
+		"acquire::https::" + option,
+		"acquire::http::" + option,
+	} {
+		if v := c[key]; v.Value != "" {
+			return key, v
+		}
 	}
-	return c["acquire::https::"+option]
+	return "", AptOption{}
 }
 
 // TLSUnmodeled is the first option that has apt's https method load a TLS
@@ -170,8 +190,8 @@ func (c AptConfig) TLSUnmodeled(host string) string {
 		{"SslKey", "has apt load a client key, and open no connection when OpenSSL does not parse it or it does not match"},
 		{"CrlFile", "has apt load a certificate revocation list, open no connection when OpenSSL does not parse it, and refuse a server certificate it lists or whose issuer it does not cover"},
 	} {
-		if v := c.https(host, strings.ToLower(o.option)); v.Value != "" {
-			return fmt.Sprintf("Acquire::https::%s (%s), which %s: the CA roots doctor verifies bodega against do not show it and doctor does not interpret it", o.option, v.File, o.effect)
+		if key, v := c.HTTPSOption(host, strings.ToLower(o.option)); v.Value != "" {
+			return fmt.Sprintf("%s (%s), which %s: the CA roots doctor verifies bodega against do not show it and doctor does not interpret it", aptKeyName(key, o.option), v.File, o.effect)
 		}
 	}
 	return ""
@@ -375,4 +395,15 @@ func NodeOptions(getenv func(string) string) (roots NodeRoots, unread string) {
 func NodeOptionsUnread(getenv func(string) string) string {
 	_, unread := NodeOptions(getenv)
 	return unread
+}
+
+// aptKeyName spells a lowercased apt option key for a message: Acquire, the
+// method and host as stored, and the option as apt documents it.
+func aptKeyName(key, option string) string {
+	parts := strings.Split(key, "::")
+	if len(parts) > 0 && parts[0] == "acquire" {
+		parts[0] = "Acquire"
+	}
+	parts[len(parts)-1] = option
+	return strings.Join(parts, "::")
 }

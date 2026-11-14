@@ -4497,7 +4497,7 @@ func TestUnmodeledTLSInputsRefuseCAPlan(t *testing.T) {
 		{name: "apt, a client certificate that loads", plan: apt,
 			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::SslCert \"/client.pem\";\n"}), names: "Acquire::https::SslCert"},
 		{name: "apt, a client key scoped to bodega's host", plan: apt,
-			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::bodega.example.com::SslKey \"/client.key\";\n"}), names: "Acquire::https::SslKey"},
+			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::bodega.example.com::SslKey \"/client.key\";\n"}), names: "Acquire::https::bodega.example.com::SslKey"},
 		{name: "apt, a revocation list", plan: apt,
 			files: with(map[string]string{"etc/apt/apt.conf": "Acquire::https::CrlFile \"/client.pem\";\n"}), names: "Acquire::https::CrlFile"},
 		{name: "apt, another root store from the environment", plan: apt,
