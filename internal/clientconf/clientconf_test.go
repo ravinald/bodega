@@ -5703,3 +5703,56 @@ func TestCARefusesContainerdImplicitRegistryServer(t *testing.T) {
 	}
 	t.Fatal("AddCA accepted skip_verify=true for bodega's own registry directory; containerd fills an omitted server from the registry name, but preflight matches only the empty server key")
 }
+
+// Every pip setting doctor admits is classified as naming a location or not,
+// and each location-bearing one reaches PipEndpoints from a file and from the
+// environment with pip's precedence, so admitting a setting without
+// classifying it, or classifying it without feeding the endpoint list, fails.
+func TestPipModeledLocationsFeedEndpoints(t *testing.T) {
+	base, _ := url.Parse(testBase)
+	plain := strings.Replace(testBase, "https://", "http://", 1) + "/x"
+	names := map[string]bool{}
+	for _, m := range PipModeled {
+		names[m.Name] = true
+		bearing, classified := pipLocations[m.Name]
+		if !classified {
+			t.Errorf("pip %s is modeled but not classified in pipLocations", m.Name)
+			continue
+		}
+		layers := []PipLayer{{File: "pip.conf", Data: []byte("[global]\n" + m.Name + " = " + plain + "\n")}}
+		setting, route := PipPlainRoute(PipEndpoints(layers, nil), base)
+		if bearing != (route == plain) || bearing && !strings.HasPrefix(setting, m.Name+" (") {
+			t.Errorf("pip %s (location=%v) in a file: setting=%q route=%q", m.Name, bearing, setting, route)
+		}
+		env := "PIP_" + strings.ToUpper(strings.ReplaceAll(m.Name, "-", "_"))
+		getenv := func(k string) string {
+			if k == env {
+				return plain
+			}
+			return ""
+		}
+		if _, route := PipPlainRoute(PipEndpoints(nil, getenv), base); bearing != (route == plain) {
+			t.Errorf("pip %s (location=%v) from %s: route=%q", m.Name, bearing, env, route)
+		}
+	}
+	for name := range pipLocations {
+		if !names[name] {
+			t.Errorf("pipLocations classifies %s, which PipModeled does not admit", name)
+		}
+	}
+	// [install] replaces [global]'s value for pip install, and the environment
+	// replaces both, so a replaced plain route is no route.
+	layers := []PipLayer{{File: "pip.conf", Data: []byte("[global]\nfind-links = " + plain + "\n[install]\nfind-links = /srv/wheels\n")}}
+	if _, route := PipPlainRoute(PipEndpoints(layers, nil), base); route != "" {
+		t.Errorf("a find-links [install] replaced still counts: %q", route)
+	}
+	getenv := func(k string) string {
+		if k == "PIP_FIND_LINKS" {
+			return "/srv/wheels " + plain
+		}
+		return ""
+	}
+	if setting, route := PipPlainRoute(PipEndpoints(nil, getenv), base); route != plain || !strings.Contains(setting, "PIP_FIND_LINKS") {
+		t.Errorf("the second word of PIP_FIND_LINKS: setting=%q route=%q", setting, route)
+	}
+}

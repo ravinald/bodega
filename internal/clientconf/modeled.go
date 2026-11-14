@@ -225,7 +225,7 @@ var PipModeled = []ModeledSetting{
 	{"no-cache-dir", "PipInstallError: not a truth value"},
 	{"no-index", "PipInstallError: not a truth value; true is PipNoIndex's refusal"},
 	{"no-compile", "PipInstallError: not a truth value; read after the download"},
-	{"find-links", "none: an append of text, naming locations beside the index"},
+	{"find-links", "none: an append of text; each word is a PipEndpoints location, and plain http to bodega is refused"},
 	{"use-deprecated", "PipInstallError: a word outside pip's choices; legacy-certs is the bundle the probe then reads"},
 }
 
@@ -730,32 +730,81 @@ func (d *DockerDaemonFile) Insecure(u *url.URL) string {
 	return ""
 }
 
-// PipPlainIndex is the first index-url or extra-index-url, in any section of
-// layers or in the environment, that reaches bodega's host over plain http,
-// "" for none. pip checks no certificate on such an index, so a verdict
-// reached through an https index says nothing about it.
-func PipPlainIndex(layers []PipLayer, getenv func(string) string, u *url.URL) string {
-	var words []string
-	for _, l := range layers {
-		f, err := readPipFile(l.Data)
-		if err != nil {
+// pipLocations classifies every PipModeled setting by whether it names a
+// location pip install may fetch from. PipEndpoints reads exactly the true
+// ones, so a setting admitted to PipModeled without a classification here is
+// a test failure rather than a location doctor never judges.
+var pipLocations = map[string]bool{
+	"index-url":                 true,
+	"extra-index-url":           true,
+	"find-links":                true,
+	"trusted-host":              false,
+	"timeout":                   false,
+	"default-timeout":           false,
+	"retries":                   false,
+	"cert":                      false,
+	"disable-pip-version-check": false,
+	"no-cache-dir":              false,
+	"no-index":                  false,
+	"no-compile":                false,
+	"use-deprecated":            false,
+}
+
+// PipEndpoint is one location pip install may fetch from: the setting that
+// names it, where that setting's winning value was set, and the location.
+type PipEndpoint struct {
+	Setting, From, Raw string
+}
+
+// TLS is the https URL pip fetches the endpoint from, nil when pip sends no
+// TLS request to it.
+func (e PipEndpoint) TLS() *url.URL { return PipIndexURL(e.Raw) }
+
+// Plain reports whether pip fetches the endpoint over plain http, where no
+// certificate is checked.
+func (e PipEndpoint) Plain() bool {
+	p, err := url.Parse(strings.TrimSpace(e.Raw))
+	return err == nil && strings.EqualFold(p.Scheme, "http") && p.Host != ""
+}
+
+// PipEndpoints is every location pip install fetches from under layers and the
+// environment, with pip's own precedence: the last file to set an option in a
+// section wins, then [install] over [global] and PIP_* over both
+// (pipInstallValue). index-url is one value; extra-index-url and find-links
+// are append options whose configured value pip splits as str.split does.
+// find-links counts as much as an index: pip 26.2.1 yields each of its links
+// to PackageFinder.find_all_candidates with no is_secure_origin check
+// (_RemoteFileSource.file_links, pip/_internal/index/sources.py:169-198), so
+// a wheel on a plain http find-links URL is downloaded and installed.
+func PipEndpoints(layers []PipLayer, getenv func(string) string) []PipEndpoint {
+	groups := pipGroups(layers, getenv)
+	var out []PipEndpoint
+	for _, m := range PipModeled {
+		if !pipLocations[m.Name] {
 			continue
 		}
-		for _, s := range f.settings() {
-			if s.option == "index-url" || s.option == "extra-index-url" {
-				words = append(words, pyFields(s.value)...)
+		value, from := pipInstallValue(groups, m.Name)
+		words := []string{strings.TrimSpace(value)}
+		if m.Name != "index-url" {
+			words = pyFields(value)
+		}
+		for _, w := range words {
+			if w != "" {
+				out = append(out, PipEndpoint{Setting: m.Name, From: from, Raw: w})
 			}
 		}
 	}
-	if getenv != nil {
-		for _, key := range []string{"PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"} {
-			words = append(words, pyFields(getenv(key))...)
+	return out
+}
+
+// PipPlainRoute is the first endpoint of eps that reaches bodega's host at u
+// over plain http, as a phrase naming its setting and where it was set, and
+// the location; "" for none.
+func PipPlainRoute(eps []PipEndpoint, u *url.URL) (setting, route string) {
+	for _, e := range eps {
+		if e.Plain() && namesBodega(e.Raw, u) {
+			return fmt.Sprintf("%s (%s)", e.Setting, e.From), e.Raw
 		}
 	}
-	for _, w := range words {
-		if p, err := url.Parse(w); err == nil && strings.EqualFold(p.Scheme, "http") && namesBodega(w, u) {
-			return w
-		}
-	}
-	return ""
+	return "", ""
 }

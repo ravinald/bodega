@@ -452,8 +452,8 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's configuration sets pypi-url (%s), a second name for index-url that doctor does not interpret, so which index pip install asks, and whether it reaches bodega or verifies its certificate, is unchecked", from)}}
 	}
 	if loopbackNote("", u) == "" {
-		if route := clientconf.PipPlainIndex(layers, t.Getenv, u); route != "" {
-			return plainUncertified("pip", "an index pip reads", route)
+		if setting, route := clientconf.PipPlainRoute(clientconf.PipEndpoints(layers, t.Getenv), u); route != "" {
+			return plainUncertified("pip", setting, route)
 		}
 	}
 	if !pipReaches(t, files, u) {
@@ -573,37 +573,18 @@ func sameHost(raw string, u *url.URL) bool {
 // together are the pair one pip install uses. A file that names bodega only
 // in a comment, in an option a later file replaces, or under [global] while
 // [install] sets its own index, configures nothing. Neither does a location
-// pip ignores or sends no TLS request to, which clientconf.PipIndexURL tells.
+// pip ignores or sends no TLS request to, which PipEndpoint.TLS tells; a
+// plain http one is refused by pipStores before this is asked.
 func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
-	merged := map[string]string{}
+	var layers []clientconf.PipLayer
 	for _, f := range files {
-		data, err := plannedfs.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		for key, v := range clientconf.PipOptions(data) {
-			merged[key] = v
+		if data, err := plannedfs.ReadFile(f); err == nil {
+			layers = append(layers, clientconf.PipLayer{File: f, Data: data})
 		}
 	}
-	for option, env := range map[string]string{"index-url": "PIP_INDEX_URL", "extra-index-url": "PIP_EXTRA_INDEX_URL"} {
-		v := t.env(env)
-		if v == "" {
-			v = merged["install."+option]
-		}
-		if v == "" {
-			v = merged["global."+option]
-		}
-		// pip stores index-url whole and splits extra-index-url as str.split
-		// does; neither is Go's white space.
-		words := []string{v}
-		if option == "extra-index-url" {
-			words = clientconf.PipWords(v)
-		}
-		if slices.ContainsFunc(words, func(one string) bool { return clientconf.PipIndexURL(one) != nil && sameHost(one, u) }) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(clientconf.PipEndpoints(layers, t.Getenv), func(e clientconf.PipEndpoint) bool {
+		return e.TLS() != nil && sameHost(e.Raw, u)
+	})
 }
 
 // nodeCAFlags reads the options that choose Node's root store, from the one
