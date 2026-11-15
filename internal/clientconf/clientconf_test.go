@@ -5863,6 +5863,11 @@ func TestRedactLocationsWithoutParsing(t *testing.T) {
 		"registry=https://u " + secret + ":x@h/",
 		"registry=https://u:a " + secret + "@h/",
 		`registry = "https://u:a ` + secret + `@h/repo/"`,
+		"index-url=https://packages.example/simple/?token=prefix," + secret,
+		"index-url=https://packages.example/simple/#prefix|" + secret,
+		"find-links=http://h/x.whl?token=a," + secret + " and more",
+		"https://a.example/p,https://u:" + secret + "@b.example/",
+		"GONOSUMDB=corp.example/*,u:" + secret + "@x",
 	} {
 		got := RedactLocations(in)
 		if strings.Contains(got, secret) {
@@ -5883,6 +5888,10 @@ func TestRedactLocationsWithoutParsing(t *testing.T) {
 		"https://h/simple/?a=1,b=2":                                            "https://h/simple/",
 		`[url "https://u:pw@creds.example/repo/?token=pw"]`:                    `[url "https://<redacted>@creds.example/repo/"]`,
 		"go env -w GOPROXY=http://<bodega>/go,https://proxy.golang.org,direct": "go env -w GOPROXY=http://<bodega>/go,https://proxy.golang.org,direct",
+		"index-url=https://packages.example/simple/?token=a,b":                 "index-url=https://packages.example/simple/",
+		"https://packages.example/simple/#a|b":                                 "https://packages.example/simple/",
+		"GOPRIVATE=corp.example/*,*.internal":                                  "GOPRIVATE=corp.example/*,*.internal",
+		"GOPROXY='https://a.example/?t=x|direct'":                              "GOPROXY='https://a.example/|direct'",
 	} {
 		if got := RedactLocations(in); got != want {
 			t.Errorf("RedactLocations(%q) = %q, want %q", in, got, want)

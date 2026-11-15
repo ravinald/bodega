@@ -300,7 +300,7 @@ func RedactLocations(text string) string {
 		if d := decodePrintableEscapes(l); d != l && schemeStart.MatchString(d) {
 			l = d
 		}
-		lines[i] = renderLocations(l)
+		lines[i] = renderLine(l)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -340,7 +340,7 @@ func renderLocations(l string) string {
 			last = after + span
 			continue
 		}
-		sb.WriteString(rebuildLocationList(scheme, trimmed))
+		sb.WriteString(rebuildLocation(scheme, trimmed, specialSchemes[scheme]))
 		sb.WriteString(token[len(trimmed):])
 		last = after + len(token)
 	}
@@ -400,58 +400,64 @@ func isSchemeChar(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '+' || c == '.' || c == '-'
 }
 
-var (
-	listSeparator = regexp.MustCompile(`[,|]`)
-	listWord      = regexp.MustCompile(`^[A-Za-z0-9._-]*$`)
-)
+// goListSetting matches a Go environment setting whose value the go command
+// splits into a list, with the value that follows its =. Only these values
+// are split: GOPROXY at commas and pipes (proxyList in
+// cmd/go/internal/modfetch/proxy.go), the other four at commas
+// (module.MatchPrefixPatterns). Every other location is one URL whatever
+// punctuation its path, query or fragment holds, because its client reads
+// it as one, and a comma in a pip query split off as a list member would
+// print the credential after it.
+var goListSetting = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])(GOPROXY|GONOSUMDB|GOPRIVATE|GONOPROXY|GOINSECURE)=["']?([^ \t\r"']*)`)
 
-// rebuildLocationList renders the text after scheme://, first as a
-// GOPROXY-style list, locations and bare words such as direct or off joined
-// by commas or pipes, then as one location. The list form holds only when
-// every later member is a bare word or a location that rebuilds whole, so a
-// comma inside a userinfo or a query cannot split a credential off into a
-// member printed as it stands.
-func rebuildLocationList(scheme, rest string) string {
-	whole := rebuildLocation(scheme, rest, specialSchemes[scheme])
-	if list, ok := rebuildList(scheme, rest); ok {
-		return list
+// renderLine renders every location in l, splitting only the value of a Go
+// list setting named in the line.
+func renderLine(l string) string {
+	var sb strings.Builder
+	last := 0
+	for _, m := range goListSetting.FindAllStringSubmatchIndex(l, -1) {
+		sb.WriteString(renderLocations(l[last:m[4]]))
+		sb.WriteString(RenderGoList(l[m[2]:m[3]], l[m[4]:m[5]]))
+		last = m[5]
 	}
-	return whole
+	return sb.String() + renderLocations(l[last:])
 }
 
-func rebuildList(scheme, rest string) (string, bool) {
-	first := listSeparator.FindStringIndex(rest)
-	if first == nil {
-		return "", false
+// RenderGoList renders the value of the Go environment setting name as the
+// go command splits it, each member that is a location rebuilt on its own
+// and each other member (direct, off, a module path pattern) kept unless it
+// carries userinfo, a query or a fragment, when it prints as
+// LocationWithheld.
+func RenderGoList(name, value string) string {
+	seps := ","
+	if name == "GOPROXY" {
+		seps = ",|"
 	}
-	out := rebuildLocation(scheme, rest[:first[0]], specialSchemes[scheme])
-	if out == LocationWithheld {
-		return "", false
-	}
-	members := rest[first[0]:]
-	for members != "" {
-		sep, member := members[:1], members[1:]
-		if m := listSeparator.FindStringIndex(member); m != nil {
-			member, members = member[:m[0]], member[m[0]:]
+	var sb strings.Builder
+	for value != "" {
+		member := value
+		sep := ""
+		if i := strings.IndexAny(value, seps); i >= 0 {
+			member, sep, value = value[:i], value[i:i+1], value[i+1:]
 		} else {
-			members = ""
+			value = ""
 		}
-		if !listWord.MatchString(member) {
-			m := schemeStart.FindStringIndex(member)
-			if m == nil || m[0] != 0 {
-				return "", false
-			}
-			s, after, ok := locationStart(member, m)
-			if !ok {
-				return "", false
-			}
-			if member = rebuildLocation(s, member[after:], specialSchemes[s]); member == LocationWithheld {
-				return "", false
-			}
-		}
-		out += sep + member
+		sb.WriteString(renderGoListMember(member))
+		sb.WriteString(sep)
 	}
-	return out, true
+	return sb.String()
+}
+
+func renderGoListMember(member string) string {
+	if m := schemeStart.FindStringIndex(member); m != nil && m[0] == 0 {
+		if scheme, after, ok := locationStart(member, m); ok {
+			return rebuildLocation(scheme, member[after:], specialSchemes[scheme])
+		}
+	}
+	if strings.ContainsAny(member, "@?#") {
+		return LocationWithheld
+	}
+	return member
 }
 
 // rebuildLocation renders the part of a location after scheme:// with its
@@ -473,6 +479,12 @@ func rebuildLocation(scheme, rest string, special bool) string {
 	}
 	if i := strings.IndexAny(tail, "?#"); i >= 0 {
 		tail = tail[:i]
+	}
+	// A path holding another authority with userinfo is a list this
+	// renderer was not told to split; its second member's credential would
+	// print as path text.
+	if i := strings.Index(tail, "//"); i >= 0 && strings.Contains(tail[i:], "@") {
+		return LocationWithheld
 	}
 	host, port := authority, ""
 	if i := strings.LastIndexByte(authority, ':'); i >= 0 && !strings.HasSuffix(authority, "]") {
