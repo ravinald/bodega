@@ -263,3 +263,19 @@ func redactXMLElements(l string) string {
 	}
 	return sb.String() + l[last:]
 }
+
+var (
+	locationUserinfo = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@`)
+	locationQuery    = regexp.MustCompile(`(?i)([?&;][^=&;#\s]*(?:pass|pwd|token|secret|auth|key|sig|credential)[^=&;#\s]*=)[^&;#\s]*`)
+)
+
+// RedactLocations removes, from text naming one or more locations, the whole
+// userinfo of each scheme://user:pass@ authority and the value of each query
+// parameter whose name suggests a credential. It works on the raw text and
+// never parses a URL, so a location a reader refused as unresolvable, with a
+// non-ASCII host or a stray backslash, is redacted all the same: a diagnostic
+// names the setting and its source, never the secret in it.
+func RedactLocations(text string) string {
+	text = locationUserinfo.ReplaceAllString(text, "${1}"+Redacted+"@")
+	return locationQuery.ReplaceAllString(text, "${1}"+Redacted)
+}

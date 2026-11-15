@@ -910,7 +910,7 @@ func PipPlainRoute(eps []PipEndpoint, u *url.URL) (setting, route string) {
 			at = net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
 		}
 		if namesBodega(at, u) {
-			return fmt.Sprintf("%s (%s)", e.Setting, e.From), e.Raw
+			return fmt.Sprintf("%s (%s)", e.Setting, e.From), RedactLocations(e.Raw)
 		}
 	}
 	return "", ""
@@ -923,7 +923,7 @@ func PipPlainRoute(eps []PipEndpoint, u *url.URL) (setting, route string) {
 func PipUnresolved(eps []PipEndpoint) string {
 	for _, e := range eps {
 		if _, err := e.Dest(); err != nil {
-			return fmt.Sprintf("%s (%s) is %s, and %v", e.Setting, e.From, e.Raw, err)
+			return fmt.Sprintf("%s (%s) is %s, and %v", e.Setting, e.From, RedactLocations(e.Raw), err)
 		}
 	}
 	return ""

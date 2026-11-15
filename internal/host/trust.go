@@ -1093,7 +1093,7 @@ func (s *served) get() error {
 func (s *served) weigh(stores []trustStore) (failed, unread []string) {
 	for _, st := range stores {
 		if st.blind != "" {
-			unread = append(unread, st.blind)
+			unread = append(unread, clientconf.RedactLocations(st.blind))
 			continue
 		}
 		if st.resolve != nil {

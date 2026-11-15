@@ -1066,41 +1066,33 @@ func plannedCA(changes []clientconf.Change, owed, osStore []string, base string)
 }
 
 // judgeCA is each owed check's verdict, as the lines of the error they make,
-// none when every client verifies bodega. rebuilt is the system store the
-// clients in osStore read once the rebuild has run.
+// none when every client verifies bodega. rebuilt is the system store as a
+// client started now reads it once the rebuild for osStore has run.
+//
+// When the plan rebuilds the system store, every owed client is judged
+// against rebuilt, not only the ones the rebuild was for: Docker and
+// containerd read the system store beside their own certs.d file, and a
+// rebuild that replaces a managed anchor takes a root away from them too.
+// This process loaded the system store before the write and Go never
+// reloads it, so its pool would still hold that root.
 func judgeCA(owed, osStore []string, base string, rebuilt func() ([]*x509.Certificate, error)) ([]string, error) {
-	checks := host.TrustSystems()
-	var rebuiltChecks, own []string
-	for _, check := range owed {
-		if slices.Contains(osStore, checks[check]) {
-			rebuiltChecks = append(rebuiltChecks, check)
-		} else {
-			own = append(own, check)
-		}
-	}
 	probe := doctorTrustProbe()
-	verdicts, err := probe.Judge(own, base)
+	if len(osStore) > 0 {
+		probe.System = func(chain []*x509.Certificate, name string) error {
+			roots, err := rebuilt()
+			if err != nil {
+				return fmt.Errorf("the system trust store's files could not be read: %w", err)
+			}
+			if len(roots) == 0 {
+				return errors.New("the system trust store's files hold no certificate")
+			}
+			return host.VerifyServed(chain, name, roots)
+		}
+	}
+	verdicts, err := probe.Judge(owed, base)
 	if err != nil {
 		return nil, err
 	}
-	// This process loaded the system store before the write, and Go never
-	// reloads it, so its pool would still hold a root the rebuild removed.
-	// Only the store's files decide here, as a client started now reads them.
-	probe.System = func(chain []*x509.Certificate, name string) error {
-		roots, err := rebuilt()
-		if err != nil {
-			return fmt.Errorf("the system trust store's files could not be read: %w", err)
-		}
-		if len(roots) == 0 {
-			return errors.New("the system trust store's files hold no certificate")
-		}
-		return host.VerifyServed(chain, name, roots)
-	}
-	more, err := probe.Judge(rebuiltChecks, base)
-	if err != nil {
-		return nil, err
-	}
-	verdicts = append(verdicts, more...)
 	slices.SortFunc(verdicts, func(a, b host.TrustVerdict) int { return strings.Compare(a.Check, b.Check) })
 	var refused, unchecked, absent []string
 	for _, v := range verdicts {

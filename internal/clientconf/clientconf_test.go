@@ -5841,3 +5841,23 @@ func TestProposedSystemRootsDropsReplacedAnchor(t *testing.T) {
 		t.Errorf("an unchanged anchor lost its certificate: %v", names(got))
 	}
 }
+
+func TestRedactLocationsWithoutParsing(t *testing.T) {
+	const secret = "marker-pw"
+	for _, in := range []string{
+		"https://u:" + secret + "@bödega.internal:8443/x.whl",
+		`http://u:` + secret + `@host\name/simple/`,
+		"find-links (file line 3) is https://" + secret + "@[::1/x, and it fails",
+		"git+ssh://u:" + secret + "@host/repo",
+		"https://host/simple/?token=" + secret + "&page=2",
+		"https://host/x?X-Amz-Signature=" + secret,
+	} {
+		got := RedactLocations(in)
+		if strings.Contains(got, secret) {
+			t.Errorf("RedactLocations(%q) = %q, still carries the secret", in, got)
+		}
+	}
+	if got := RedactLocations("https://host/simple/?page=2"); got != "https://host/simple/?page=2" {
+		t.Errorf("a location with no credential changed: %q", got)
+	}
+}
