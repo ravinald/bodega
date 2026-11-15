@@ -942,7 +942,7 @@ func GitRewriteUnread(files []string) string {
 				continue
 			}
 			if _, err := gitNormalizeURL(e.Subsection, false); err != nil {
-				return fmt.Sprintf("[url %q] in %s, a URL git does not normalize (%v) and so applies no [http \"<url>\"] section to", redactURLPassword(e.Subsection), f, err)
+				return fmt.Sprintf("[url %q] in %s, a URL git does not normalize (%v) and so applies no [http \"<url>\"] section to", RedactLocations(e.Subsection), f, err)
 			}
 		}
 	}

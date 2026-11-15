@@ -194,7 +194,7 @@ func urlScheme(s string) bool {
 func NpmRegistryUnread(regs []NpmRegistry) string {
 	for _, r := range regs {
 		if _, err := NpmRegistryURL(r.Value); err != nil {
-			return fmt.Sprintf("%s=%s from %s, which %v", r.Option, redactURLPassword(strings.TrimSpace(r.Value)), r.From, err)
+			return fmt.Sprintf("%s=%s from %s, which %v", r.Option, RedactLocations(strings.TrimSpace(r.Value)), r.From, err)
 		}
 	}
 	return ""

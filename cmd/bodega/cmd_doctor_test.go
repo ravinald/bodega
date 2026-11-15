@@ -4614,3 +4614,120 @@ func TestCARefusesNpmEscapedCAPathRefusesBeforeWrites(t *testing.T) {
 		t.Errorf("doctor refused only after writing %s: %v", config, applyErr)
 	}
 }
+
+// F116 R1, R2: no reader's location reaches doctor's output with its
+// credentials. Each case seeds one client's documented file with a location
+// carrying a password in its userinfo and a token in its query, then runs the
+// CA preview, the apply and the ordinary report. Whatever each run does with
+// the location (replaces it in a diff, keeps it as context, refuses it, warns
+// on it), the marker never appears in the output or the returned error, the
+// location's host does, so the location was echoed and not dropped, and a
+// file the apply keeps still holds the credential the client needs.
+func TestDoctorCARedactsLocationCredentialsPerReader(t *testing.T) {
+	const marker = "f116-reader-password-marker"
+	const location = "https://review-user:" + marker + "@creds.example/repo/?token=" + marker
+	for _, tc := range []struct {
+		name, configure, file, body string
+		apt                         bool
+	}{
+		{name: "npm", configure: "npm", file: ".npmrc", body: "registry=" + location + "\n"},
+		{name: "pip", configure: "pypi", file: "etc/pip.conf", body: "[global]\nindex-url=" + location + "\n"},
+		{name: "go", configure: "gomod", file: ".config/go/env", body: "GOPROXY=" + location + ",direct\n"},
+		{name: "git", configure: "git", file: ".gitconfig", body: "[url \"" + location + "\"]\n\tinsteadOf = https://example.org/\n"},
+		{name: "helm", configure: "helm", file: ".config/helm/repositories.yaml", body: clientconf.HelmDocument("- name: corp\n  url: " + location + "\n")},
+		{name: "docker", configure: "oci", file: "etc/docker/daemon.json", body: `{"registry-mirrors":["` + location + `"]}`},
+		{name: "containerd", configure: "oci", file: "etc/containerd/certs.d/docker.io/hosts.toml", body: "server = \"" + location + "\"\n"},
+		{name: "apt", configure: "apt", file: "etc/apt/sources.list.d/corp.sources", body: "Types: deb\nURIs: " + location + "\nSuites: stable\nComponents: main\n", apt: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t, "dockerd", "containerd")
+			var srv *httptest.Server
+			var caPEM []byte
+			if tc.apt {
+				srv, caPEM = caAptPlanServer(t)
+			} else {
+				srv, caPEM, _ = caPlanServer(t)
+			}
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			release := filepath.Join(t.TempDir(), "os-release")
+			seeded := filepath.Join(home, tc.file)
+			for path, content := range map[string]string{caFile: string(caPEM), release: "ID=ubuntu\nID_LIKE=debian\n", seeded: tc.body} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prevGOOS, prevRoot, prevRelease, prevRun, prevApt, prevExit := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, aptSources, doctorExit
+			doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, home, release
+			aptSources = &aptSourcesHost{goos: "linux", root: home, record: filepath.Join(home, "apt-ledger.json")}
+			doctorExit = func(int) {}
+			doctorRun = func(name string, args ...string) error {
+				if name != "update-ca-certificates" {
+					return nil
+				}
+				bundle := filepath.Join(home, "etc/ssl/certs/ca-certificates.crt")
+				if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+					return err
+				}
+				return os.WriteFile(bundle, caPEM, 0o644)
+			}
+			t.Cleanup(func() {
+				doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, aptSources, doctorExit = prevGOOS, prevRoot, prevRelease, prevRun, prevApt, prevExit
+			})
+			echoed := false
+			for _, args := range [][]string{
+				{"--configure", tc.configure, "--ca-file", caFile, "--url", srv.URL},
+				{"--configure", tc.configure, "--ca-file", caFile, "--url", srv.URL, "--apply"},
+				{"--url", srv.URL},
+			} {
+				out, err := runDoctor(t, args...)
+				text := out
+				if err != nil {
+					text += "\n" + err.Error()
+				}
+				if strings.Contains(text, marker) {
+					t.Errorf("doctor %v exposes the credential:\n%s", args, text)
+				}
+				echoed = echoed || strings.Contains(text, "creds.example")
+			}
+			if !echoed {
+				t.Errorf("no run named the seeded location, so nothing here exercised its redaction")
+			}
+			if got, err := os.ReadFile(seeded); err == nil && strings.Contains(string(got), "creds.example") && !strings.Contains(string(got), marker) {
+				t.Errorf("%s keeps the location but lost its credential:\n%s", seeded, got)
+			}
+		})
+	}
+}
+
+// caAptPlanServer is a TLS bodega whose plan writes bodega.sources under the
+// caller's home, and the PEM of the certificate it serves.
+func caAptPlanServer(t *testing.T) (*httptest.Server, []byte) {
+	t.Helper()
+	var srv *httptest.Server
+	body := func() string { return "Types: deb\nURIs: " + srv.URL + "/apt\nSuites: stable\nComponents: main\n" }
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, _ *http.Request) {
+		sum := sha256.Sum256([]byte(body()))
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{{
+			System: manifest.TypeApt, Action: clientconf.PlanInstall, Path: "~" + clientconf.AptSourcesPath,
+			URL: srv.URL + "/client/apt", SHA256: hex.EncodeToString(sum[:]),
+		}}})
+	})
+	mux.HandleFunc("GET /client/apt", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body()) })
+	srv = httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	prev := doctorTrustProbe
+	doctorTrustProbe = func() host.TrustProbe {
+		p := prev()
+		p.Root, p.GOOS = p.Home, clientconf.OSLinux
+		return p
+	}
+	t.Cleanup(func() { doctorTrustProbe = prev })
+	return srv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+}

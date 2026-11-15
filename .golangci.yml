@@ -85,6 +85,9 @@ linters:
       - path: internal/host/review4[34]_test\.go
         linters: [staticcheck]
         text: ST1013
+      - path: cmd/bodega/review46_test\.go
+        linters: [gosec]
+        text: G101
 
 issues:
   max-issues-per-linter: 0

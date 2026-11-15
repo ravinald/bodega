@@ -289,11 +289,11 @@ See docs/threat-model.md for the rationale behind each check.`,
 					"  Add it:  bodega doctor --configure apt --archive <codename>")
 			}
 			if configuring {
-				return configureFromPlan(gf, planRequest{
+				return redactedErr(configureFromPlan(gf, planRequest{
 					token: token, baseURL: baseURL, systems: systems,
 					suite: aptSuite, archives: aptArchives, abi: pkgABI, release: pkgRelease, quietPro: quietPro, quietOS: quietOS,
 					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext, caFile: caFile,
-				})
+				}))
 			}
 			var lockFinding *host.Finding
 			if composerLock != "" {
@@ -333,6 +333,10 @@ See docs/threat-model.md for the rationale behind each check.`,
 			findings = append(findings, probe.Rows(base)...)
 			findings = probe.Apply(findings, base)
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
+			for i := range findings {
+				findings[i].Detail = clientconf.RedactLocations(findings[i].Detail)
+				findings[i].Remediation = clientconf.RedactLocations(findings[i].Remediation)
+			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tSTATUS\tDETAIL")
@@ -402,6 +406,22 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Permit --url over http; refused by default because a bearer token would travel in the clear")
 	return c
 }
+
+// redactedErr is the boundary every --configure error crosses on its way to
+// the terminal: a refusal can quote a client's location from any reader or
+// planner, and a credential in it is removed here even when the producer
+// forgot. errors.Is and errors.As still see the original.
+func redactedErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return redactedError{err}
+}
+
+type redactedError struct{ err error }
+
+func (e redactedError) Error() string { return clientconf.RedactLocations(e.err.Error()) }
+func (e redactedError) Unwrap() error { return e.err }
 
 // printRemediation prints one block of next steps, one line per row the
 // predicate keeps. Findings and skipped checks get separate blocks because
@@ -702,11 +722,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		if r.Profile != "" {
 			profile = "profile " + r.Profile
 		}
-		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, client.BaseURL)
+		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, clientconf.RedactLocations(client.BaseURL))
 	}
 	for _, rec := range records {
 		if rec.Reason != "" {
-			fmt.Printf("note       %-10s %s\n", rec.System, rec.Reason)
+			fmt.Printf("note       %-10s %s\n", rec.System, clientconf.RedactLocations(rec.Reason))
 		}
 	}
 	home, _ := os.UserHomeDir()
@@ -1103,9 +1123,9 @@ func judgeCA(owed, osStore []string, base string, rebuilt func() ([]*x509.Certif
 		}
 		switch v.State {
 		case host.TrustFailed:
-			refused = append(refused, fmt.Sprintf("  %s: %s", name, v.Detail))
+			refused = append(refused, fmt.Sprintf("  %s: %s", name, clientconf.RedactLocations(v.Detail)))
 		case host.TrustUnchecked:
-			unchecked = append(unchecked, fmt.Sprintf("  %s: %s", name, v.Detail))
+			unchecked = append(unchecked, fmt.Sprintf("  %s: %s", name, clientconf.RedactLocations(v.Detail)))
 		case host.TrustAbsent:
 			absent = append(absent, fmt.Sprintf("  %s: nothing this command finds its client reading points it at %s", name, base))
 		}

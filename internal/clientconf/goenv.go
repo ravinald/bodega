@@ -229,53 +229,31 @@ func GoProxyList(val string) ([]string, error) {
 	return reached, nil
 }
 
-// goProxyURL is the URL check of newProxyRepo.
+// goProxyURL is the URL check of newProxyRepo. Every error names the entry
+// through RedactLocations rather than url.URL.Redacted, which keeps a token in
+// the query and cannot be asked about an entry that does not parse.
 func goProxyURL(entry string) error {
+	shown := RedactLocations(entry)
 	base, err := url.Parse(entry)
 	if err != nil {
-		// url.Parse quotes the whole input, password included, so the
+		// url.Parse quotes the whole input, credentials included, so the
 		// error is rebuilt around the redacted entry.
 		var uerr *url.Error
 		if errors.As(err, &uerr) {
 			err = uerr.Err
 		}
-		return fmt.Errorf("invalid proxy URL %s: %w", redactURLPassword(entry), err)
+		return fmt.Errorf("invalid proxy URL %s: %w", shown, err)
 	}
-	redacted := base.Redacted()
 	switch base.Scheme {
 	case "http", "https":
 	case "file":
 		if *base != (url.URL{Scheme: base.Scheme, Path: base.Path, RawPath: base.RawPath}) {
-			return fmt.Errorf("invalid file:// proxy URL with non-path elements: %s", redacted)
+			return fmt.Errorf("invalid file:// proxy URL with non-path elements: %s", shown)
 		}
 	case "":
-		return fmt.Errorf("invalid proxy URL missing scheme: %s", redacted)
+		return fmt.Errorf("invalid proxy URL missing scheme: %s", shown)
 	default:
-		return fmt.Errorf("invalid proxy URL scheme (must be https, http, file): %s", redacted)
+		return fmt.Errorf("invalid proxy URL scheme (must be https, http, file): %s", shown)
 	}
 	return nil
-}
-
-// redactURLPassword hides the password of a URL that does not parse, which
-// url.URL.Redacted cannot be asked for: everything between the first ':' of
-// the userinfo and the last '@' of the authority.
-func redactURLPassword(raw string) string {
-	start := strings.Index(raw, "://")
-	if start < 0 {
-		return raw
-	}
-	start += len("://")
-	end := len(raw)
-	if i := strings.IndexAny(raw[start:], "/?#"); i >= 0 {
-		end = start + i
-	}
-	at := strings.LastIndex(raw[start:end], "@")
-	if at < 0 {
-		return raw
-	}
-	colon := strings.Index(raw[start:start+at], ":")
-	if colon < 0 {
-		return raw
-	}
-	return raw[:start+colon+1] + "xxxxx" + raw[start+at:]
 }

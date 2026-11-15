@@ -283,7 +283,9 @@ func TargetPath(path, home string) (string, error) {
 // Diff is the unified diff from what the host holds to what Apply would
 // write, as diff(1) -u prints it: the setup script shells out to the same
 // tool, so both paths show an operator one format. Both sides pass through
-// Redact first, so a secret in either file never reaches the output.
+// Redact and RedactLocations first, so a secret in either file, a token in an
+// index URL's query included, never reaches the output. Only the diffed
+// copies are redacted; Apply writes the file as planned.
 func (c Change) Diff() (string, error) {
 	dir, err := os.MkdirTemp("", "bodega-plan-*")
 	if err != nil {
@@ -291,10 +293,10 @@ func (c Change) Diff() (string, error) {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	oldPath, newPath := filepath.Join(dir, "old"), filepath.Join(dir, "new")
-	if err := os.WriteFile(oldPath, []byte(Redact(string(c.Old))), 0o600); err != nil {
+	if err := os.WriteFile(oldPath, []byte(RedactLocations(Redact(string(c.Old)))), 0o600); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(newPath, []byte(Redact(string(c.New))), 0o600); err != nil {
+	if err := os.WriteFile(newPath, []byte(RedactLocations(Redact(string(c.New)))), 0o600); err != nil {
 		return "", err
 	}
 	if !c.Existed {

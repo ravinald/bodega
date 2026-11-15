@@ -293,6 +293,7 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 				continue
 			}
 			if planned, ok := want["global."+option]; ok && strings.TrimSpace(v) != strings.TrimSpace(planned) {
+				v, planned := RedactLocations(v), RedactLocations(planned)
 				return fmt.Errorf("%s: %s sets %s = %s under [%s], and pip reads a command's own section ahead of the [global] index this command writes to %s, so pip %s would keep fetching from %s and the CA installed for bodega would verify an index pip does not use. "+
 					"Nothing was written. Remove %s from [%s] or set it to %s, then re-run", rec.System, f, option, v, section, target, section, v, option, section, planned)
 			}
