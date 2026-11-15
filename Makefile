@@ -284,10 +284,16 @@ vet:
 # would pass.
 GO_SOURCES = git ls-files -z --cached --others --exclude-standard -- '*.go'
 
+# A review's regression test is committed as the reviewer wrote it, so the
+# evidence cannot be edited to pass, and that includes its import grouping:
+# goimports neither checks nor rewrites these. gofmt still checks them.
+VERBATIM_GO := cmd/bodega/review47_test.go
+GOIMPORTS_SOURCES = $(GO_SOURCES) $(addprefix ':(exclude)',$(VERBATIM_GO))
+
 ## fmt: Format all Go source files (goimports if available, else gofmt)
 fmt:
 	@if command -v goimports >/dev/null 2>&1; then \
-		$(GO_SOURCES) | xargs -0 goimports -w; \
+		$(GOIMPORTS_SOURCES) | xargs -0 goimports -w; \
 	else \
 		$(GO_SOURCES) | xargs -0 gofmt -w; \
 	fi
@@ -305,7 +311,7 @@ fmt-check:
 		echo "install it: go install golang.org/x/tools/cmd/goimports@v0.50.0"; \
 		exit 1; \
 	fi
-	@out=$$($(GO_SOURCES) | xargs -0 goimports -l); \
+	@out=$$($(GOIMPORTS_SOURCES) | xargs -0 goimports -l); \
 	if [ -n "$$out" ]; then \
 		echo "goimports drift in:"; echo "$$out"; \
 		echo "run 'make fmt'"; \

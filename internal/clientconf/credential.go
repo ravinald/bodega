@@ -1,7 +1,9 @@
 package clientconf
 
 import (
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -264,18 +266,229 @@ func redactXMLElements(l string) string {
 	return sb.String() + l[last:]
 }
 
+// LocationWithheld stands in for a location whose authority cannot be
+// rebuilt as a plain host and port, so no part of its text is printed.
+const LocationWithheld = "<location withheld>"
+
 var (
-	locationUserinfo = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@`)
-	locationQuery    = regexp.MustCompile(`(?i)([?&;][^=&;#\s]*(?:pass|pwd|token|secret|auth|key|sig|credential)[^=&;#\s]*=)[^&;#\s]*`)
+	schemeStart     = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*:`)
+	printableEscape = regexp.MustCompile(`\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|x([0-9A-Fa-f]{2})|(/))`)
+	// cleanHost and cleanPort also take the <bodega> and {host} placeholders
+	// remediation text writes in place of a real address.
+	cleanHost = regexp.MustCompile(`^(?:\[[0-9A-Fa-f:.]+\]|(?:[\p{L}\p{N}._~-]|<[A-Za-z_]+>|\{[A-Za-z_]+\})*)$`)
+	cleanPort = regexp.MustCompile(`^(?:[0-9]*|<[A-Za-z_]+>)$`)
 )
 
-// RedactLocations removes, from text naming one or more locations, the whole
-// userinfo of each scheme://user:pass@ authority and the value of each query
-// parameter whose name suggests a credential. It works on the raw text and
-// never parses a URL, so a location a reader refused as unresolvable, with a
-// non-ASCII host or a stray backslash, is redacted all the same: a diagnostic
-// names the setting and its source, never the secret in it.
+// specialSchemes are the WHATWG special schemes, which npm's URL parser
+// accepts with any run of slashes or backslashes, or none, before the
+// authority.
+var specialSchemes = map[string]bool{"http": true, "https": true, "ws": true, "wss": true, "ftp": true, "file": true}
+
+// RedactLocations rewrites every location in text, as a diagnostic prints
+// it, to scheme://host[:port]/path: userinfo becomes the Redacted marker,
+// and query and fragment are dropped whole, so no credential survives whatever encoding a client
+// decodes in them (a percent-escaped query key, a JSON-escaped userinfo).
+// A line holding escapes for printable characters is read decoded when that
+// reveals a location, because npm/ini, YAML, TOML and JSON strings all
+// decode \u002f and its kin before the client sees a URL. An authority that
+// is not a plain host and port after the userinfo goes prints as
+// LocationWithheld. Only diagnostics pass through here; the bytes a client
+// reads are never rewritten.
 func RedactLocations(text string) string {
-	text = locationUserinfo.ReplaceAllString(text, "${1}"+Redacted+"@")
-	return locationQuery.ReplaceAllString(text, "${1}"+Redacted)
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if d := decodePrintableEscapes(l); d != l && schemeStart.MatchString(d) {
+			l = d
+		}
+		lines[i] = renderLocations(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// decodePrintableEscapes decodes \uXXXX, \UXXXXXXXX, \xXX and \/ wherever
+// the result is printable ASCII other than a quote or backslash, leaving
+// every other escape, and so the line's quoting, as it was.
+func decodePrintableEscapes(l string) string {
+	return printableEscape.ReplaceAllStringFunc(l, func(m string) string {
+		if m == `\/` {
+			return "/"
+		}
+		n, err := strconv.ParseUint(m[2:], 16, 32)
+		if err != nil || n < 0x21 || n > 0x7e || n == '"' || n == '\'' || n == '\\' {
+			return m
+		}
+		return string(rune(n))
+	})
+}
+
+func renderLocations(l string) string {
+	var sb strings.Builder
+	last := 0
+	for _, m := range schemeStart.FindAllStringIndex(l, -1) {
+		if m[0] < last || (m[0] > 0 && isSchemeChar(l[m[0]-1])) {
+			continue
+		}
+		scheme, after, ok := locationStart(l, m)
+		if !ok {
+			continue
+		}
+		token := tokenAt(l, after)
+		trimmed := strings.TrimRight(token, `"'),;]>}`+"`")
+		sb.WriteString(l[last:m[0]])
+		if span := spannedUserinfo(l[after:], len(token)); span > 0 {
+			sb.WriteString(LocationWithheld)
+			last = after + span
+			continue
+		}
+		sb.WriteString(rebuildLocationList(scheme, trimmed))
+		sb.WriteString(token[len(trimmed):])
+		last = after + len(token)
+	}
+	return sb.String() + l[last:]
+}
+
+// locationStart reports whether the scheme match m in l opens a location,
+// and where its authority begins. Any scheme followed by // qualifies. A
+// special scheme also qualifies with any run of slashes and backslashes, or
+// with none when an @ follows, because npm's WHATWG parser reads
+// https:user:pass@host as an authority.
+func locationStart(l string, m []int) (scheme string, after int, ok bool) {
+	scheme = strings.ToLower(l[m[0] : m[1]-1])
+	if !specialSchemes[scheme] {
+		return scheme, m[1] + 2, strings.HasPrefix(l[m[1]:], "//")
+	}
+	after = m[1]
+	for after < len(l) && (l[after] == '/' || l[after] == '\\') {
+		after++
+	}
+	if after == m[1] && !strings.Contains(tokenAt(l, after), "@") {
+		return scheme, after, false
+	}
+	return scheme, after, true
+}
+
+// spannedUserinfo is how far a userinfo holding whitespace runs into rest,
+// the text after scheme://, or 0 when it holds none. WHATWG URL parsing
+// percent-encodes a space in userinfo rather than ending the authority
+// there, so npm reads https://u p:x@h/ as host h with password x, and an
+// @ before the next path, query or fragment delimiter means the authority
+// spans the whitespace.
+func spannedUserinfo(rest string, token int) int {
+	if strings.ContainsAny(rest[:token], "/?#\\") {
+		return 0
+	}
+	end := len(rest)
+	if i := strings.IndexAny(rest[token:], "/?#\\"); i >= 0 {
+		end = token + i
+	}
+	if at := strings.LastIndexByte(rest[token:end], '@'); at >= 0 {
+		return token + at + 1
+	}
+	return 0
+}
+
+// tokenAt is the run of l from i up to the next whitespace.
+func tokenAt(l string, i int) string {
+	j := i
+	for j < len(l) && l[j] != ' ' && l[j] != '\t' && l[j] != '\r' {
+		j++
+	}
+	return l[i:j]
+}
+
+func isSchemeChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '+' || c == '.' || c == '-'
+}
+
+var (
+	listSeparator = regexp.MustCompile(`[,|]`)
+	listWord      = regexp.MustCompile(`^[A-Za-z0-9._-]*$`)
+)
+
+// rebuildLocationList renders the text after scheme://, first as a
+// GOPROXY-style list, locations and bare words such as direct or off joined
+// by commas or pipes, then as one location. The list form holds only when
+// every later member is a bare word or a location that rebuilds whole, so a
+// comma inside a userinfo or a query cannot split a credential off into a
+// member printed as it stands.
+func rebuildLocationList(scheme, rest string) string {
+	whole := rebuildLocation(scheme, rest, specialSchemes[scheme])
+	if list, ok := rebuildList(scheme, rest); ok {
+		return list
+	}
+	return whole
+}
+
+func rebuildList(scheme, rest string) (string, bool) {
+	first := listSeparator.FindStringIndex(rest)
+	if first == nil {
+		return "", false
+	}
+	out := rebuildLocation(scheme, rest[:first[0]], specialSchemes[scheme])
+	if out == LocationWithheld {
+		return "", false
+	}
+	members := rest[first[0]:]
+	for members != "" {
+		sep, member := members[:1], members[1:]
+		if m := listSeparator.FindStringIndex(member); m != nil {
+			member, members = member[:m[0]], member[m[0]:]
+		} else {
+			members = ""
+		}
+		if !listWord.MatchString(member) {
+			m := schemeStart.FindStringIndex(member)
+			if m == nil || m[0] != 0 {
+				return "", false
+			}
+			s, after, ok := locationStart(member, m)
+			if !ok {
+				return "", false
+			}
+			if member = rebuildLocation(s, member[after:], specialSchemes[s]); member == LocationWithheld {
+				return "", false
+			}
+		}
+		out += sep + member
+	}
+	return out, true
+}
+
+// rebuildLocation renders the part of a location after scheme:// with its
+// userinfo replaced by the Redacted marker and its query and fragment gone. A special scheme ends its authority at
+// a backslash as well, as WHATWG URL parsing does.
+func rebuildLocation(scheme, rest string, special bool) string {
+	stops := "/?#"
+	if special {
+		stops += "\\"
+	}
+	cut := len(rest)
+	if i := strings.IndexAny(rest, stops); i >= 0 {
+		cut = i
+	}
+	authority, tail := rest[:cut], rest[cut:]
+	userinfo := ""
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authority, userinfo = authority[at+1:], Redacted+"@"
+	}
+	if i := strings.IndexAny(tail, "?#"); i >= 0 {
+		tail = tail[:i]
+	}
+	host, port := authority, ""
+	if i := strings.LastIndexByte(authority, ':'); i >= 0 && !strings.HasSuffix(authority, "]") {
+		host, port = authority[:i], authority[i:]
+		port = port[1:]
+	}
+	if strings.Contains(host, "%") {
+		if h, err := url.PathUnescape(host); err == nil {
+			host = h
+		}
+	}
+	if !cleanHost.MatchString(host) || !cleanPort.MatchString(port) {
+		return LocationWithheld
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + userinfo + host + tail
 }

@@ -5851,13 +5851,41 @@ func TestRedactLocationsWithoutParsing(t *testing.T) {
 		"git+ssh://u:" + secret + "@host/repo",
 		"https://host/simple/?token=" + secret + "&page=2",
 		"https://host/x?X-Amz-Signature=" + secret,
+		"https://host/simple/?%74oken=" + secret,
+		`registry="https:\u002f\u002fu:` + secret + `@creds.example/repo/"`,
+		`registry=https:\/\/u:` + secret + `@creds.example/`,
+		"https:u:" + secret + "@creds.example/",
+		`https:\\u:` + secret + `@creds.example/`,
+		"https://u:" + secret + "@ho%zzst/",
+		"https://host/#" + secret,
+		"https://u,x:" + secret + "@host/",
+		"GOPROXY=https://a.example,https://u:" + secret + "@b.example,direct",
+		"registry=https://u " + secret + ":x@h/",
+		"registry=https://u:a " + secret + "@h/",
+		`registry = "https://u:a ` + secret + `@h/repo/"`,
 	} {
 		got := RedactLocations(in)
 		if strings.Contains(got, secret) {
 			t.Errorf("RedactLocations(%q) = %q, still carries the secret", in, got)
 		}
 	}
-	if got := RedactLocations("https://host/simple/?page=2"); got != "https://host/simple/?page=2" {
-		t.Errorf("a location with no credential changed: %q", got)
+	//nolint:gosec // G101: synthetic userinfo the redactor has to strip.
+	for in, want := range map[string]string{
+		"index-url = https://host/simple/?page=2":                              "index-url = https://host/simple/",
+		`registry="https:\u002f\u002fu:pw@creds.example:8443/r/"`:              `registry="https://<redacted>@creds.example:8443/r/"`,
+		`"registry-mirrors": ["https://mirror.example"]`:                       `"registry-mirrors": ["https://mirror.example"]`,
+		"proxy ftp://u:pw@host:x/p is invalid":                                 "proxy " + LocationWithheld + " is invalid",
+		"no location here: http: error":                                        "no location here: http: error",
+		"GOPROXY=https://u:pw@proxy.golang.org,direct":                         "GOPROXY=https://<redacted>@proxy.golang.org,direct",
+		"GOPROXY=https://a.example|https://b.example/p?t=x,off":                "GOPROXY=https://a.example|https://b.example/p,off",
+		"GOPROXY=https://u:pw@c.example/r/?token=pw,direct":                    "GOPROXY=https://<redacted>@c.example/r/,direct",
+		"https://u,x:pw@host/":                                                 "https://<redacted>@host/",
+		"https://h/simple/?a=1,b=2":                                            "https://h/simple/",
+		`[url "https://u:pw@creds.example/repo/?token=pw"]`:                    `[url "https://<redacted>@creds.example/repo/"]`,
+		"go env -w GOPROXY=http://<bodega>/go,https://proxy.golang.org,direct": "go env -w GOPROXY=http://<bodega>/go,https://proxy.golang.org,direct",
+	} {
+		if got := RedactLocations(in); got != want {
+			t.Errorf("RedactLocations(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

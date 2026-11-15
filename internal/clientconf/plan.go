@@ -293,10 +293,10 @@ func (c Change) Diff() (string, error) {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	oldPath, newPath := filepath.Join(dir, "old"), filepath.Join(dir, "new")
-	if err := os.WriteFile(oldPath, []byte(RedactLocations(Redact(string(c.Old)))), 0o600); err != nil {
+	if err := os.WriteFile(oldPath, []byte(Redact(RedactLocations(string(c.Old)))), 0o600); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(newPath, []byte(RedactLocations(Redact(string(c.New)))), 0o600); err != nil {
+	if err := os.WriteFile(newPath, []byte(Redact(RedactLocations(string(c.New)))), 0o600); err != nil {
 		return "", err
 	}
 	if !c.Existed {

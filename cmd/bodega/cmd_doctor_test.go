@@ -4618,26 +4618,62 @@ func TestCARefusesNpmEscapedCAPathRefusesBeforeWrites(t *testing.T) {
 // F116 R1, R2: no reader's location reaches doctor's output with its
 // credentials. Each case seeds one client's documented file with a location
 // carrying a password in its userinfo and a token in its query, then runs the
-// CA preview, the apply and the ordinary report. Whatever each run does with
-// the location (replaces it in a diff, keeps it as context, refuses it, warns
-// on it), the marker never appears in the output or the returned error, the
-// location's host does, so the location was echoed and not dropped, and a
-// file the apply keeps still holds the credential the client needs.
+// CA preview, the apply and the ordinary report, reseeding before each so
+// every run reads the credential-bearing file. Each invocation has its own
+// control: it must succeed or refuse as the case says and print the line
+// under test before its output is searched for the marker. The report runs
+// against a location on bodega's own host, because a reader's row names only
+// a location it judges, and is left out for APT and containerd, whose rows
+// never read the seeded location.
 func TestDoctorCARedactsLocationCredentialsPerReader(t *testing.T) {
 	const marker = "f116-reader-password-marker"
 	const location = "https://review-user:" + marker + "@creds.example/repo/?token=" + marker
+	type invocation struct{ refuse, line string }
 	for _, tc := range []struct {
 		name, configure, file, body string
+		plan                        invocation
+		reportBody, reportEnv       string
+		reportRow                   string
 		apt                         bool
 	}{
-		{name: "npm", configure: "npm", file: ".npmrc", body: "registry=" + location + "\n"},
-		{name: "pip", configure: "pypi", file: "etc/pip.conf", body: "[global]\nindex-url=" + location + "\n"},
-		{name: "go", configure: "gomod", file: ".config/go/env", body: "GOPROXY=" + location + ",direct\n"},
-		{name: "git", configure: "git", file: ".gitconfig", body: "[url \"" + location + "\"]\n\tinsteadOf = https://example.org/\n"},
-		{name: "helm", configure: "helm", file: ".config/helm/repositories.yaml", body: clientconf.HelmDocument("- name: corp\n  url: " + location + "\n")},
-		{name: "docker", configure: "oci", file: "etc/docker/daemon.json", body: `{"registry-mirrors":["` + location + `"]}`},
-		{name: "containerd", configure: "oci", file: "etc/containerd/certs.d/docker.io/hosts.toml", body: "server = \"" + location + "\"\n"},
-		{name: "apt", configure: "apt", file: "etc/apt/sources.list.d/corp.sources", body: "Types: deb\nURIs: " + location + "\nSuites: stable\nComponents: main\n", apt: true},
+		{
+			name: "npm", configure: "npm", file: ".npmrc", body: "registry=LOC\n",
+			plan:       invocation{line: "-registry=https://<redacted>@creds.example/repo/"},
+			reportBody: "registry=BODEGA/npm/?token=" + marker + "\n", reportRow: "npm-config ",
+		},
+		{
+			name: "pip", configure: "pypi", file: "etc/pip.conf", body: "[global]\nindex-url=LOC\n",
+			plan:       invocation{line: "-index-url=https://<redacted>@creds.example/repo/"},
+			reportBody: "[global]\nindex-url=BODEGA/pypi/simple/?token=" + marker + "\n", reportRow: "pip-config ",
+		},
+		{
+			name: "go", configure: "gomod", file: ".config/go/env", body: "GOPROXY=LOC,direct\n",
+			plan:      invocation{line: "-GOPROXY=https://<redacted>@creds.example/repo/,direct"},
+			reportEnv: "BODEGA/go?token=" + marker + ",direct", reportRow: "goproxy-env ",
+		},
+		{
+			name: "git", configure: "git", file: ".gitconfig", body: "[url \"LOC\"]\n\tinsteadOf = https://example.org/\n",
+			plan:       invocation{line: `[url "https://<redacted>@creds.example/repo/"]`},
+			reportBody: "[url \"BODEGA/git/?token=" + marker + "\"]\n\tinsteadOf = https://example.org/\n", reportRow: "git-config ",
+		},
+		{
+			name: "helm", configure: "helm", file: ".config/helm/repositories.yaml", body: clientconf.HelmDocument("- name: corp\n  url: LOC\n"),
+			plan:       invocation{line: "url: https://<redacted>@creds.example/repo/"},
+			reportBody: clientconf.HelmDocument("- name: corp\n  url: BODEGA/helm?token=" + marker + "\n"), reportRow: "helm-repos ",
+		},
+		{
+			name: "docker", configure: "oci", file: "etc/docker/daemon.json", body: `{"registry-mirrors":["LOC"]}`,
+			plan:       invocation{refuse: "invalid mirror", line: "creds.example"},
+			reportBody: `{"registry-mirrors":["BODEGA/?token=` + marker + `"]}`, reportRow: "oci-docker ",
+		},
+		{
+			name: "containerd", configure: "oci", file: "etc/containerd/certs.d/docker.io/hosts.toml", body: "server = \"LOC\"\n",
+			plan: invocation{line: `-server = "https://<redacted>@creds.example/repo/"`},
+		},
+		{
+			name: "apt", configure: "apt", file: "etc/apt/sources.list.d/corp.sources", body: "Types: deb\nURIs: LOC\nSuites: stable\nComponents: main\n", apt: true,
+			plan: invocation{line: "https://<redacted>@creds.example/repo/ names neither a public archive nor bodega"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -4654,13 +4690,13 @@ func TestDoctorCARedactsLocationCredentialsPerReader(t *testing.T) {
 			caFile := filepath.Join(t.TempDir(), "ca.pem")
 			release := filepath.Join(t.TempDir(), "os-release")
 			seeded := filepath.Join(home, tc.file)
-			for path, content := range map[string]string{caFile: string(caPEM), release: "ID=ubuntu\nID_LIKE=debian\n", seeded: tc.body} {
-				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-					t.Fatal(err)
-				}
+			for path, content := range map[string]string{caFile: string(caPEM), release: "ID=ubuntu\nID_LIKE=debian\n"} {
 				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if err := os.MkdirAll(filepath.Dir(seeded), 0o755); err != nil {
+				t.Fatal(err)
 			}
 			prevGOOS, prevRoot, prevRelease, prevRun, prevApt, prevExit := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, aptSources, doctorExit
 			doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, home, release
@@ -4679,27 +4715,67 @@ func TestDoctorCARedactsLocationCredentialsPerReader(t *testing.T) {
 			t.Cleanup(func() {
 				doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, aptSources, doctorExit = prevGOOS, prevRoot, prevRelease, prevRun, prevApt, prevExit
 			})
-			echoed := false
-			for _, args := range [][]string{
-				{"--configure", tc.configure, "--ca-file", caFile, "--url", srv.URL},
-				{"--configure", tc.configure, "--ca-file", caFile, "--url", srv.URL, "--apply"},
-				{"--url", srv.URL},
-			} {
+			seed := func(body string) {
+				t.Helper()
+				if err := os.WriteFile(seeded, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body := strings.ReplaceAll(tc.body, "LOC", location)
+			for _, apply := range []bool{false, true} {
+				seed(body)
+				args := []string{"--configure", tc.configure, "--ca-file", caFile, "--url", srv.URL}
+				if apply {
+					args = append(args, "--apply")
+				}
 				out, err := runDoctor(t, args...)
 				text := out
-				if err != nil {
+				switch {
+				case tc.plan.refuse == "" && err != nil:
+					t.Fatalf("doctor %v: want success, got %v\n%s", args, err, out)
+				case tc.plan.refuse != "":
+					if err == nil || !strings.Contains(err.Error(), tc.plan.refuse) {
+						t.Fatalf("doctor %v: want a refusal naming %q, got %v\n%s", args, tc.plan.refuse, err, out)
+					}
 					text += "\n" + err.Error()
+				}
+				if !strings.Contains(text, tc.plan.line) {
+					t.Fatalf("doctor %v printed no %q, so it never echoed the seeded location:\n%s", args, tc.plan.line, text)
 				}
 				if strings.Contains(text, marker) {
 					t.Errorf("doctor %v exposes the credential:\n%s", args, text)
 				}
-				echoed = echoed || strings.Contains(text, "creds.example")
+				if got, err := os.ReadFile(seeded); err == nil && strings.Contains(string(got), "creds.example") && !strings.Contains(string(got), marker) {
+					t.Errorf("%s keeps the location but lost its credential:\n%s", seeded, got)
+				}
 			}
-			if !echoed {
-				t.Errorf("no run named the seeded location, so nothing here exercised its redaction")
+			if tc.reportRow == "" {
+				return
 			}
-			if got, err := os.ReadFile(seeded); err == nil && strings.Contains(string(got), "creds.example") && !strings.Contains(string(got), marker) {
-				t.Errorf("%s keeps the location but lost its credential:\n%s", seeded, got)
+			withCreds := strings.Replace(srv.URL, "https://", "https://review-user:"+marker+"@", 1)
+			seed(strings.ReplaceAll(tc.body, "LOC", "https://other.example/"))
+			if tc.reportBody != "" {
+				seed(strings.ReplaceAll(tc.reportBody, "BODEGA", withCreds))
+			}
+			if tc.reportEnv != "" {
+				t.Setenv("GOPROXY", strings.ReplaceAll(tc.reportEnv, "BODEGA", withCreds))
+			}
+			out, err := runDoctor(t, "--url", srv.URL)
+			if err != nil {
+				t.Fatalf("ordinary report: %v\n%s", err, out)
+			}
+			endpoint := strings.TrimPrefix(srv.URL, "https://")
+			var row string
+			for _, l := range strings.Split(out, "\n") {
+				if strings.HasPrefix(l, tc.reportRow) {
+					row = l
+				}
+			}
+			if !strings.Contains(row, endpoint) && !strings.Contains(row, tc.file) {
+				t.Fatalf("the %s row never read the seeded location:\n%s", strings.TrimSpace(tc.reportRow), out)
+			}
+			if strings.Contains(out, marker) {
+				t.Errorf("ordinary report exposes the credential:\n%s", out)
 			}
 		})
 	}
