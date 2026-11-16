@@ -206,8 +206,8 @@ check_ne FDIST-05 "no binary namespace answers the distfile" "200" "$E2E_OUT" \
 
 E2E_HOST=freebsd
 # The guests resolve through public DNS and public_url names the server by
-# its internal name; same tag as 47, so one sed clears both.
-fd_sh "sudo -n sed -i '' '/# bodega-e2e\$/d' /etc/hosts &&
+# its internal name. Only this server's line is replaced, as in 47.
+fd_sh "sudo -n sed -i '' '/ $E2E_SERVER_HOST # bodega-e2e\$/d' /etc/hosts &&
 printf '%s %s # bodega-e2e\\n' '$E2E_SERVER_ADDR' '$E2E_SERVER_HOST' | sudo -n tee -a /etc/hosts >/dev/null &&
 curl -sS -o /dev/null -w '%{http_code}' --max-time 10 '$E2E_BASE_URL/healthz'" || true
 check_eq FDIST-06 "the freebsd guest reaches the server by name" "200" "$E2E_OUT" \

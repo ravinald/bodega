@@ -689,6 +689,14 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.spoolErr != nil {
 		return s.spoolErr
 	}
+
+	// Ahead of the spool lock: a second server started to learn whether a
+	// posture is refused must be told about the posture, and the lock would
+	// answer first with a conflict that says nothing of it.
+	if err := s.guardPlaintext(); err != nil {
+		return err
+	}
+
 	spoolLock, err := lockSpoolDir(s.spool.dir)
 	if err != nil {
 		return err
@@ -698,10 +706,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if s.inventoryErr != nil {
 		return s.inventoryErr
-	}
-
-	if err := s.guardPlaintext(); err != nil {
-		return err
 	}
 
 	// Before the listener, so no proxy fill or API admission runs before the

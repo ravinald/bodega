@@ -142,9 +142,13 @@ done
 # 47 and 49 write their own entry. A guest carrying a line from an earlier run
 # hid that order; a fresh one fails 46's fetch as an unresolvable host. BSD sed
 # takes the in-place suffix as a separate argument.
+#
+# Only this server's line is replaced. Several host maps name the same two
+# FreeBSD guests, and deleting every tagged line took another running pass's
+# server out of /etc/hosts in the middle of its suite.
 for h in freebsd freebsd-server; do
 	E2E_HOST="$h"
-	e2e_on "$h" "sudo sed -i '' '/# bodega-e2e\$/d' /etc/hosts && \
+	e2e_on "$h" "sudo sed -i '' '/ $E2E_SERVER_HOST # bodega-e2e\$/d' /etc/hosts && \
 		printf '%s %s # bodega-e2e\n' '$E2E_SERVER_ADDR' '$E2E_SERVER_HOST' | sudo tee -a /etc/hosts >/dev/null" || true
 done
 

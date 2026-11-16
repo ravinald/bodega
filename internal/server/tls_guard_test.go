@@ -82,6 +82,28 @@ func TestStartTLSMatrix(t *testing.T) {
 	}
 }
 
+// TestStartRefusesPlaintextBeforeTheSpoolLock covers the order of the two
+// refusals. An operator checking a posture starts a second server beside the
+// running one, which holds the spool; the answer has to be about plaintext.
+func TestStartRefusesPlaintextBeforeTheSpoolLock(t *testing.T) {
+	addr := reservePort(t)
+	s := newGuardServer(t, &config.Config{LogDir: t.TempDir()}, addr)
+	held, err := lockSpoolDir(s.spool.dir)
+	if err != nil {
+		t.Fatalf("take the spool lock a running server would hold: %v", err)
+	}
+	defer func() { _ = held.Close() }()
+
+	err = s.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start bound a plaintext listener nobody authorized")
+	}
+	if !strings.Contains(err.Error(), "refusing to serve plaintext HTTP") {
+		t.Fatalf("error %q is not the plaintext refusal", err)
+	}
+	assertNothingListening(t, addr)
+}
+
 // TestStartRefusesPlaintextOn443 covers the evidence a port carries. 443 is
 // not authorization, but an operator who wrote it expected TLS, so an empty
 // cert pair there refuses with the port named rather than binding in the clear

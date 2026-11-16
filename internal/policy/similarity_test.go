@@ -837,6 +837,12 @@ func TestGitSimilarityNameMatchesGit(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
 	}
+	// fetch-pack refuses to run outside a repository, and a tree unpacked
+	// from an archive has none around it.
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init %s: %v\n%s", repo, err, out)
+	}
 	for _, upstream := range []string{
 		"git@github.com:kubernetes/kubernetes.git",
 		"github.com:kubernetes/kubernetes.git",
@@ -879,7 +885,9 @@ func TestGitSimilarityNameMatchesGit(t *testing.T) {
 		"../repos/kubernetes/kubernetes.git",
 		"srv/git:x/kubernetes/kubernetes.git",
 	} {
-		out, err := exec.Command("git", "fetch-pack", "--diag-url", upstream).CombinedOutput()
+		cmd := exec.Command("git", "fetch-pack", "--diag-url", upstream)
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git fetch-pack --diag-url %q: %v\n%s", upstream, err, out)
 		}
