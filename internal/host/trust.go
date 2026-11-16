@@ -525,7 +525,31 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 			return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's cert setting in %s names %s, which pip resolves against another account's home directory or the directory it is started in, neither of which doctor knows, so which bundle pip verifies bodega against is unchecked", cert[1], cert[0])}}
 		}
 		cert[0] = path
-		return []trustStore{{name: fmt.Sprintf("%s, which pip's cert setting names in %s in place of the system trust store,", cert[0], cert[1]), files: []string{cert[0]}}}
+		replaced := trustStore{name: fmt.Sprintf("%s, which pip's cert setting names in %s in place of the system trust store,", cert[0], cert[1]), files: []string{cert[0]}}
+		added := trustStore{name: fmt.Sprintf("%s, which pip's cert setting names in %s and pip reads alongside the system trust store,", cert[0], cert[1]), files: []string{cert[0]}, system: true}
+		// pip 24.2 and later verify through truststore, which keeps the
+		// system's roots and loads the cert bundle on top of them; only
+		// legacy-certs, or a pip without truststore, hands the bundle to
+		// requests in place of every default root.
+		if strings.Contains(t.env("PIP_USE_DEPRECATED"), "legacy-certs") {
+			return []trustStore{replaced}
+		}
+		return []trustStore{{name: added.name, resolve: func() trustStore {
+			reason := "pip is not asked on this host"
+			if ask != nil {
+				d, err := ask()
+				switch {
+				case err != nil:
+					reason = err.Error()
+				case !d.Truststore:
+					return replaced
+				default:
+					return added
+				}
+			}
+			added.unsure = fmt.Sprintf("whether pip reads %s alongside the system trust store or in place of it is not known (%s): pip 24.2 and later add it to the system's roots, an older pip or legacy-certs replaces them, so while the bundle alone does not verify bodega's certificate, whether pip does is unchecked", cert[0], reason)
+			return added
+		}}}
 	}
 	system := trustStore{name: systemStoreName + ", which pip reads while no cert setting names a bundle,", system: true}
 	return []trustStore{{name: system.name, resolve: func() trustStore {

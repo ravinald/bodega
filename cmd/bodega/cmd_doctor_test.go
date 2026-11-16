@@ -1803,18 +1803,26 @@ func TestUnreadCAOwesAVerdictPerSystem(t *testing.T) {
 	}
 	prev := doctorTrustProbe
 	t.Cleanup(func() { doctorTrustProbe = prev })
+	pipDeprecated := ""
 	doctorTrustProbe = func() host.TrustProbe {
-		return host.TrustProbe{Root: root, Home: "/home/u", GOOS: "linux", Getenv: func(string) string { return "" },
+		return host.TrustProbe{Root: root, Home: "/home/u", GOOS: "linux", Getenv: func(k string) string {
+			if k == "PIP_USE_DEPRECATED" {
+				return pipDeprecated
+			}
+			return ""
+		},
 			System: func([]*x509.Certificate, string) error { return nil }}
 	}
 	systems := []string{"pip-config"}
 	for _, tc := range []struct {
-		name, cert, want string
+		name, cert, deprecated, want string
 	}{
-		{"pip cannot say which bundle it reads", "", "could not be checked"},
-		{"pip reads a bundle without the CA", "cert = /missing/site.pem\n", "still read a store without it"},
-		{"pip reads the installed CA", "cert = " + caFile + "\n", ""},
+		{"pip cannot say which bundle it reads", "", "", "could not be checked"},
+		{"pip in legacy-certs mode reads a bundle without the CA", "cert = /missing/site.pem\n", "legacy-certs", "still read a store without it"},
+		{"pip of unknown mode names a bundle without the CA", "cert = /missing/site.pem\n", "", "could not be checked"},
+		{"pip reads the installed CA", "cert = " + caFile + "\n", "", ""},
 	} {
+		pipDeprecated = tc.deprecated
 		if err := os.WriteFile(pipConf, []byte("[global]\nindex-url = "+srv.URL+"/pypi/simple/\n"+tc.cert), 0o644); err != nil {
 			t.Fatal(err)
 		}

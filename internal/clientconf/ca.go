@@ -1047,15 +1047,20 @@ func ProposedSystemRoots(h CAHost, changes []Change) ([]*x509.Certificate, error
 		added = append(added, pemCerts(c.New)...)
 	}
 	if len(gone) > 0 && store.anchors != nil {
-		// An anchor that resolves to a file the plan rewrites is that file,
-		// whatever name or symlink reaches it: its proposed bytes are already
-		// in added, and its bytes on disk are the ones the plan replaces.
+		// An anchor that is a file the plan rewrites in place is that file,
+		// whatever name, symlink or hard link reaches it: its proposed bytes
+		// are already in added, and its bytes on disk are the ones the plan
+		// replaces.
 		changed := map[string]bool{}
+		var changedFiles []os.FileInfo
 		for _, c := range changes {
 			changed[resolved(c.Target)] = true
+			if info, err := os.Stat(c.Target); err == nil {
+				changedFiles = append(changedFiles, info)
+			}
 		}
 		for _, f := range store.anchors(h.Root) {
-			if changed[resolved(f)] {
+			if changed[resolved(f)] || sameAsAny(f, changedFiles) {
 				continue
 			}
 			if data, err := plannedfs.ReadFile(f); err == nil {
@@ -1105,6 +1110,20 @@ func confAnchors(dir string, conf []byte) []string {
 		}
 	}
 	return out
+}
+
+// sameAsAny reports whether path is, on disk, the same file as one of files.
+func sameAsAny(path string, files []os.FileInfo) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	for _, f := range files {
+		if os.SameFile(info, f) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolved is path with every symlink on disk followed, or path cleaned when
