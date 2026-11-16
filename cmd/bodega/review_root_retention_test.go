@@ -111,7 +111,7 @@ func TestReviewRootReplacementRetainsIndependentAnchor(t *testing.T) {
 					return err
 				}
 				if !entry.IsDir() && filepath.Ext(path) == ".crt" {
-					data, err := os.ReadFile(path)
+					data, err := os.ReadFile(path) //nolint:gosec // G122: the tree walked is this test's own TempDir.
 					if err != nil {
 						return err
 					}
