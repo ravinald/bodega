@@ -109,13 +109,16 @@ check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega ins
 # the arithmetic below inside bash's 64-bit integers, where a longer value
 # wraps and hands timeout(1) a negative bound.
 if [[ "$GATED_RACE_TIMEOUT" =~ ^[1-9][0-9]{0,3}m$ ]] && [ "${GATED_RACE_TIMEOUT%m}" -le 1440 ]; then
+	# Each run's whole output stays on the guest and the first failure is
+	# printed ahead of the tail: a timeout's goroutine dump fills any tail and
+	# pushes the failing test, or the race report, out of it.
 	race_ssh_timeout=$((${GATED_RACE_TIMEOUT%m} * 60 + 600))
 
-	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/audit/ 2>&1 | tail -20" || true
+	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/audit/ >$GATED_ROOT/GAT-06.log 2>&1; rc=\$?; grep -E -m 5 'WARNING: DATA RACE|^--- FAIL|^panic: test timed out' $GATED_ROOT/GAT-06.log; tail -20 $GATED_ROOT/GAT-06.log; exit \$rc" || true
 	check_eq GAT-06 "the audit package passes under -race on two cores" 0 "$E2E_RC" \
 		"docs/design.md:618" "GOMAXPROCS=2 taskset -c 0,1 go test -race -timeout $GATED_RACE_TIMEOUT ./internal/audit/" "$E2E_RC"
 
-	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/server/ 2>&1 | tail -20" || true
+	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/server/ >$GATED_ROOT/GAT-07.log 2>&1; rc=\$?; grep -E -m 5 'WARNING: DATA RACE|^--- FAIL|^panic: test timed out' $GATED_ROOT/GAT-07.log; tail -20 $GATED_ROOT/GAT-07.log; exit \$rc" || true
 	check_eq GAT-07 "the server package passes under -race on two cores" 0 "$E2E_RC" \
 		"docs/design.md:641" "GOMAXPROCS=2 taskset -c 0,1 go test -race -timeout $GATED_RACE_TIMEOUT ./internal/server/" "$E2E_RC"
 	unset race_ssh_timeout

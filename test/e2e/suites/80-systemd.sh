@@ -103,7 +103,7 @@ fi
 
 e2e_on server "sudo bodega serve --addr 127.0.0.1:18080 --allow-plaintext=false 2>&1 | head -5; true" || true
 check_matches SYS-10 "--allow-plaintext=false refuses a plaintext listener" \
-	'plaintext|TLS|cert' "$E2E_OUT$E2E_ERR" "internal/server/server.go:438" \
+	'plaintext|TLS|cert' "$E2E_OUT$E2E_ERR" "internal/server/server.go:622" \
 	"bodega serve --allow-plaintext=false with allow_plaintext true in the config"
 
 # ---- the ownership trap ----------------------------------------------------

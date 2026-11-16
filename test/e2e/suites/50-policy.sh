@@ -34,7 +34,7 @@ check_contains POL-03 "the seeded action is warn, not block" "warn" "$ages" \
 
 # The ecosystems with no upstream publish timestamp must be refused rather than
 # accepted and silently never evaluated.
-for eco in apt binary git helm; do
+for eco in binary git helm; do
 	e2e_bodega server "policy age set $eco 7d warn" || true
 	check_ne "POL-AGE-$eco" "an age gate on $eco is refused" 0 "$E2E_RC" \
 		"docs/quickstart.md:247" "bodega policy age set $eco 7d warn" "$E2E_RC"
@@ -46,6 +46,13 @@ e2e_bodega server "policy age set gomod 7d warn" || true
 check_eq POL-04 "an age gate can be set on gomod" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_policy_age.go:39" "bodega policy age set gomod 7d warn" "$E2E_RC"
 e2e_bodega server "policy age remove gomod" || true
+
+# apt is among the dated ecosystems docs/usage.md lists, so it takes a gate.
+# Removed again: a rule left behind gates every apt fetch the later suites make.
+e2e_bodega server "policy age set apt 7d warn" || true
+check_eq POL-AGE-apt "an age gate can be set on apt" 0 "$E2E_RC" \
+	"docs/usage.md" "bodega policy age set apt 7d warn" "$E2E_RC"
+e2e_bodega server "policy age remove apt" || true
 
 # ---- the allow-list --------------------------------------------------------
 

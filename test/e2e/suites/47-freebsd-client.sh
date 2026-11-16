@@ -79,8 +79,9 @@ check_contains FBSD-03 "the freebsd guest runs the commit under test" \
 	"$E2E_COMMIT" "$E2E_OUT" "Makefile" "bodega --version"
 
 # The guests resolve through public DNS, and public_url names the server by
-# its internal name. Same tag as the Linux pair, so one sed clears both.
-e2e_on freebsd "sudo sed -i '' '/# bodega-e2e\$/d' /etc/hosts && \
+# its internal name. Only this server's line is replaced: another pass may be
+# using the same guest with a server of its own.
+e2e_on freebsd "sudo sed -i '' '/ $E2E_SERVER_HOST # bodega-e2e\$/d' /etc/hosts && \
 	printf '%s %s # bodega-e2e\n' '$E2E_SERVER_ADDR' '$E2E_SERVER_HOST' | sudo tee -a /etc/hosts >/dev/null" || true
 e2e_on freebsd "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 '$E2E_BASE_URL/healthz'" || true
 check_eq FBSD-04 "the freebsd guest reaches the server by name" "200" "$E2E_OUT" \
@@ -203,9 +204,11 @@ e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest tree 2>&1 | tail -3" ||
 check_eq FBSD-PKG-05 "pkg install onto a FreeBSD root succeeds through bodega" 0 "$E2E_RC" \
 	"internal/server/freebsd.go:57" "pkg install -r bodega-e2e-latest tree" "$E2E_RC"
 
-e2e_on freebsd "pkg query '%n %R' tree" || true
+# The repository annotation, not %R: pkg 2.9.0 prints %R empty for every
+# installed package while still recording the annotation.
+e2e_on freebsd "pkg query '%n %At %Av' tree | awk '\$2 == \"repository\" { print \$1, \$3 }'" || true
 check_eq FBSD-PKG-06 "the installed package names bodega's repository as its origin" \
-	"tree bodega-e2e-latest" "$E2E_OUT" "internal/server/freebsd.go:57" "pkg query '%n %R' tree"
+	"tree bodega-e2e-latest" "$E2E_OUT" "internal/server/freebsd.go:57" "pkg query '%n %At %Av' tree"
 
 e2e_on freebsd "sudo pkg delete -y tree >/dev/null && sudo rm -f /usr/local/etc/pkg/repos/bodega.conf && \
 	pkg -vv | awk '/^  FreeBSD-ports:/{r=1} r && /enabled/{v=\$NF; gsub(/[^a-z]/, \"\", v); print v; exit}'" || true
@@ -295,7 +298,7 @@ e2e_on freebsd "pkg search -r bodega-e2e-latest -q -x '.*' | sed -E 's/-[^-]+\$/
 check_eq FBSD-PROF-08 "pkg search finds the two listed packages and nothing else" "pv tree " "$E2E_OUT" \
 	"internal/server/freebsd_profile.go" "pkg search -r bodega-e2e-latest -x '.*'"
 
-e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest tree 2>&1 | tail -2 && pkg query '%n %R' tree" || true
+e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest tree 2>&1 | tail -2 && pkg query '%n %At %Av' tree | awk '\$2 == \"repository\" { print \$1, \$3 }'" || true
 check_contains FBSD-PROF-09 "a listed package installs through the filtered catalogue" \
 	"tree bodega-e2e-latest" "$E2E_OUT" "internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest tree"
 
