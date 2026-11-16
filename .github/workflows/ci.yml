@@ -121,11 +121,11 @@ jobs:
           printf '%s\n' 'pip==26.2.1 --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e' > pip-oracle.txt
           python3 -m pip install --disable-pip-version-check --no-deps --require-hashes -r pip-oracle.txt
           mkdir -p oracles/bin
-          curl -fsSLO https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz
+          curl -fsSLO --retry 5 --retry-all-errors --retry-delay 5 https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz
           echo '86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb  helm-v4.3.0-linux-amd64.tar.gz' | sha256sum -c -
           tar -xzf helm-v4.3.0-linux-amd64.tar.gz
           install -m 0755 linux-amd64/helm oracles/bin/helm
-          curl -fsSLO https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz
+          curl -fsSLO --retry 5 --retry-all-errors --retry-delay 5 https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz
           echo 'f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3  git-2.54.0.tar.xz' | sha256sum -c -
           tar -xf git-2.54.0.tar.xz
           sudo apt-get update
