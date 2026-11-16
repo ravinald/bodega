@@ -1920,14 +1920,14 @@ func TestAudit9NativeOraclesCannotSkipInCI(t *testing.T) {
 	cmd := exec.Command(exe, "-test.v", "-test.run=^(TestAudit8NpmQuotedCARefusesBeforeWrite|TestNpmOptionsDecodeAsNpmDoes)$")
 	for _, e := range os.Environ() {
 		k, _, _ := strings.Cut(e, "=")
-		if k != "CI" && k != "PATH" {
+		if k != "BODEGA_ORACLES" && k != "PATH" {
 			cmd.Env = append(cmd.Env, e)
 		}
 	}
-	cmd.Env = append(cmd.Env, "CI=true", "PATH="+t.TempDir())
+	cmd.Env = append(cmd.Env, "BODEGA_ORACLES=required", "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatalf("CI=true with no npm passed its oracle tests:\n%s", out)
+		t.Fatalf("BODEGA_ORACLES=required with no npm passed its oracle tests:\n%s", out)
 	}
 }
 
@@ -1942,6 +1942,7 @@ func TestAudit9CIInstallsPinnedNativeOracle(t *testing.T) {
 				Uses string            `yaml:"uses"`
 				Run  string            `yaml:"run"`
 				With map[string]string `yaml:"with"`
+				Env  map[string]string `yaml:"env"`
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
@@ -1950,6 +1951,9 @@ func TestAudit9CIInstallsPinnedNativeOracle(t *testing.T) {
 	}
 	pinned := false
 	for _, step := range workflow.Jobs["test"].Steps {
+		if strings.Contains(step.Run, "make test") && step.Env["BODEGA_ORACLES"] != "required" {
+			t.Fatal("CI's Go test step does not set BODEGA_ORACLES=required, so a missing native oracle skips there and the ports pass with nothing compared")
+		}
 		if strings.HasPrefix(step.Uses, "actions/setup-node@") {
 			pinned = regexp.MustCompile(`^actions/setup-node@[0-9a-f]{40}$`).MatchString(step.Uses) && regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(step.With["node-version"])
 		}
@@ -2372,7 +2376,8 @@ func TestPipOptionsMatchesNativePip(t *testing.T) {
 		"[global]\r\ncert = /a.pem\r\n[install]\r\ntimeout: 5\r\n",
 	}
 	line := regexp.MustCompile(`^([^=]+)='(.*)'$`)
-	for _, body := range cases {
+	list := func(body string) map[string]string {
+		t.Helper()
 		file := filepath.Join(t.TempDir(), "pip.conf")
 		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
 			t.Fatal(err)
@@ -2390,7 +2395,21 @@ func TestPipOptionsMatchesNativePip(t *testing.T) {
 				native[m[1]] = strings.ReplaceAll(m[2], `\n`, "\n")
 			}
 		}
-		if got := PipOptions([]byte(body)); !maps.Equal(got, native) {
+		return native
+	}
+	// pip loads the host's global files beside PIP_CONFIG_FILE and nothing
+	// turns them off without turning that file off too, so what the host
+	// alone sets (a CI image's break-system-packages) is taken out of each
+	// answer where the case does not set the option itself.
+	host := list("")
+	for _, body := range cases {
+		native, got := list(body), PipOptions([]byte(body))
+		for k, v := range host {
+			if _, set := got[k]; !set && native[k] == v {
+				delete(native, k)
+			}
+		}
+		if !maps.Equal(got, native) {
 			t.Errorf("PipOptions(%q)\n got %v\nnative pip %v", body, got, native)
 		}
 	}
@@ -3861,11 +3880,11 @@ func TestAudit25MissingPipOracleFailsInCI(t *testing.T) {
 	}
 	cmd := exec.Command(exe, "-test.v", "-test.run=^TestPipInstallOptionsMatchNativePip$")
 	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "CI=") {
+		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "BODEGA_ORACLES=") {
 			cmd.Env = append(cmd.Env, e)
 		}
 	}
-	cmd.Env = append(cmd.Env, "CI=true", "PATH="+t.TempDir())
+	cmd.Env = append(cmd.Env, "BODEGA_ORACLES=required", "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("missing native pip oracle passed CI:\n%s", out)
@@ -4103,11 +4122,11 @@ func TestAudit26MissingHelmOracleFailsInCI(t *testing.T) {
 	}
 	cmd := exec.Command(exe, "-test.run=^TestHelmFileLoadsAsHelmLoadsIt$", "-test.v")
 	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "CI=") {
+		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "BODEGA_ORACLES=") {
 			cmd.Env = append(cmd.Env, e)
 		}
 	}
-	cmd.Env = append(cmd.Env, "CI=true", "PATH="+t.TempDir())
+	cmd.Env = append(cmd.Env, "BODEGA_ORACLES=required", "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Errorf("missing native Helm passed CI:\n%s", out)
@@ -5199,6 +5218,7 @@ func TestGoFlagsModeledStartNativeGo(t *testing.T) {
 		if err := os.WriteFile(file, []byte("GOPROXY="+srv.URL+"\nGOFLAGS="+flags+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		oracletest.QuietGo(t, root)
 		cmd := exec.Command(goBin, "mod", "download", "example.com/audit@v1.0.0")
 		cmd.Dir = root
 		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "GOENV=" + file, "GOTOOLCHAIN=" + oracletest.GoVersion, "GOSUMDB=off", "GOPATH=" + filepath.Join(root, "gopath"), "GOWORK=off"}
@@ -5455,6 +5475,7 @@ func TestCARefusesGoModuleSubpathBypass(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	oracletest.QuietGo(t, home)
 	cmd := exec.CommandContext(ctx, goBin, "mod", "download", "bodega.example.com/private@v1.0.0")
 	cmd.Dir = home
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GOENV=" + filepath.Join(home, file), "GOTOOLCHAIN=local", "GOSUMDB=off", "GOWORK=off", "GOPATH=" + filepath.Join(home, "gopath"), "HTTPS_PROXY=" + proxy.URL}
@@ -5664,6 +5685,7 @@ func TestCARefusesGoDistributionBypass(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	oracletest.QuietGo(t, home)
 	cmd := exec.CommandContext(ctx, goBin, "mod", "download", "bodega.example.com/private@v1.0.0")
 	cmd.Dir = home
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GOENV=" + filepath.Join(home, file), "GOTOOLCHAIN=local", "GOROOT=" + goroot, "GOSUMDB=off", "GOWORK=off", "GOPATH=" + filepath.Join(home, "gopath"), "HTTPS_PROXY=" + proxy.URL}

@@ -1354,6 +1354,7 @@ func TestAudit22GomodProxyValidityMatchesGo(t *testing.T) {
 		t.Run(tail, func(t *testing.T) {
 			dir := t.TempDir()
 			proxy := base + "/go," + tail
+			oracletest.QuietGo(t, dir)
 			cmd := exec.Command(goBin, "mod", "download", "example.com/ca-audit@v1.0.0")
 			cmd.Dir = dir
 			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GOPATH=" + filepath.Join(dir, "gopath"), "GOCACHE=" + filepath.Join(dir, "cache"), "GOTOOLCHAIN=local", "GOENV=off", "GOSUMDB=off", "GOWORK=off", "GO111MODULE=on", "GOPROXY=" + proxy}
@@ -1729,6 +1730,7 @@ func TestAudit24GomodEmptyProxyListMatchesGo(t *testing.T) {
 		return ""
 	}
 	dir := t.TempDir()
+	oracletest.QuietGo(t, dir)
 	cmd := exec.Command(goBin, "mod", "download", "example.com/ca-audit@v1.0.0")
 	cmd.Dir = dir
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GOPATH=" + dir, "GOENV=off", "GOTOOLCHAIN=local", "GOWORK=off", "GO111MODULE=on", "GOSUMDB=off", "GOPROXY=,|"}
@@ -2674,6 +2676,7 @@ func TestAudit38GoFlagsStartupIsUnchecked(t *testing.T) {
 	}))
 	defer srv.Close()
 	root := t.TempDir()
+	oracletest.QuietGo(t, root)
 	file := filepath.Join(root, "go.env")
 	for _, flags := range []string{"", "-bodega-unknown-flag"} {
 		writeTrustFile(t, file, "GOPROXY="+srv.URL+"\nGOFLAGS="+flags+"\n")
@@ -2866,6 +2869,7 @@ func TestAudit39GoFlagsLexingIsUnchecked(t *testing.T) {
 	}))
 	defer srv.Close()
 	root := t.TempDir()
+	oracletest.QuietGo(t, root)
 	file := filepath.Join(root, "go.env")
 	for _, flags := range []string{"", "-modcacherw\u00a0"} {
 		writeTrustFile(t, file, "GOPROXY="+srv.URL+"\nGOFLAGS="+flags+"\n")

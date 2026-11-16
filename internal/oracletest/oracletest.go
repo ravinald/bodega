@@ -1,9 +1,12 @@
 // Package oracletest finds the native clients doctor's configuration ports
 // are tested against, each at the release its port is of. Every test that
 // holds a port's answer against a client's finds the client here, so one rule
-// decides what a missing one means: on a developer's machine the test skips,
-// and in CI, where the test job installs each client from a verified release,
-// it fails. A skip there would pass the port with nothing compared.
+// decides what a missing one means: the test skips, except where
+// BODEGA_ORACLES=required says the clients were installed for it, as the CI
+// test job does from verified releases, and there it fails. A skip there
+// would pass the port with nothing compared. The other CI jobs run the same
+// tests on hosts nothing installed the clients on, so CI=true alone cannot
+// be the signal.
 //
 // A client that is installed and will not say its version, or says another,
 // counts as missing: a port of one release proves nothing against another.
@@ -13,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -54,8 +58,8 @@ func find(t testing.TB, bin, pin string, match func(out string) bool, args ...st
 	if r.problem == "" {
 		return r.path
 	}
-	if os.Getenv("CI") == "true" {
-		t.Fatalf("in CI, where the test job installs this oracle: %s", r.problem)
+	if os.Getenv("BODEGA_ORACLES") == "required" {
+		t.Fatalf("BODEGA_ORACLES=required, which says this oracle is installed: %s", r.problem)
 	}
 	t.Skip(r.problem)
 	return ""
@@ -116,4 +120,21 @@ func Helm(t testing.TB) string {
 func Go(t testing.TB) string {
 	t.Helper()
 	return find(t, "go", GoVersion, func(out string) bool { return out == GoVersion }, "env", "GOVERSION")
+}
+
+// QuietGo turns Go telemetry off for a go command run with HOME=home. Left
+// on, each go command under a fresh HOME starts a detached child that keeps
+// writing counter files there after the command exits, and the test's
+// TempDir cleanup then fails on a directory that is no longer empty.
+func QuietGo(t testing.TB, home string) {
+	t.Helper()
+	for _, config := range []string{filepath.Join(home, ".config"), filepath.Join(home, "Library", "Application Support")} {
+		dir := filepath.Join(config, "go", "telemetry")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "mode"), []byte("off\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

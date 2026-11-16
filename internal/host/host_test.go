@@ -241,6 +241,7 @@ func TestGoEnvResolvesAsGo(t *testing.T) {
 			if runtime.GOOS == "darwin" {
 				configDir = filepath.Join(home, "Library", "Application Support")
 			}
+			oracletest.QuietGo(t, home)
 			env := map[string]string{"PATH": filepath.Dir(goBin), "GOTOOLCHAIN": "local", "HOME": home}
 			if tc.noHome {
 				delete(env, "HOME")

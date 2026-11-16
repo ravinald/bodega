@@ -227,6 +227,7 @@ var PipModeled = []ModeledSetting{
 	{"no-compile", "PipInstallError: not a truth value; read after the download"},
 	{"find-links", "none: an append of text; each word is a PipEndpoints location, and plain http to bodega is refused"},
 	{"use-deprecated", "PipInstallError: a word outside pip's choices; legacy-certs is the bundle the probe then reads"},
+	{"break-system-packages", "PipInstallError: not a truth value; read when pip installs into an externally managed environment, after the download"},
 }
 
 // PipUncertified names the first setting of pip install's configuration that
@@ -579,6 +580,9 @@ var AptModeled = []ModeledSetting{
 	{"acquire::http::timeout", "none: FindI"},
 	{"acquire::https::timeout", "none: FindI"},
 	{"acquire::http::pipeline-depth", "none: FindI"},
+	{"acquire::http::no-cache", "none: FindB; a request header"},
+	{"acquire::http::no-store", "none: FindB; a request header"},
+	{"acquire::brokenproxy", "none: a truth value, and at most a request header"},
 	{"acquire::http::user-agent-non-interactive", "none: FindB"},
 	{"acquire::forceipv4", "none: FindB"},
 	{"acquire::forceipv6", "none: FindB"},
@@ -748,6 +752,7 @@ var pipLocations = map[string]bool{
 	"no-index":                  false,
 	"no-compile":                false,
 	"use-deprecated":            false,
+	"break-system-packages":     false,
 }
 
 // PipEndpoint is one location pip install may fetch from: the setting that

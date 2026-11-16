@@ -21,6 +21,14 @@ import (
 // checksum database reads at the loopback interface, so a test that imports a
 // manifest never reaches a public registry, GitHub, Sigstore or sum.golang.org, and never depends on one.
 func TestMain(m *testing.M) {
+	// Tests point HOME at a temporary directory and expect each client's
+	// per-user files under it. A CI runner exports XDG_CONFIG_HOME, which
+	// outranks HOME for those files and would send doctor to the runner's own.
+	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"} {
+		if err := os.Unsetenv(key); err != nil {
+			panic(err)
+		}
+	}
 	admit.NewPublishReader = func() *policy.AgeChecker {
 		ac := policy.NewAgeChecker(nil)
 		ac.HTTP = &http.Client{Transport: loopbackOnly{}}
