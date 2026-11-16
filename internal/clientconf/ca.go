@@ -943,12 +943,12 @@ type systemStore struct {
 	dir, ext string
 	step     []string
 	live     []string
-	// anchors lists the files under dir the rebuild reads, by the
+	// anchors lists every file under root the rebuild reads, by the
 	// platform's own selection rule. Nil where that rule is not modeled: a
 	// replaced anchor's roots then leave the proposed store even if another
 	// file still supplies them, which can refuse a plan but never passes one
 	// the rebuild would fail.
-	anchors func(dir string) []string
+	anchors func(root string) []string
 }
 
 // systemStoreFor resolves the trust store of the host. certctl before FreeBSD
@@ -966,7 +966,7 @@ func systemStoreFor(h CAHost) (systemStore, error) {
 			switch id {
 			case "debian", "ubuntu":
 				return systemStore{"/usr/local/share/ca-certificates", ".crt", []string{"update-ca-certificates"},
-					[]string{"/etc/ssl/certs/ca-certificates.crt"}, crtTree}, nil
+					[]string{"/etc/ssl/certs/ca-certificates.crt"}, debianAnchors}, nil
 			case "rhel", "fedora", "centos":
 				return systemStore{"/etc/pki/ca-trust/source/anchors", ".pem", []string{"update-ca-trust", "extract"},
 					[]string{"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"}, nil}, nil
@@ -1047,12 +1047,15 @@ func ProposedSystemRoots(h CAHost, changes []Change) ([]*x509.Certificate, error
 		added = append(added, pemCerts(c.New)...)
 	}
 	if len(gone) > 0 && store.anchors != nil {
+		// An anchor that resolves to a file the plan rewrites is that file,
+		// whatever name or symlink reaches it: its proposed bytes are already
+		// in added, and its bytes on disk are the ones the plan replaces.
 		changed := map[string]bool{}
 		for _, c := range changes {
-			changed[filepath.Clean(c.Target)] = true
+			changed[resolved(c.Target)] = true
 		}
-		for _, f := range store.anchors(dir) {
-			if changed[filepath.Clean(f)] {
+		for _, f := range store.anchors(h.Root) {
+			if changed[resolved(f)] {
 				continue
 			}
 			if data, err := plannedfs.ReadFile(f); err == nil {
@@ -1069,6 +1072,48 @@ func ProposedSystemRoots(h CAHost, changes []Change) ([]*x509.Certificate, error
 		}
 	}
 	return append(out, added...), nil
+}
+
+// debianAnchors is update-ca-certificates' input: each certificate
+// /etc/ca-certificates.conf enables under /usr/share/ca-certificates, then
+// every local *.crt.
+func debianAnchors(root string) []string {
+	var out []string
+	if conf, err := plannedfs.ReadFile(filepath.Join(root, "etc/ca-certificates.conf")); err == nil {
+		out = append(out, confAnchors(filepath.Join(root, "usr/share/ca-certificates"), conf)...)
+	}
+	return append(out, crtTree(filepath.Join(root, "usr/local/share/ca-certificates"))...)
+}
+
+// confAnchors reads ca-certificates.conf as update-ca-certificates does: an
+// empty line, or one opening with # or !, selects nothing; any other names a
+// file below dir, trimmed of the blanks read -r strips, and counts when it is
+// a regular file.
+func confAnchors(dir string, conf []byte) []string {
+	var out []string
+	for _, line := range strings.Split(string(conf), "\n") {
+		if line == "" || line[0] == '#' || line[0] == '!' {
+			continue
+		}
+		name := strings.Trim(line, " \t")
+		if name == "" {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		if info, err := plannedfs.Stat(p); err == nil && info.Mode().IsRegular() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// resolved is path with every symlink on disk followed, or path cleaned when
+// it does not resolve (a file the plan has yet to create).
+func resolved(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	return filepath.Clean(path)
 }
 
 // crtTree is update-ca-certificates' selection of local anchors: every
