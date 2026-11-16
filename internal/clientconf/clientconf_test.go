@@ -800,7 +800,9 @@ func TestAddCAFollowsTheHost(t *testing.T) {
 		})
 	}
 
-	_, err = AddCA([]Change{apt}, ca, CAHost{Base: testBase, GOOS: OSDarwin})
+	// A root of its own: without one this reads the apt configuration of
+	// whatever host runs the test.
+	_, err = AddCA([]Change{apt}, ca, CAHost{Base: testBase, Root: t.TempDir(), GOOS: OSDarwin})
 	if err == nil || !strings.Contains(err.Error(), "apt verify through the system trust store") {
 		t.Errorf("a system-store client on macOS = %v, want a refusal naming it", err)
 	}
