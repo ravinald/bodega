@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // Credential writing. The checks in this package report; this file is the one
@@ -280,7 +281,7 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 	block := t.block(base, token)
 
 	existing := ""
-	if data, err := os.ReadFile(t.Path); err == nil {
+	if data, err := plannedfs.ReadFile(t.Path); err == nil {
 		existing = string(data)
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("%s: read %s: %w", t.Client, t.Path, err)

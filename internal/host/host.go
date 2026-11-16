@@ -8,12 +8,12 @@
 // see CredentialTargets and WriteCredential.
 package host
 
-import "os"
+import "github.com/ravinald/bodega/internal/plannedfs"
 
 // exists reports whether path resolves to anything (file, directory, or
 // symlink target). Shared by per-format checks across all platforms.
 func exists(path string) bool {
-	_, err := os.Stat(path)
+	_, err := plannedfs.Stat(path)
 	return err == nil
 }
 

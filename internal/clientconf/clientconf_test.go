@@ -1,23 +1,47 @@
 package clientconf
 
 import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
+	"maps"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/oracletest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
@@ -502,6 +526,5399 @@ func TestComposerRendersAGlobalConfigWithPackagistOff(t *testing.T) {
 	for os, want := range map[string]string{OSLinux: "~/.config/composer/config.json", OSDarwin: "~/.composer/config.json", OSFreeBSD: "~/.composer/config.json"} {
 		if got := f.Path(os); got != want {
 			t.Errorf("path on %s = %q, want %q", os, got, want)
+		}
+	}
+}
+
+// testCA mints a CA and a certificate it issues for dnsName, both as PEM.
+func testCA(t *testing.T, dnsName string) (caPEM, leafPEM, keyPEM []byte) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "bodega test CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: dnsName}, DNSNames: []string{dnsName},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caTmpl, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+}
+
+// caPlan builds the changes a plan carries for files, each a system and its
+// rendered file, at the file's Linux path rooted under home.
+func caPlan(t *testing.T, home string, files ...File) []Change {
+	t.Helper()
+	var out []Change
+	for _, f := range files {
+		p := f.Path(OSLinux)
+		if !strings.HasPrefix(p, "~/") {
+			p = "~" + p
+		}
+		sum := sha256.Sum256([]byte(f.Content))
+		c, err := NewChange(PlanRecord{System: f.System, Action: PlanInstall, Path: p, SHA256: hex.EncodeToString(sum[:])}, []byte(f.Content), home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+func changeAt(t *testing.T, changes []Change, target string) Change {
+	t.Helper()
+	for _, c := range changes {
+		if c.Target == target {
+			return c
+		}
+	}
+	var have []string
+	for _, c := range changes {
+		have = append(have, c.Target)
+	}
+	t.Fatalf("no change writes %s; the plan writes:\n  %s", target, strings.Join(have, "\n  "))
+	return Change{}
+}
+
+// F116 R1, R3: the CA lands where each client reads it, every other setting
+// in an edited file is kept, and a second plan over the applied host changes
+// nothing and runs no trust store step.
+func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\nID_LIKE=debian\n")}
+	plan := func() []Change {
+		oci := OCIClient(testBase, map[string]string{"docker.io": "https://registry-1.docker.io"})
+		files := []File{
+			Npm(testBase, nil), Pip(testBase),
+			Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			Gomod(testBase), Helm(testBase),
+		}
+		// podman's registries.conf is refused under a CA plan, as
+		// TestAddCARefusesEveryOtherClient holds it to.
+		for _, f := range oci {
+			if OCIRuntimeOf(f.Path(OSLinux)) != RuntimePodman {
+				files = append(files, f.File)
+			}
+		}
+		return caPlan(t, home, files...)
+	}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+
+	in, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for target, want := range map[string]string{
+		filepath.Join(home, ".npmrc"):       "registry=https://bodega.example.com/npm/\ncafile=" + userCA + "\n",
+		filepath.Join(home, "etc/pip.conf"): "[global]\ncert = " + userCA + "\nindex-url = https://bodega.example.com/pypi/simple/\n",
+		filepath.Join(home, ".gitconfig"):   "[url \"https://bodega.example.com/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http \"https://bodega.example.com/\"]\n\tsslCAInfo = " + userCA + "\n",
+		userCA:                              string(caPEM),
+		filepath.Join(home, "etc/docker/certs.d/bodega.example.com/ca.crt"):  string(caPEM),
+		filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt"): string(caPEM),
+	} {
+		if got := string(changeAt(t, in.Changes, target).New); got != want {
+			t.Errorf("%s =\n%s\nwant\n%s", target, got, want)
+		}
+	}
+	var hosts struct {
+		Server string `toml:"server"`
+		Host   map[string]struct {
+			CA           string   `toml:"ca"`
+			Capabilities []string `toml:"capabilities"`
+		} `toml:"host"`
+	}
+	hostsToml := changeAt(t, in.Changes, filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml"))
+	if _, err := toml.Decode(string(hostsToml.New), &hosts); err != nil {
+		t.Fatalf("hosts.toml does not parse: %v\n%s", err, hostsToml.New)
+	}
+	if got := hosts.Host[testBase]; got.CA != userCA || len(got.Capabilities) != 2 || hosts.Server == "" {
+		t.Errorf("hosts.toml host table = %+v, server %q; want ca %s beside the capabilities\n%s", got, hosts.Server, userCA, hostsToml.New)
+	}
+	if !slices.Equal(in.Step, []string{"update-ca-certificates"}) {
+		t.Errorf("step = %v, want update-ca-certificates for the anchor go and helm read through", in.Step)
+	}
+	// daemon.json takes no CA setting: Docker reads certs.d beside it.
+	if got := changeAt(t, in.Changes, filepath.Join(home, "etc/docker/daemon.json")); strings.Contains(string(got.New), "ca") {
+		t.Errorf("daemon.json gained a CA key: %s", got.New)
+	}
+
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	// The anchor is written and the store the clients read is not rebuilt
+	// yet, which is where a failed update-ca-certificates leaves a host: the
+	// step is still owed.
+	owed, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(owed.Step, []string{"update-ca-certificates"}) {
+		t.Errorf("step with the anchor written and the store not rebuilt = %v, want update-ca-certificates again", owed.Step)
+	}
+	bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+	if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundle, caPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range again.Changes {
+		if !c.Unchanged() {
+			t.Errorf("a second plan still changes %s:\n%s\nto\n%s", c.Target, c.Old, c.New)
+		}
+	}
+	if again.Step != nil {
+		t.Errorf("a second plan runs %v with the store holding the anchor", again.Step)
+	}
+}
+
+// F116 R1: a CA plan holding a record for any client other than apt, go,
+// helm, pip, npm, git, Docker Engine and containerd is refused whole, naming
+// the client, with no edit planned for the clients beside it.
+func TestAddCARefusesEveryOtherClient(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := func(system string) File {
+		return File{System: system, Paths: map[string]string{OSLinux: "/etc/bodega-" + system + ".conf"}, Content: "x\n"}
+	}
+	for name, tc := range map[string]struct {
+		file File
+		want string
+	}{
+		"maven":     {Maven(testBase, nil)[0], "maven: private-CA installation for maven is not supported"},
+		"rpm":       {Rpm(testBase, []string{"baseos"}), "rpm: private-CA installation for rpm is not supported"},
+		"cargo":     {Cargo(testBase), "cargo: private-CA installation for cargo is not supported"},
+		"rubygems":  {Rubygems(testBase)[0], "rubygems: private-CA installation for rubygems is not supported"},
+		"composer":  {Composer(testBase), "composer: private-CA installation for composer is not supported"},
+		"freebsd":   {other(manifest.TypeFreeBSD), "freebsd: private-CA installation for freebsd is not supported"},
+		"distfiles": {other(manifest.TypeDistfiles), "distfiles: private-CA installation for distfiles is not supported"},
+		"binary":    {other(manifest.TypeBinary), "binary: private-CA installation for binary is not supported"},
+		"podman":    {RegistriesConf(testBase, []string{"docker.io"}), "oci: private-CA installation for podman, buildah and CRI-O is not supported"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+			for _, files := range [][]File{{tc.file}, {Pip(testBase), tc.file}, {tc.file, Gomod(testBase)}} {
+				in, err := AddCA(caPlan(t, home, files...), ca, h)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("AddCA over %d file(s) = %v, want a refusal holding %q", len(files), err, tc.want)
+				}
+				if len(in.Changes) != 0 || in.Step != nil {
+					t.Errorf("a refused plan still carries %d change(s) and the step %v", len(in.Changes), in.Step)
+				}
+			}
+		})
+	}
+	if err := CAUnsupported(PlanRecord{System: manifest.TypeOCI}); err != nil {
+		t.Errorf("oci named alone = %v, want it left to the plan's records", err)
+	}
+	for _, f := range OCIClient(testBase, map[string]string{"docker.io": "https://registry-1.docker.io"}) {
+		rec := PlanRecord{System: f.System, Path: f.Path(OSLinux)}
+		if err := CAUnsupported(rec); (err != nil) != (OCIRuntimeOf(rec.Path) == RuntimePodman) {
+			t.Errorf("CAUnsupported(%s) = %v, want a refusal for podman's file alone", rec.Path, err)
+		}
+	}
+}
+
+// F116 R1: a file under /etc names the shared copy rather than one in a home
+// directory, and each family's anchor and command are its own.
+func TestAddCAFollowsTheHost(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(append(caPEM, caPEM...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := Change{Record: PlanRecord{System: manifest.TypeApt, Path: AptSourcesPath}, Target: AptSourcesPath}
+	for _, tc := range []struct {
+		name, goos, osRelease string
+		anchors               []string
+		step                  []string
+	}{
+		{"ubuntu", OSLinux, "ID=ubuntu\nID_LIKE=debian\n",
+			[]string{"usr/local/share/ca-certificates/bodega-ca.crt", "usr/local/share/ca-certificates/bodega-ca-2.crt"}, []string{"update-ca-certificates"}},
+		{"rocky", OSLinux, "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+			[]string{"etc/pki/ca-trust/source/anchors/bodega-ca.pem", "etc/pki/ca-trust/source/anchors/bodega-ca-2.pem"}, []string{"update-ca-trust", "extract"}},
+		{"freebsd", OSFreeBSD, "",
+			[]string{"usr/local/share/certs/bodega-ca.pem", "usr/local/share/certs/bodega-ca-2.pem"}, []string{"certctl", "rehash"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			pip := Change{Record: PlanRecord{System: manifest.TypePypi, Path: "/etc/pip.conf"}, Target: "/etc/pip.conf", New: []byte(Pip(testBase).Content)}
+			in, err := AddCA([]Change{apt, pip}, ca, CAHost{Base: testBase, Home: t.TempDir(), Root: root, GOOS: tc.goos, OSRelease: []byte(tc.osRelease)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, a := range tc.anchors {
+				// One certificate to a file: c_rehash and certctl link a
+				// file by the first certificate in it.
+				if got := changeAt(t, in.Changes, filepath.Join(root, a)); string(got.New) != string(caPEM) {
+					t.Errorf("%s = %s, want one certificate", a, got.New)
+				}
+			}
+			if !slices.Equal(in.Step, tc.step) {
+				t.Errorf("step = %v, want %v", in.Step, tc.step)
+			}
+			shared := filepath.Join(root, CASharedPath)
+			if got := string(in.Changes[1].New); !strings.Contains(got, "cert = "+shared+"\n") {
+				t.Errorf("/etc/pip.conf names no shared copy at %s:\n%s", shared, got)
+			}
+			changeAt(t, in.Changes, shared)
+		})
+	}
+
+	// A root of its own: without one this reads the apt configuration of
+	// whatever host runs the test.
+	_, err = AddCA([]Change{apt}, ca, CAHost{Base: testBase, Root: t.TempDir(), GOOS: OSDarwin})
+	if err == nil || !strings.Contains(err.Error(), "apt verify through the system trust store") {
+		t.Errorf("a system-store client on macOS = %v, want a refusal naming it", err)
+	}
+	if _, err := AddCA([]Change{apt}, ca, CAHost{Base: "http://bodega.example.com", GOOS: OSLinux}); err == nil {
+		t.Error("a plaintext base took a CA")
+	}
+}
+
+// F116 R1: merging into an existing file replaces a repeated key as a group,
+// drops the lines continuing a replaced value, and refuses a hosts.toml the
+// line merge would corrupt rather than writing it.
+func TestAddCAMergesWithoutCorrupting(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(home string, f File, content string) string {
+		target := filepath.Join(home, strings.TrimPrefix(f.Path(OSLinux), "~"))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return target
+	}
+	home := t.TempDir()
+	h := CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+
+	pip := Pip(testBase)
+	target := write(home, pip, "# site policy\n[global]\nINDEX-URL =\n    https://pypi.org/simple/\ntimeout = 5\ncert = /old/ca.pem\n")
+	in, err := AddCA(caPlan(t, home, pip), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# site policy\n[global]\nindex-url = https://bodega.example.com/pypi/simple/\ntimeout = 5\ncert = " + userCA + "\n"
+	if got := string(changeAt(t, in.Changes, target).New); got != want {
+		t.Errorf("pip.conf =\n%s\nwant\n%s", got, want)
+	}
+
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}, "gl": {URL: "https://gitlab.com/"}})
+	target = write(home, git, "[core]\n\teditor = vi\n"+git.Content+"[http \"https://bodega.example.com/\"]\n\tsslCAInfo = /old/ca.pem\n\tproxy = http://p\n")
+	in, err = AddCA(caPlan(t, home, git), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "[core]\n\teditor = vi\n" + git.Content + "[http \"https://bodega.example.com/\"]\n\tsslCAInfo = " + userCA + "\n\tproxy = http://p\n"
+	if got := string(changeAt(t, in.Changes, target).New); got != want {
+		t.Errorf(".gitconfig =\n%s\nwant\n%s", got, want)
+	}
+
+	hosts := ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")
+	write(home, hosts, "server = \"https://registry-1.docker.io\"\n[host.\""+testBase+"\"]\n  capabilities = [\n    \"pull\",\n  ]\n")
+	if _, err := AddCA(caPlan(t, home, hosts), ca, h); err == nil || !strings.Contains(err.Error(), "move the file aside") {
+		t.Errorf("a hosts.toml with a value over several lines = %v, want a refusal naming the next step", err)
+	}
+}
+
+// F116 R1: a file that is no CA bundle is refused, naming why.
+func TestParseCARefusesWhatIsNotACA(t *testing.T) {
+	caPEM, leafPEM, keyPEM := testCA(t, "bodega.example.com")
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"no certificate", []byte("not a pem file\n"), "holds no PEM certificate"},
+		{"empty", nil, "holds no PEM certificate"},
+		{"a leaf", leafPEM, "is not a CA"},
+		{"a CA then a leaf", append(slices.Clone(caPEM), leafPEM...), "certificate 2 (CN=bodega.example.com) is not a CA"},
+		{"a key beside the CA", append(slices.Clone(caPEM), keyPEM...), `"EC PRIVATE KEY" block`},
+	} {
+		if _, err := ParseCA(tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: ParseCA = %v, want an error naming %q", tc.name, err, tc.want)
+		}
+	}
+	ca, err := ParseCA(append([]byte("subject=CN=bodega test CA\n"), caPEM...))
+	if err != nil || len(ca.Certs) != 1 || string(ca.PEM) != string(caPEM) {
+		t.Errorf("a CA under a text header = %v, %d certs; want it accepted and re-encoded alone", err, len(ca.Certs))
+	}
+}
+
+func TestReviewCAKeepsExistingSettings(t *testing.T) {
+	pem, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(pem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		file File
+		keep string
+	}{
+		{"npm", Npm(testBase, nil), "save-exact=true\n"},
+		{"pip", Pip(testBase), "[install]\nno-compile = true\n"},
+		{"git", Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}), "[user]\n\tname = Existing User\n"},
+		{"containerd", ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"), "[host.\"" + testBase + "\".header]\n  X-Existing = [\"kept\"]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := tc.file.Path(OSLinux)
+			path = strings.TrimPrefix(path, "~")
+			target := filepath.Join(home, path)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.file.Content+tc.keep), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".review-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Errorf("CA install discarded %q; wrote:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestAuditCAPreservesExistingSettings(t *testing.T) {
+	pem, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(pem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"pip-indented", Pip(testBase), "[global]\n  index-url = https://pypi.org/simple/\n  timeout = 120\n", "timeout = 120"},
+		{"go", Gomod(testBase), "GOPROXY=https://proxy.golang.org\nGOPRIVATE=corp.example/*\n", "GOPRIVATE=corp.example/*"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".audit-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("CA install discarded %q; wrote:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestAuditFreeBSDHashCollisionsRemainIdempotent(t *testing.T) {
+	first, _, _ := testCA(t, "bodega.example.com")
+	second, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(append(slices.Clone(first), second...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSFreeBSD}
+	plan := func() []Change { return caPlan(t, home, Gomod(testBase)) }
+	in, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(in.Changes, ".audit-backup"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "etc/ssl/certs")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"12345678.0": first, "12345678.1": second} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	again, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Step) != 0 {
+		t.Fatalf("both CAs are in FreeBSD's hashed store, but second apply runs %v", again.Step)
+	}
+}
+
+// F116 R1: under a CA plan every existing file keeps what the plan does not
+// set, in each format a plan edits, takes what the plan does set, and reads
+// the same after a second plan over the applied host.
+func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(f File, path string) File {
+		f.Paths = map[string]string{OSLinux: path}
+		return f
+	}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	for _, tc := range []struct {
+		name   string
+		file   File
+		before string
+		// keep stays, want arrives and gone leaves.
+		keep, want, gone []string
+	}{
+		{"helm", Helm(testBase), "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n  - name: corp\n    url: https://charts.corp.example\n  - name: bodega\n    url: https://old.example/helm\n",
+			[]string{"name: corp", "url: https://charts.corp.example"}, []string{testBase + "/helm"}, []string{"old.example"}},
+		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: https://corp.example/apt\nSuites: stable\nComponents: main\n\n# ours\nTypes: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nTrusted: yes\n",
+			[]string{"URIs: https://corp.example/apt", "Suites: stable"}, []string{"Suites: noble", "Signed-By: "}, []string{"Components: main\nTrusted", "Trusted: yes"}},
+		{"node mirror", at(File{System: manifest.TypeNpm, Content: "NODEJS_ORG_MIRROR=" + testBase + "/binaries/node/dist\n"}, NodeMirrorUserPath),
+			"EDITOR=vi\nNODEJS_ORG_MIRROR=https://nodejs.org/dist\n", []string{"EDITOR=vi"}, []string{testBase + "/binaries/node/dist"}, []string{"nodejs.org"}},
+		{"pip", Pip(testBase), "[global]\n  index_url: https://pypi.org/simple/\n  find-links =\n    cert = not-a-setting\n    /srv/wheels\n[install]\ncert = /old/ca.pem\nno-compile = true\n[download]\ncert:/old/ca.pem\n",
+			[]string{"  find-links =\n    cert = not-a-setting\n    /srv/wheels\n", "no-compile = true"},
+			[]string{"  index-url = " + testBase + "/pypi/simple/", "[install]\ncert = ", "[download]\ncert = "}, []string{"pypi.org", "/old/ca.pem"}},
+		{"git", git, "[url \"https://old.example/git/gh/\"]\n\tinsteadOf = https://github.com/\n[alias]\n\tlg = log \\\n\t\t--oneline = x\n",
+			[]string{"[alias]\n\tlg = log \\\n\t\t--oneline = x\n", "[url \"https://old.example/git/gh/\"]"}, []string{strings.TrimSpace(git.Content), "sslCAInfo = "}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".merge-backup"); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(raw)
+			for _, s := range append(slices.Clone(tc.keep), tc.want...) {
+				if !strings.Contains(got, s) {
+					t.Errorf("merged file lacks %q:\n%s", s, got)
+				}
+			}
+			for _, s := range tc.gone {
+				if strings.Contains(got, s) {
+					t.Errorf("merged file still holds %q:\n%s", s, got)
+				}
+			}
+			again, err := AddCA(caPlan(t, home, tc.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c := changeAt(t, again.Changes, target); !c.Unchanged() {
+				t.Errorf("a second plan rewrites the file:\n%s\nfrom\n%s", c.New, c.Old)
+			}
+		})
+	}
+}
+
+func TestIndependentCANamedEntryPreservation(t *testing.T) {
+	raw, leaf, key := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A client pair helm can load: it reads both files beside the caFile the
+	// install adds, and an entry naming a pair it cannot read is refused.
+	pair := t.TempDir()
+	certFile, keyFile := filepath.Join(pair, "client.crt"), filepath.Join(pair, "client.key")
+	for path, data := range map[string][]byte{certFile: leaf, keyFile: key} {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n", "Architectures: amd64"},
+		{"helm", Helm(testBase), HelmDocument(HelmRepository(testBase, "certFile: "+certFile, "keyFile: "+keyFile)), "certFile: " + certFile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".independent-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("CA install discarded %q; wrote:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+// TestEntryMergeIsFieldLevel pins what a named entry keeps when a plan joins
+// it: every field the plan does not set, in the layout the host wrote, less
+// the fields named as unable to stand beside the plan's. A second merge
+// changes nothing, and an entry the merge cannot follow is refused.
+func TestEntryMergeIsFieldLevel(t *testing.T) {
+	helm := fileKind{blocks: func(o, p []string) []string { return mergeYAML(o, p, "repositories") }, holds: yamlHolds("repositories")}
+	for _, tc := range []struct {
+		name         string
+		kind         fileKind
+		old, planned string
+		want         string
+	}{
+		{"helm entry keeps client auth, loses caFile", helm,
+			"repositories:\n  - caFile: /old/ca.pem\n    name: bodega\n    url: https://old/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n", "repositories:\n" + HelmRepository("https://b"),
+			"repositories:\n  - name: bodega\n    url: https://b/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n"},
+		{"helm empty flow sequence", helm, "repositories: []\n", "repositories:\n" + HelmRepository("https://b"), "repositories:\n- name: bodega\n  url: https://b/helm\n"},
+		{"apt stanza", fileKind{blocks: mergeDeb822}, "# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: noble\nEnabled: no\nArchitectures: amd64\n arm64\nTrusted: yes\n",
+			"Types: deb\nURIs: https://b/apt/\nSuites: noble\nSigned-By: /k.asc\n",
+			"# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: noble\nArchitectures: amd64\n arm64\nSigned-By: /k.asc\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.kind.merge([]byte(tc.old), []byte(tc.planned))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("merged:\n%s\nwant:\n%s", got, tc.want)
+			}
+			again, err := tc.kind.merge(got, []byte(tc.planned))
+			if err != nil || string(again) != tc.want {
+				t.Fatalf("a second merge changed the file (%v):\n%s", err, again)
+			}
+		})
+	}
+}
+
+// TestPipOptionsReadsPipsGrammar pins the reader the trust probe shares with
+// the merge: a colon delimits, a deeper line continues the option above it
+// across a comment and a blank line, a line indented under a header is an
+// option, and a file pip refuses to load gives no option.
+func TestPipOptionsReadsPipsGrammar(t *testing.T) {
+	got := PipOptions([]byte("[global]\nIndex_URL: https://b/simple\nfind-links =\n  cert=/not.pem\n  # note\n\n  /srv/wheels\ncert=/b.pem\n[install]\n  no-compile = true\n"))
+	want := map[string]string{"global.index-url": "https://b/simple", "global.cert": "/b.pem", "global.find-links": "\ncert=/not.pem\n\n/srv/wheels", "install.no-compile": "true"}
+	if !maps.Equal(got, want) {
+		t.Fatalf("PipOptions = %q, want %q", got, want)
+	}
+	for _, refused := range []string{
+		"[global]\ncert = /a.pem\ncert = /b.pem\n",
+		"[global]\nindex-url = https://b/simple\nnot-an-assignment\n",
+		"[global]\nindex-url = https://b/simple\n= nameless\n",
+		"[global\nindex-url = https://b/simple\n",
+	} {
+		if got := PipOptions([]byte(refused)); len(got) != 0 {
+			t.Errorf("PipOptions(%q) = %q, want none from a file pip refuses to load", refused, got)
+		}
+	}
+}
+
+func TestStaffCAKeepsRepositoryPolicy(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"apt-distinct-stanza", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n\nTypes: deb-src\nURIs: " + testBase + "/apt/\nSuites: jammy\nComponents: main\nArchitectures: arm64\n", "Types: deb-src\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".staff-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("CA apply removed unrelated policy %q:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestStaffGitCAReachesEffectiveURL(t *testing.T) {
+	git := oracletest.Git(t)
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".gitconfig")
+	old := "[http \"" + testBase + "/git/gh/\"]\n\tsslCAInfo = /missing/old-git-ca.pem\n\textraHeader = X-Corp: keep\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	in, err := AddCA(caPlan(t, home, file), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(in.Changes, ".staff-backup"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.Command(git, "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git config: %v: %s", err, got)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if strings.TrimSpace(string(got)) != want {
+		t.Fatalf("git reads %q after successful CA apply; want %q", strings.TrimSpace(string(got)), want)
+	}
+}
+
+// F116 R1: the files a CA plan reaches through a client's own selection rules
+// are idle on a second plan, and the selection follows each client's order.
+func TestCASelectionSecondPlanIsIdle(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	home, root := t.TempDir(), t.TempDir()
+	venv := filepath.Join(root, "venv")
+	// The copy a setting names sits beside the file naming it: git's is per
+	// user, pip's is under /etc.
+	caPath, pipCA := filepath.Join(home, ".config/bodega/ca.pem"), filepath.Join(root, "usr/local/share/bodega/ca.pem")
+	// git: a longer section in another file git reads, and a wildcard host
+	// that never outranks the plan's. pip: a file loaded before the plan's
+	// whose command section sets cert, and the virtualenv's, loaded after.
+	xdgGit := filepath.Join(home, ".config/git/config")
+	write(xdgGit, "[http \""+testBase+"/git/gh/corp/\"]\n\tsslCAInfo = /old/corp.pem\n\tproxy = http://p\n[http \"https://*.example.com/\"]\n\tsslCAInfo = /old/wild.pem\n")
+	write(filepath.Join(home, ".gitconfig"), "[http \""+testBase+"\"]\n\tsslCAInfo = /old/base.pem\n[user]\n\tname = x\n")
+	early := filepath.Join(root, "etc/xdg/pip/pip.conf")
+	write(early, "[global]\ncert = /old/global.pem\n[install]\ncert = /old/install.pem\ntimeout = 9\n")
+	write(filepath.Join(venv, "pip.conf"), "[global]\ncert = /old/venv.pem\nretries = 2\n")
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string {
+		if k == "VIRTUAL_ENV" {
+			return venv
+		}
+		return ""
+	}}
+	pip := Pip(testBase)
+	pip.Paths = everywhere(filepath.Join(root, "etc/pip.conf"))
+	plan := func() CAInstall {
+		t.Helper()
+		var changes []Change
+		for _, f := range []File{Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}), pip} {
+			sum := sha256.Sum256([]byte(f.Content))
+			c, err := NewChange(PlanRecord{System: f.System, Action: PlanInstall, Path: f.Path(OSLinux), SHA256: hex.EncodeToString(sum[:])}, []byte(f.Content), home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changes = append(changes, c)
+		}
+		in, err := AddCA(changes, ca, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in
+	}
+	if _, err := Apply(plan().Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string][]string{
+		xdgGit:                            {"sslCAInfo = " + caPath + "\n\tproxy = http://p", "sslCAInfo = /old/wild.pem"},
+		filepath.Join(home, ".gitconfig"): {"[http \"" + testBase + "\"]\n\tsslCAInfo = " + caPath, "name = x"},
+		early:                             {"[global]\ncert = /old/global.pem", "[install]\ncert = " + pipCA + "\ntimeout = 9"},
+		filepath.Join(venv, "pip.conf"):   {"cert = " + pipCA, "retries = 2", "index-url = " + testBase},
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range want {
+			if !strings.Contains(string(got), w) {
+				t.Errorf("%s does not hold %q:\n%s", path, w, got)
+			}
+		}
+	}
+	own, narrower := GitCAInfo(GitConfigFiles(h.Getenv, home, root), testBase+"/git/gh/", home)
+	if own == nil || own.Value != caPath || len(narrower) != 1 || narrower[0].Value != caPath {
+		t.Errorf("git resolves %+v and %+v after the apply; want %s for the prefix and for the one section below it", own, narrower, caPath)
+	}
+	for _, c := range plan().Changes {
+		if !c.Unchanged() {
+			d, _ := c.Diff()
+			t.Errorf("a second plan still changes %s:\n%s", c.Target, d)
+		}
+	}
+}
+
+// F116 R1, R2: pip loads its files in one order, with PIP_CONFIG_FILE
+// displacing the per-user ones.
+func TestTrustSourceSelection(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	env := map[string]string{"VIRTUAL_ENV": "/venv"}
+	h := PipHost{GOOS: OSLinux, Root: root, Home: home, Getenv: func(k string) string { return env[k] }}
+	rel := func(files []string) string {
+		return strings.NewReplacer(root, "R", home, "H").Replace(strings.Join(files, " "))
+	}
+	files, global := PipConfigFiles(h)
+	if got, want := rel(files), "R/etc/xdg/pip/pip.conf R/etc/pip.conf H/.pip/pip.conf H/.config/pip/pip.conf /venv/pip.conf"; got != want || global != 2 {
+		t.Errorf("pip on Linux loads %s (%d global); want %s", got, global, want)
+	}
+	explicit := filepath.Join(root, "explicit.conf")
+	if err := os.WriteFile(explicit, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env["PIP_CONFIG_FILE"] = explicit
+	if files, _ = PipConfigFiles(h); rel(files) != "R/etc/xdg/pip/pip.conf R/etc/pip.conf /venv/pip.conf R/explicit.conf" {
+		t.Errorf("with PIP_CONFIG_FILE pip loads %s; want no per-user file and the named one last", rel(files))
+	}
+	env["PIP_CONFIG_FILE"] = os.DevNull
+	if files, _ = PipConfigFiles(h); len(files) != 0 {
+		t.Errorf("with PIP_CONFIG_FILE the null device pip loads %v; want none", files)
+	}
+	delete(env, "PIP_CONFIG_FILE")
+	delete(env, "VIRTUAL_ENV")
+	h.GOOS, h.Prefix = OSDarwin, "/opt/py"
+	if files, _ = PipConfigFiles(h); rel(files) != "R/Library/Application Support/pip/pip.conf H/.pip/pip.conf H/.config/pip/pip.conf /opt/py/pip.conf" {
+		t.Errorf("pip on macOS loads %s", rel(files))
+	}
+}
+
+func TestFinalCAPreservesAlternateSyntax(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"helm-dash", Helm(testBase), "repositories:\n  -\n    name: bodega\n    url: https://old.example/helm\n    certFile: /corp/client.pem\n    keyFile: /corp/client.key\n", "certFile: /corp/client.pem"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0600); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				return
+			} // Refusing an unsupported form before writing preserves the file.
+			if _, err := Apply(in.Changes, ".audit"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("successful apply discarded %q:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestFinalGitCAAcceptsNativeSectionSyntax(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{" # corporate roots", "; corporate roots"} {
+		t.Run(suffix, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".gitconfig")
+			old := "[http \"" + testBase + "/git/gh/\"]" + suffix + "\n\tsslCAInfo = /missing/corporate.pem\n\textraHeader = X-Corp: keep\n"
+			if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			native := func() string {
+				t.Helper()
+				out, err := exec.Command("git", "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+				if err != nil {
+					t.Fatalf("native git: %v: %s", err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			if got := native(); got != "/missing/corporate.pem" {
+				t.Fatalf("fixture: git reads %q", got)
+			}
+			in, err := AddCA(caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux})
+			if err != nil {
+				return
+			}
+			if _, err := Apply(in.Changes, ".audit"); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(home, ".config/bodega/ca.pem")
+			if got := native(); got != want {
+				t.Fatalf("git still reads %q after successful CA apply; want %q", got, want)
+			}
+		})
+	}
+}
+
+// F116 R1: a file the plan cannot be placed in field by field is refused
+// before anything is written, naming the file and what stands in the way, and
+// so is a plan file the environment tells its client not to load. None of
+// them is replaced, and none is reported installed.
+func TestCARefusesWhatItCannotEditExactly(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	for name, tc := range map[string]struct {
+		file   File
+		before string
+		env    map[string]string
+		want   string
+	}{
+		"pip header with a comment":     {Pip(testBase), "[global] ; site policy\nindex-url = https://corp.example/simple\n", nil, "[global] ; site policy"},
+		"git setting on a header line":  {git, "[http \"" + testBase + "/\"] sslCAInfo = /corp.pem\n", nil, "opens a section"},
+		"git value continued":           {git, "[http \"" + testBase + "/git/\"]\n\tsslCAInfo = /corp\\\n.pem\n", nil, "opens a section"},
+		"helm flow sequence of entries": {Helm(testBase), "repositories: [{name: corp, url: \"https://corp.example\", certFile: /c.pem}]\n", nil, "move the file aside"},
+		"pip told to load no file":      {Pip(testBase), "", map[string]string{"PIP_CONFIG_FILE": os.DevNull}, "PIP_CONFIG_FILE"},
+		"git told to load no file":      {git, "", map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull}, "GIT_CONFIG_GLOBAL"},
+		"git configured by environment": {git, "", map[string]string{"GIT_CONFIG_COUNT": "1"}, "GIT_CONFIG_COUNT"},
+		"npm pointed at a missing file": {Npm(testBase, nil), "", map[string]string{"NPM_CONFIG_USERCONFIG": "/missing/work.npmrc"}, "NPM_CONFIG_USERCONFIG"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(tc.file.Path(OSLinux), "~"), "/"))
+			if tc.before != "" {
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, []byte(tc.before), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(k string) string { return tc.env[k] }})
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), target) {
+				t.Fatalf("AddCA = %v; want a refusal naming %s and %q", err, target, tc.want)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: a git value is read and written by git's own grammar, so a
+// path holding # or ; is not cut short at it, and the reader agrees with the
+// writer.
+func TestGitValueGrammar(t *testing.T) {
+	for raw, want := range map[string]string{
+		" /etc/ca.pem":           "/etc/ca.pem",
+		" /etc/ca.pem # roots":   "/etc/ca.pem",
+		" /etc/ca#1.pem":         "/etc/ca",
+		" \"/etc/ca#1.pem\" ; x": "/etc/ca#1.pem",
+		" /a\\\\b \"c d\"  ":     "/a\\b c d",
+		" \"say \\\"hi\\\"\"":    "say \"hi\"",
+	} {
+		if got, whole := gitValue(raw); got != want || !whole {
+			t.Errorf("gitValue(%q) = %q, %v; want %q", raw, got, whole, want)
+		}
+	}
+	for _, raw := range []string{" /etc/ca\\", " \"/etc/ca"} {
+		if got, whole := gitValue(raw); whole {
+			t.Errorf("gitValue(%q) = %q, read as a whole value", raw, got)
+		}
+	}
+	for _, v := range []string{"/etc/ca.pem", "/tmp/a_#_b/ca.pem", "/tmp/a;b", `C:\certs\ca.pem`, `/q"uote`, " lead"} {
+		if got, whole := gitValue(" " + gitQuote(v)); got != v || !whole {
+			t.Errorf("gitQuote(%q) = %s, which reads back as %q", v, gitQuote(v), got)
+		}
+	}
+}
+
+func TestAudit6CAHandlesGitIncludes(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target, included := filepath.Join(home, ".gitconfig"), filepath.Join(home, "corporate.gitconfig")
+	if err := os.WriteFile(included, []byte("[http \""+testBase+"/git/gh/\"]\n\tsslCAInfo = /missing/corporate.pem\n\textraHeader = X-Corp: keep\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("[include]\n\tpath = "+included+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	native := func() string {
+		t.Helper()
+		out, err := exec.Command("git", "config", "--includes", "--file", target, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+		if err != nil {
+			t.Fatalf("native git: %v: %s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := native(); got != "/missing/corporate.pem" {
+		t.Fatalf("fixture: git reads %q", got)
+	}
+	in, err := AddCA(caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "include") {
+			t.Fatalf("refusal must identify the unread include: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit"); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if got := native(); got != want {
+		t.Fatalf("successful CA apply leaves native git reading %q; want %q or a pre-write refusal of the include", got, want)
+	}
+}
+
+func TestAudit6NpmInlineCAAfterCAFile(t *testing.T) {
+	nativeNpm(t)
+	raw, leaf, _ := testCA(t, "bodega.example.com")
+	other, _, _ := testCA(t, "other.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".npmrc")
+	old := "registry=" + testBase + "/npm/\ncafile=/missing/previous.pem\nca[]=\"" + strings.ReplaceAll(strings.TrimSpace(string(other)), "\n", `\n`) + "\"\nsave-exact=true\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux})
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "get", "ca", "--json", "--userconfig", target, "--globalconfig", filepath.Join(home, "global.npmrc"))
+	cmd.Dir = home
+	for _, entry := range os.Environ() {
+		k, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(strings.ToLower(k), "npm_config_") && k != "HOME" && k != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("native npm: %v", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(out) {
+		t.Fatalf("native npm returned no CA: %s", out)
+	}
+	block, _ := pem.Decode(leaf)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: pool, DNSName: "bodega.example.com"}); err != nil {
+		t.Fatalf("successful apply leaves npm's effective inline CA without bodega's issuer: %v", err)
+	}
+}
+
+// F116 R1: what AddCA detects in a client's configuration and does not
+// interpret is refused while the plan is built, naming it, so nothing is
+// written; an environment cafile naming the installed copy is not one.
+func TestCARefusesWhatItDoesNotInterpret(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	for _, tc := range []struct {
+		name  string
+		file  File
+		files map[string]string
+		env   map[string]string
+		want  []string
+	}{
+		{"git includeIf in the per-user file", git, map[string]string{"~/.gitconfig": "[user]\n\tname = kept\n[includeIf \"gitdir:~/work/\"]\n\tpath = ~/work.gitconfig\n"}, nil, []string{"includeIf", ".gitconfig"}},
+		{"git include in the system file", git, map[string]string{"/etc/gitconfig": "[Include]\n\tpath = /etc/corp.gitconfig\n"}, nil, []string{"[Include]", "etc/gitconfig"}},
+		{"npm inline ca ahead of cafile", Npm(testBase, nil), map[string]string{"~/.npmrc": "ca=\ncafile=/old.pem\n"}, nil, []string{"sets ca,", ".npmrc"}},
+		{"npm ca[] in the file the environment selects", Npm(testBase, nil), map[string]string{"~/corp.npmrc": "ca[]=\"x\"\n"}, map[string]string{"NPM_CONFIG_USERCONFIG": "~/corp.npmrc"}, []string{"ca[]", "corp.npmrc"}},
+		{"npm inline ca from the environment", Npm(testBase, nil), nil, map[string]string{"npm_config_ca": "x"}, []string{"npm_config_ca"}},
+		{"git header carrying a setting in a file the plan does not edit", git, map[string]string{"~/.config/git/config": "[http] sslCAInfo = /corp.pem\n"}, nil, []string{"[http] sslCAInfo", ".config/git/config"}},
+		{"npm ca[] beside cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem\nca[]=\"x\"\n"}, nil, []string{"ca[] beside cafile", "etc/npmrc"}},
+		{"npm cafile with a comment in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem # corporate\n"}, nil, nil},
+		{"npm cafile from a reference in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "save=true\ncafile=${CORP_CA}\n"}, nil, []string{"sets cafile", "line 2 of", "etc/npmrc"}},
+		{"npm quoted ca[] beside quoted cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "'cafile'=/corp.pem\n\"ca[]\"=x\n"}, nil, []string{"ca[] beside cafile", "etc/npmrc"}},
+		{"npm plain cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem\n"}, nil, nil},
+		{"npm cafile from the environment", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "/etc/ssl/corp.pem"}, []string{"NPM_CONFIG_CAFILE", "/etc/ssl/corp.pem"}},
+		{"npm cafile from the environment naming the installed copy", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "~/.config/bodega/ca.pem"}, nil},
+	} {
+		home, root := t.TempDir(), t.TempDir()
+		at := func(p string) string {
+			if rest, ok := strings.CutPrefix(p, "~/"); ok {
+				return filepath.Join(home, rest)
+			}
+			return filepath.Join(root, p)
+		}
+		for p, content := range tc.files {
+			if err := os.MkdirAll(filepath.Dir(at(p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(at(p), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		getenv := func(key string) string {
+			if v, ok := tc.env[key]; ok && strings.HasPrefix(v, "~/") {
+				return at(v)
+			}
+			return tc.env[key]
+		}
+		_, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, Getenv: getenv})
+		if tc.want == nil {
+			if err != nil {
+				t.Errorf("%s: %v; want a plan", tc.name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: planned an install", tc.name)
+			continue
+		}
+		for _, want := range append(tc.want, "Nothing was written") {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: refusal does not name %q: %v", tc.name, want, err)
+			}
+		}
+		for p, content := range tc.files {
+			if got, _ := os.ReadFile(at(p)); string(got) != content {
+				t.Errorf("%s: the refusal changed %s", tc.name, p)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+			t.Errorf("%s: the refusal left a CA copy behind: %v", tc.name, err)
+		}
+	}
+}
+
+func TestAudit7GitInlineIncludeInSelectedFileRefusesBeforeWrite(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	xdg := filepath.Join(home, ".config/git/config")
+	included := filepath.Join(home, "corporate.gitconfig")
+	if err := os.MkdirAll(filepath.Dir(xdg), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(included, []byte("[http \""+testBase+"/git/gh/\"]\nsslCAInfo = /missing/corporate.pem\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := "[include] path = " + included + "\n"
+	if err := os.WriteFile(xdg, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("git", "config", "--includes", "--file", xdg, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "/missing/corporate.pem" {
+		t.Fatalf("native git fixture: %q, %v", out, err)
+	}
+	_, err = AddCA(caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "include") || !strings.Contains(err.Error(), xdg) {
+		t.Fatalf("selected %s imports native Git CA policy through %q; want a pre-write refusal naming it, got %v", xdg, strings.TrimSpace(old), err)
+	}
+	if got, _ := os.ReadFile(xdg); string(got) != old {
+		t.Fatal("refusal changed the selected file")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Fatalf("refusal wrote a CA: %v", err)
+	}
+}
+
+func TestAudit8NpmQuotedCARefusesBeforeWrite(t *testing.T) {
+	nativeNpm(t)
+	raw, _, _ := testCA(t, "bodega.example.com")
+	other, _, _ := testCA(t, "other.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".npmrc")
+	old := "registry=" + testBase + "/npm/\ncafile=/missing/previous.pem\n\"ca\"=\"" + strings.ReplaceAll(strings.TrimSpace(string(other)), "\n", `\n`) + "\"\nsave-exact=true\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "get", "ca", "--userconfig", target, "--globalconfig", filepath.Join(home, "global.npmrc"))
+	cmd.Dir = home
+	for _, entry := range os.Environ() {
+		k, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(strings.ToLower(k), "npm_config_") && k != "HOME" && k != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) != strings.TrimSpace(string(other)) {
+		t.Fatalf("native npm did not select the quoted ca: %q, %v", out, err)
+	}
+	_, err = AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux, Root: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "ca") {
+		t.Fatalf("native npm selects the quoted ca beside cafile; want pre-write refusal naming %s and ca, got %v", target, err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != old {
+		t.Fatal("refusal changed .npmrc")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Fatalf("refusal wrote a CA: %v", err)
+	}
+}
+
+// TestNpmOptionsDecodeAsNpmDoes holds the npmrc decoder to native npm's own
+// reading of the same file: every name and value NpmOptions is sure of is
+// the one `npm config list --json` reports.
+func TestNpmOptionsDecodeAsNpmDoes(t *testing.T) {
+	nativeNpm(t)
+	rc := strings.Join([]string{
+		`"tag"=a1`,
+		`'otp'="q # x"`,
+		`scope = @x ; trailing`,
+		`heading=a\#b\;c\qd`,
+		` "init-author-url" = y `,
+		`omit[]=dev`,
+		`"omit[]"="peer"`,
+		`ca # named before the comment = dropped`,
+		`init-author-name="unterminated`,
+		`init-author-email='single'`,
+		`init-license = "a\nb"`,
+		`"init-version"[]=z`,
+		`=skipped`,
+		`; cafile=/comment`,
+		`[section]`,
+		`registry=https://under.section.example/`,
+	}, "\n") + "\n"
+	dir := t.TempDir()
+	file := filepath.Join(dir, "rc")
+	if err := os.WriteFile(file, []byte(rc), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "list", "--json", "--userconfig", file, "--globalconfig", filepath.Join(dir, "global"))
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("npm config list: %v", err)
+	}
+	var native map[string]any
+	if err := json.Unmarshal(out, &native); err != nil {
+		t.Fatalf("npm config list printed %q: %v", out, err)
+	}
+	opts := NpmOptions([]byte(rc))
+	if len(opts) != 12 {
+		t.Fatalf("decoded %d options, want the 12 above the section: %+v", len(opts), opts)
+	}
+	for _, o := range opts {
+		if o.Unsure != "" || o.ValueUnsure != "" {
+			t.Errorf("line %d: unsure of a line npm reads plainly: %+v", o.Line, o)
+			continue
+		}
+		switch got := native[o.Key].(type) {
+		case string:
+			if o.Array || got != o.Value {
+				t.Errorf("line %d: decoded %q = %q, npm reads %q", o.Line, o.Key, o.Value, got)
+			}
+		case []any:
+			if !slices.Contains(got, any(o.Value)) {
+				t.Errorf("line %d: decoded %q[] = %q, npm reads %v", o.Line, o.Key, o.Value, got)
+			}
+		case bool:
+			if !o.Bare || !got {
+				t.Errorf("line %d: decoded %q = %q, npm reads %v", o.Line, o.Key, o.Value, got)
+			}
+		default:
+			t.Errorf("line %d: npm reports no option named %q (%v)", o.Line, o.Key, got)
+		}
+	}
+	if native["registry"] != "https://registry.npmjs.org/" {
+		t.Errorf("npm read the registry under a section: %v", native["registry"])
+	}
+}
+
+// TestNpmUnclassifiedLinesRefuseAndStayUnchecked walks the forms the decoder
+// is not sure of, and the registry forms the readers do not take: each names
+// its file and line, and none echoes a value.
+func TestNpmUnclassifiedLinesRefuseAndStayUnchecked(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, line := range map[string]string{
+		"quoted number name":  `'8443'=hunter2`,
+		"env in name":         `//${HOST}/:_authToken=hunter2`,
+		"indented bracket":    ` [scope]`,
+		"header with comment": `[scope] ; hunter2`,
+		"carriage return":     "save=hunter2\rregistry=https://elsewhere.example/",
+		"registry list":       `registry[]=https://elsewhere.example/hunter2`,
+		"bare registry":       `@corp:registry`,
+		"quoted list value":   `registry='["hunter2"]'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".npmrc")
+			old := "save-exact=true\n" + line + "\n"
+			if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got := NpmUnclassified(target)
+			if !strings.Contains(got, "line 2 of "+target) || strings.Contains(got, "hunter2") {
+				t.Fatalf("NpmUnclassified = %q, want line 2 of %s named and no value", got, target)
+			}
+			_, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux, Root: t.TempDir()})
+			if err == nil || !strings.Contains(err.Error(), "line 2 of "+target) || strings.Contains(err.Error(), "hunter2") {
+				t.Fatalf("AddCA = %v, want a refusal naming line 2 of %s and no value", err, target)
+			}
+			if now, _ := os.ReadFile(target); string(now) != old {
+				t.Fatal("refusal changed .npmrc")
+			}
+		})
+	}
+	// A token whose value npm fills from the environment is the common
+	// credential line, and names nothing this install reads.
+	home := t.TempDir()
+	target := filepath.Join(home, ".npmrc")
+	if err := os.WriteFile(target, []byte("//registry.example/:_authToken=${NPM_TOKEN}\n\"registry\"=https://old.example/\n'cafile' = /old.example.pem ; before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux, Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := string(in.Changes[0].New)
+	if !strings.Contains(merged, "//registry.example/:_authToken=${NPM_TOKEN}\n") || strings.Contains(merged, "old.example") || !strings.Contains(merged, "registry="+testBase+"/npm/\n") || strings.Count(merged, "cafile") != 1 {
+		t.Fatalf("merge did not replace the quoted registry and cafile and keep the token line:\n%s", merged)
+	}
+}
+
+// nativeNpm gates a test that holds doctor's reading of an npmrc against
+// npm's own. A developer's machine without npm skips it. CI does not: its
+// test job installs a pinned Node, so a missing npm there is a broken job
+// that would otherwise pass every oracle test unrun.
+func nativeNpm(t *testing.T) {
+	t.Helper()
+	oracletest.Npm(t)
+}
+
+func TestAudit9NativeOraclesCannotSkipInCI(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.v", "-test.run=^(TestAudit8NpmQuotedCARefusesBeforeWrite|TestNpmOptionsDecodeAsNpmDoes)$")
+	for _, e := range os.Environ() {
+		k, _, _ := strings.Cut(e, "=")
+		if k != "BODEGA_ORACLES" && k != "PATH" {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "BODEGA_ORACLES=required", "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("BODEGA_ORACLES=required with no npm passed its oracle tests:\n%s", out)
+	}
+}
+
+func TestAudit9CIInstallsPinnedNativeOracle(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				With map[string]string `yaml:"with"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(raw, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	pinned := false
+	for _, step := range workflow.Jobs["test"].Steps {
+		if strings.Contains(step.Run, "make test") && step.Env["BODEGA_ORACLES"] != "required" {
+			t.Fatal("CI's Go test step does not set BODEGA_ORACLES=required, so a missing native oracle skips there and the ports pass with nothing compared")
+		}
+		if strings.HasPrefix(step.Uses, "actions/setup-node@") {
+			pinned = regexp.MustCompile(`^actions/setup-node@[0-9a-f]{40}$`).MatchString(step.Uses) && regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(step.With["node-version"])
+		}
+		if strings.Contains(step.Run, "make test") && !pinned {
+			t.Fatal("CI's Go test job runs before any full-SHA setup-node with an exact node-version; native npm oracle is not pinned and required")
+		}
+	}
+	if !pinned {
+		t.Fatal("CI's test job installs no pinned Node/npm release")
+	}
+}
+
+// F116 R2: an absent ca, a null one and an empty one are three states to
+// npm, and NpmCAOf folds a file's lines to the one native npm reports. The
+// global file gives ca a value, so a per-user file that does not set it
+// shows as that value and a null shows as null.
+func TestNpmCAStatesAsNpmDoes(t *testing.T) {
+	nativeNpm(t)
+	dir := t.TempDir()
+	global, user := filepath.Join(dir, "global"), filepath.Join(dir, "rc")
+	if err := os.WriteFile(global, []byte("ca=GLOBAL\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		"", "ca=", `ca=""`, "ca= ; comment", "ca=null", `ca="null"`, "ca=true", "ca=false", "ca",
+		"ca[]=", "ca[]=null", "ca=x\nca=", "ca=x\nca=null", "ca[]=x\nca=", "ca[]=x\nca=null",
+		"ca=null\nca[]=x", "ca=x\nca[]=y", "ca=null\nca=x", "cafile=/corp.pem",
+	} {
+		if err := os.WriteFile(user, []byte(body+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("npm", "config", "list", "--json", "--userconfig", user, "--globalconfig", global)
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%q: npm config list: %v", body, err)
+		}
+		var native struct {
+			CA any `json:"ca"`
+		}
+		if err := json.Unmarshal(out, &native); err != nil {
+			t.Fatalf("%q: npm config list printed %q: %v", body, out, err)
+		}
+		// want is the state native npm reports: absent, null, unread for a
+		// value holding anything but strings, or the list itself.
+		want := "unread"
+		switch v := native.CA.(type) {
+		case nil:
+			want = "null"
+		case string:
+			want = "list " + strconv.Quote(v)
+		case []any:
+			var list []string
+			for _, e := range v {
+				if s, ok := e.(string); ok {
+					list = append(list, strconv.Quote(s))
+				}
+			}
+			if len(list) == len(v) {
+				want = "list " + strings.Join(list, ",")
+			}
+		}
+		if want == `list "GLOBAL"` {
+			want = "absent"
+		}
+		ca := NpmCAOf(NpmOptions([]byte(body + "\n")))
+		got := "absent"
+		switch {
+		case ca.Why != "":
+			got = "unread"
+		case ca.Set && ca.List == nil:
+			got = "null"
+		case ca.Set:
+			var list []string
+			for _, s := range ca.List {
+				list = append(list, strconv.Quote(s))
+			}
+			got = "list " + strings.Join(list, ",")
+		}
+		if got != want {
+			t.Errorf("%q: NpmCAOf = %s, native npm reports %s (%v)", body, got, want, native.CA)
+		}
+		if unread := NpmUnread(user); (unread != "") != (want == "unread") {
+			t.Errorf("%q: NpmUnread = %q, and native npm reports %s", body, unread, want)
+		}
+	}
+}
+
+// F116 R1: a record no editor reads is written whole only over nothing. Over
+// an existing file it keeps the file when the rendering is intact inside it,
+// and is refused, naming the file, when the two differ any other way.
+func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rendered = "# bodega apt settings\nAcquire::Retries \"3\";\n"
+	for name, tc := range map[string]struct {
+		old     string
+		want    string
+		refused bool
+	}{
+		"blank":                {" \n", rendered, false},
+		"same":                 {rendered, rendered, false},
+		"lines around":         {"# mine\n" + rendered + "APT::Color \"0\";\n", "# mine\n" + rendered + "APT::Color \"0\";\n", false},
+		"an older rendering":   {"# bodega apt settings\nAcquire::Retries \"1\";\n", "", true},
+		"edited inside":        {"# bodega apt settings\nAPT::Color \"0\";\nAcquire::Retries \"3\";\n", "", true},
+		"another file's lines": {"APT::Color \"0\";\n", "", true},
+	} {
+		home := t.TempDir()
+		// A record beside the system's first one, in a format no editor here
+		// reads.
+		const companionPath = "/etc/apt/apt.conf.d/90bodega"
+		main := AptArchive(testBase, "noble", nil)
+		companion := File{System: main.System, Paths: map[string]string{OSLinux: companionPath}, Content: rendered}
+		target := filepath.Join(home, companionPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(tc.old), 0600); err != nil {
+			t.Fatal(err)
+		}
+		in, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+		if tc.refused {
+			if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "Move the file aside") {
+				t.Errorf("%s: AddCA = %v, want a refusal naming %s and the next step", name, err, target)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: AddCA = %v", name, err)
+			continue
+		}
+		if _, err := Apply(in.Changes, ".f116"); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(target); string(got) != tc.want {
+			t.Errorf("%s: wrote %q, want %q", name, got, tc.want)
+		}
+		again, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+		if err != nil {
+			t.Errorf("%s: second AddCA = %v", name, err)
+			continue
+		}
+		for _, c := range again.Changes {
+			if c.Target == target && !c.Unchanged() {
+				t.Errorf("%s: a second apply would rewrite %s", name, target)
+			}
+		}
+	}
+}
+
+func TestAudit10GitCommentCannotHideTrustOverride(t *testing.T) {
+	oracletest.Git(t)
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".gitconfig")
+	old := "[http \"https://bodega.example.com/git/\"]\n# company policy \\\nsslCAInfo = /missing/company-ca.pem\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	remote := "https://bodega.example.com/git/gh/repo"
+	native := func() string {
+		cmd := exec.Command("git", "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", remote)
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1"}
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := native(); got != "/missing/company-ca.pem" {
+		t.Fatalf("native control = %q", got)
+	}
+	file := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	in, err := AddCA(caPlan(t, home, file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err != nil {
+		if !strings.Contains(err.Error(), target) {
+			t.Fatalf("refusal omits target: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit10"); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if got := native(); got != want {
+		t.Fatalf("CA apply succeeded but native git still selects %q; want %q", got, want)
+	}
+}
+
+func TestAudit10NpmUncheckedInputRefusesInPrimaryFile(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range []string{"cafile=", "cafile[]=/missing/company.pem", "cafile=${CORP_CA}"} {
+		t.Run(option, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".npmrc")
+			old := "registry=" + testBase + "/npm/\n" + option + "\n"
+			if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if why := NpmUnread(target); why == "" {
+				t.Fatal("control: probe classifier did not mark the input unchecked")
+			}
+			_, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+			if err == nil || !strings.Contains(err.Error(), target) {
+				t.Fatalf("primary file has a documented unchecked construct %q, but AddCA = %v; want refusal naming %s", option, err, target)
+			}
+			if got, _ := os.ReadFile(target); string(got) != old {
+				t.Fatal("refusal changed the primary file")
+			}
+		})
+	}
+}
+
+// TestGitContinuationFollowsGitsLexer holds the one continuation decision the
+// editor, the classifier and the probe share to native git's, on the lines
+// that tell a value running on from a backslash that continues nothing.
+func TestGitContinuationFollowsGitsLexer(t *testing.T) {
+	oracletest.Git(t)
+	const base = "https://bodega.example.com/"
+	for name, body := range map[string]string{
+		"a # comment ending in a backslash":          "[http]\n# note \\\nsslCAInfo = /ca.pem\n",
+		"a ; comment ending in a backslash":          "[http]\n; note \\\nsslCAInfo = /ca.pem\n",
+		"a header comment ending in a backslash":     "[http] # note \\\nsslCAInfo = /ca.pem\n",
+		"a value comment ending in a backslash":      "[http]\nproxy = x # note \\\nsslCAInfo = /ca.pem\n",
+		"an escaped backslash ending a value":        "[http]\nproxy = \"x\\\\\"\nsslCAInfo = /ca.pem\n",
+		"a value running on":                         "[http]\nproxy = x \\\nsslCAInfo = /ca.pem\n",
+		"a quoted ; before the backslash":            "[http]\nproxy = \"x ; y\" \\\nsslCAInfo = /ca.pem\n",
+		"a quoted value running on past a ;":         "[http]\nproxy = \"x ; \\\nsslCAInfo = /ca.pem\"\n",
+		"a ] inside the subsection before a comment": "[http \"https://bodega.example.com/a]b/\"] # note \\\nsslCAInfo = /deep.pem\n[http]\nsslCAInfo = /ca.pem\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config")
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("git", "config", "--file", file, "--get-urlmatch", "http.sslCAInfo", base)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1"}
+			out, _ := cmd.Output()
+			want := strings.TrimSpace(string(out))
+			got := ""
+			if own, _ := GitCAInfo([]string{file}, base, ""); own != nil {
+				got = own.Value
+			}
+			if got != want {
+				t.Errorf("git reads http.sslCAInfo = %q, this package %q, from:\n%s", want, got, body)
+			}
+		})
+	}
+}
+
+// TestContinuationIsEachFormatsOwn holds each line format to its own reader:
+// sh ends a comment at the newline, where systemd's environment.d joins
+// lines before it looks for one.
+func TestContinuationIsEachFormatsOwn(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		rules lineRules
+		lines []string
+		want  []bool
+	}{
+		{"sh comment", shRules, []string{`# note \`, `export A=b`}, []bool{false, false}},
+		{"sh trailing comment", shRules, []string{`export A=b # note \`, `export C=d`}, []bool{false, false}},
+		{"sh value", shRules, []string{`export A=b\`, `c`, `export C=d`}, []bool{false, true, false}},
+		{"sh # inside a word", shRules, []string{`export A=b#c\`, `d`}, []bool{false, true}},
+		{"sh single quotes keep a backslash", shRules, []string{`export A='b\'`, `export C=d`}, []bool{false, false}},
+		{"sh open quote", shRules, []string{`export A="b`, `# c"`, `export C=d`}, []bool{false, true, false}},
+		{"environment.d comment", envdRules, []string{`# note \`, `A=b`, `C=d`}, []bool{false, true, false}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			scan := lineScan{rules: c.rules, keyIndent: -1}
+			for i, l := range c.lines {
+				if got := scan.continues(l); got != c.want[i] {
+					t.Errorf("line %d %q: continues = %v, want %v", i+1, l, got, c.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestAudit11CAPlanEditsSelectedHelmConfig(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	target := filepath.Join(t.TempDir(), "repositories.yaml")
+	old := HelmDocument(HelmRepository(testBase, "caFile: /missing/company-ca.pem", "username: company-user", "password: company-password"))
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string {
+		if k == "HELM_REPOSITORY_CONFIG" {
+			return target
+		}
+		return ""
+	}}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := changeAt(t, in.Changes, target)
+	if strings.Contains(string(change.New), "/missing/company-ca.pem") {
+		t.Fatal("selected Helm file still replaces system roots with the missing CA")
+	}
+	for _, keep := range []string{"company-user", "company-password"} {
+		if !strings.Contains(string(change.New), keep) {
+			t.Fatalf("selected Helm file lost %s", keep)
+		}
+	}
+	if _, err := Apply(in.Changes, ".audit11"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, change.New) {
+		t.Fatalf("selected Helm file was not applied: %s, %v", got, err)
+	}
+	again, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changeAt(t, again.Changes, target).Unchanged() {
+		t.Fatal("selected Helm file changes again")
+	}
+}
+
+// A system-store client whose configuration the environment relocates gets
+// the plan's merge in the file it reads, with that file's other settings
+// kept, and a second plan leaves it alone.
+func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		file File
+		env  func(target string) map[string]string
+		path string
+		old  string
+		want string
+	}{
+		{"GOENV", Gomod(testBase), func(f string) map[string]string { return map[string]string{"GOENV": f} }, "goenv",
+			"GOFLAGS=-mod=mod\nGOPROXY=https://proxy.golang.org,direct\n", "GOPROXY=" + GoProxy(testBase)},
+		{"XDG_CONFIG_HOME for go", Gomod(testBase), func(f string) map[string]string {
+			return map[string]string{"XDG_CONFIG_HOME": filepath.Dir(filepath.Dir(f))}
+		}, "go/env", "GOFLAGS=-mod=mod\n", "GOPROXY=" + GoProxy(testBase)},
+		{"HELM_CONFIG_HOME", Helm(testBase), func(f string) map[string]string { return map[string]string{"HELM_CONFIG_HOME": filepath.Dir(f)} }, "repositories.yaml",
+			HelmDocument("- name: company\n  url: https://charts.example/\n"), testBase + "/helm"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			target := filepath.Join(t.TempDir(), c.path)
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(c.old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			env := c.env(target)
+			h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string { return env[k] }}
+			in, err := AddCA(caPlan(t, home, c.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			change := changeAt(t, in.Changes, target)
+			if !strings.Contains(string(change.New), c.want) {
+				t.Fatalf("%s does not hold %s:\n%s", target, c.want, change.New)
+			}
+			for _, line := range strings.Split(strings.TrimSpace(c.old), "\n") {
+				if !strings.HasPrefix(line, "GOPROXY=") && !strings.Contains(string(change.New), line) {
+					t.Errorf("%s lost the line %q:\n%s", target, line, change.New)
+				}
+			}
+			if _, err := Apply(in.Changes, ".selected"); err != nil {
+				t.Fatal(err)
+			}
+			again, err := AddCA(caPlan(t, home, c.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !changeAt(t, again.Changes, target).Unchanged() {
+				t.Fatal("the selected file changes again on a second plan")
+			}
+		})
+	}
+}
+
+// TestPipOptionsMatchesNativePip compares PipOptions with pip config list
+// across the spellings pip's loader folds together: a -- prefix, _ for -,
+// case, a colon delimiter, and [DEFAULT] inheritance in either direction.
+func TestPipOptionsMatchesNativePip(t *testing.T) {
+	python := oracletest.Pip(t)
+	cases := []string{
+		"[global]\n--cert = /a.pem\nindex-url = https://x/simple/\n",
+		"[global]\ncert = /a.pem\n--cert = /b.pem\n",
+		"[global]\n--Index_URL: https://x/simple/\n",
+		"[DEFAULT]\ncert = /d.pem\n[global]\nindex-url = https://x/simple/\n[install]\n",
+		"[DEFAULT]\n--cert = /d.pem\n[global]\ncert = /g.pem\n",
+		"[DEFAULT]\ncert = /d.pem\n[global]\n--cert = /g.pem\n",
+		"[DEFAULT]\nindex-url = https://d/simple/\n[install]\nextra_index_url = https://e/simple/\n  https://f/simple/\n",
+		"[global]\n  index-url = https://x/simple/\n  cert = /a.pem\n",
+		"[global]\nfind-links = /a\n  # note\n\n  /b\n  [install]\n  cert = /not.pem\ncert = /a.pem\n",
+		"[global] trailing\ncert = /a.pem # kept\n",
+		"[global]\nfind-links =\n  /a\n\n  /b\n",
+		"[global]\r\ncert = /a.pem\r\n[install]\r\ntimeout: 5\r\n",
+	}
+	line := regexp.MustCompile(`^([^=]+)='(.*)'$`)
+	list := func(body string) map[string]string {
+		t.Helper()
+		file := filepath.Join(t.TempDir(), "pip.conf")
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(python, "-m", "pip", "config", "list")
+		cmd.Dir = t.TempDir()
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "PIP_CONFIG_FILE=" + file}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("native pip on %q: %v: %s", body, err, out)
+		}
+		native := map[string]string{}
+		for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if m := line.FindStringSubmatch(l); m != nil && !strings.HasPrefix(m[1], ":env:.") {
+				native[m[1]] = strings.ReplaceAll(m[2], `\n`, "\n")
+			}
+		}
+		return native
+	}
+	// pip loads the host's global files beside PIP_CONFIG_FILE and nothing
+	// turns them off without turning that file off too, so what the host
+	// alone sets (a CI image's break-system-packages) is taken out of each
+	// answer where the case does not set the option itself.
+	host := list("")
+	for _, body := range cases {
+		native, got := list(body), PipOptions([]byte(body))
+		for k, v := range host {
+			if _, set := got[k]; !set && native[k] == v {
+				delete(native, k)
+			}
+		}
+		if !maps.Equal(got, native) {
+			t.Errorf("PipOptions(%q)\n got %v\nnative pip %v", body, got, native)
+		}
+	}
+}
+
+// TestPipLoadErrorMatchesNativePip compares PipLoadError with whether pip
+// config list loads the file at all.
+func TestPipLoadErrorMatchesNativePip(t *testing.T) {
+	python := oracletest.Pip(t)
+	cases := []string{
+		"[global]\ntimeout = 1\ntimeout = 2\n",
+		"[global]\ntimeout = 1\n[global]\nretries = 2\n",
+		"[global]\nTimeout = 1\ntimeout = 2\n",
+		"[global]\ncert = /a.pem\n--cert = /b.pem\n",
+		"[global]\nindex_url = https://a/\nindex-url = https://b/\n",
+		"[DEFAULT]\ntimeout = 1\n[DEFAULT]\nretries = 2\n",
+		"[DEFAULT]\ntimeout = 1\n[DEFAULT]\ntimeout = 2\n",
+		"timeout = 1\n[global]\n",
+		"[global]\nindex-url = https://a/\n  https://b/\n[install]\nindex-url = https://c/\n",
+		"# comment\n\n[global]\ntimeout: 1\n",
+		// The rest of configparser's line grammar: every line that is not
+		// blank or a comment is a header, an option or a continuation.
+		"[global]\ntimeout = 1\nnot-an-assignment\n",
+		"[global]\ntimeout = 1\n= nameless\n",
+		"[global]\ntimeout = 1\n: nameless\n",
+		"[global\ntimeout = 1\n",
+		"[global]\ntimeout = 1\n[install\nretries = 2\n",
+		"[global]\ntimeout = 1\n[]\n",
+		"[global]\n  not-an-assignment\n",
+		"[global]\n  timeout = 1\n",
+		"[global]\n  timeout = 1\nretries = 2\n",
+		"[global]\nfind-links = /a\n  not-an-assignment\n",
+		"[global]\nfind-links = /a\n\n  not-an-assignment\n",
+		"[global]\nfind-links = /a\n# note\n  not-an-assignment\n",
+		"[global]\nfind-links = /a\n  [install]\n  retries = 2\n",
+		"[global]\nfind-links = /a\n  /b\nnot-an-assignment\n",
+		"[global]\n= nameless\n  not-an-assignment\n",
+		"[global] trailing\ntimeout = 1\n",
+		"[global]\n  # indented comment\n; another\ntimeout = 1\n",
+		"[global]\nfind-links = /a # not a comment\n",
+		"[global]\r\ntimeout = 1\r\nnot-an-assignment\r\n",
+		"not-an-assignment\n[global]\n",
+		"[global]\ntimeout\n",
+	}
+	accepted, refused := 0, 0
+	for _, body := range cases {
+		file := filepath.Join(t.TempDir(), "pip.conf")
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(python, "-m", "pip", "config", "list")
+		cmd.Dir = t.TempDir()
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "PIP_CONFIG_FILE=" + file}
+		out, nativeErr := cmd.CombinedOutput()
+		if nativeErr == nil {
+			accepted++
+		} else {
+			refused++
+		}
+		if got := PipLoadError([]byte(body)); (got == nil) != (nativeErr == nil) {
+			t.Errorf("PipLoadError(%q) = %v, native pip: %v: %s", body, got, nativeErr, out)
+		}
+	}
+	// A pip that refuses or accepts everything would agree with nothing
+	// these cases are here to tell apart.
+	if accepted == 0 || refused == 0 {
+		t.Fatalf("native pip accepted %d and refused %d of the cases; the oracle is not telling them apart", accepted, refused)
+	}
+}
+
+// F116 R1, R2: ParseGitConfig loads a file as git itself does. Native git is
+// the oracle: for each body the variables it lists, or the line it refuses
+// the file at, are the ones the port gives, for a line in any section.
+func TestGitConfigMatchesNativeGit(t *testing.T) {
+	git := oracletest.Git(t)
+	dir := t.TempDir()
+	for i, body := range []string{
+		"",
+		"top = level\n",
+		"[user]\n\tname = \"bad\\q\"\n",
+		"[user]\n\tname = \"A \\\"B\\\" \\\\ C\\tD\\n\\b\"\n",
+		"[a]\n\tb\n\tc =\n\td = \n",
+		"[a] b = c\n[d.E]\nf=g\n[H \"I.j\"] k = l\n",
+		"[a \"b\\c\\\"d\"]\n e = f\n",
+		"[a]\n b = c \\\n d ; x\n e = \"f \\\n g\" h # i\n",
+		"\xef\xbb\xbf[a]\nb=c\n",
+		"\xef\xbb[a]\nb=c\n",
+		"[a]\n b = \"open\n c = d\n",
+		"[a]\n 1b = c\n",
+		"[a]\n b c\n",
+		"[a]\n b ; c\n",
+		"[a]\r\n b = c\r\n d = e\\\r\n f\r\n",
+		"[a]\n b = c\\",
+		"[a]\n b = c \\\n",
+		"[]\n",
+		"[a\n b = c\n",
+		"[a \"b\n\"]\n",
+		"[a \"b\" ]\n",
+		"[ a]\n",
+		"[a b]\n",
+		"[a_b]\n",
+		"# c\n; d\n[a] # e\n b = c#d\n f = \"g#h\" ; i\n",
+		"[a]\n b = c ; \\\n d = e\n",
+		"[http]\n sslCAInfo = /a\\\n/b\n[http \"https://h/\"]\n\tsslCAInfo = ~/x.pem  \n",
+		"[url \"https://h/git/\"]\n insteadOf = https://github.com/\n insteadOf = gh:\n",
+		"[a]\n b = x\ty  z \n",
+		"[a]\n\x0cb = c\n",
+		"[a]\n b = c\n=d\n",
+	} {
+		file := filepath.Join(dir, strconv.Itoa(i)+".cfg")
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(git, "config", "--file", file, "--list", "-z")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_NOSYSTEM=1"}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		native, nativeErr := cmd.Output()
+		got := ParseGitConfig([]byte(body))
+		if nativeErr != nil {
+			want := 0
+			if m := regexp.MustCompile(`^fatal: bad config line (\d+) `).FindStringSubmatch(stderr.String()); m != nil {
+				want, _ = strconv.Atoi(m[1])
+			} else {
+				t.Fatalf("%q: native git failed another way: %s", body, stderr.String())
+			}
+			if got.BadLine != want {
+				t.Errorf("%q: BadLine = %d; native git stops at line %d", body, got.BadLine, want)
+			}
+			continue
+		}
+		var ours []string
+		for _, e := range got.Entries {
+			one := e.Key()
+			if e.HasValue {
+				one += "\n" + e.Value
+			}
+			ours = append(ours, one)
+		}
+		var theirs []string
+		if len(native) > 0 {
+			theirs = strings.Split(strings.TrimSuffix(string(native), "\x00"), "\x00")
+		}
+		if got.BadLine != 0 || !slices.Equal(ours, theirs) {
+			t.Errorf("%q: BadLine = %d and variables %q; native git loads it as %q", body, got.BadLine, ours, theirs)
+		}
+	}
+}
+
+// F116 R1, R2: the two spellings of one npm option in the environment are
+// one option. Agreeing or alone they give its value; disagreeing they give
+// none and name the pair, since the order npm takes them in is not readable.
+func TestNpmEnvResolvesOneOption(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	for _, tc := range []struct {
+		env      map[string]string
+		value    string
+		conflict bool
+	}{
+		{env: nil},
+		{env: map[string]string{"npm_config_registry": "https://a/"}, value: "https://a/"},
+		{env: map[string]string{"NPM_CONFIG_REGISTRY": "https://b/"}, value: "https://b/"},
+		{env: map[string]string{"npm_config_registry": "https://a/", "NPM_CONFIG_REGISTRY": "https://a/"}, value: "https://a/"},
+		{env: map[string]string{"npm_config_registry": "https://a/", "NPM_CONFIG_REGISTRY": "https://b/"}, conflict: true},
+	} {
+		value, conflict := NpmEnv(env(tc.env), "registry")
+		if value != tc.value || (conflict != "") != tc.conflict || NpmEnvConflict(env(tc.env)) != conflict {
+			t.Errorf("NpmEnv(%v) = %q, %q; want %q, conflict %v", tc.env, value, conflict, tc.value, tc.conflict)
+		}
+	}
+	if c := NpmEnvConflict(env(map[string]string{"npm_config_userconfig": "/a", "NPM_CONFIG_USERCONFIG": "/b"})); !strings.Contains(c, "npm_config_userconfig") {
+		t.Errorf("NpmEnvConflict over userconfig = %q; want the pair named", c)
+	}
+}
+
+// F116 R1, R2: repositories.yaml loads the way helm v4.3.0 loads it. A wrong
+// type in any field of File or Entry is a load error, whichever field it is,
+// and where helm is installed it gives the same verdict on the same bytes.
+func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
+	entry := "repositories:\n  - name: bodega\n    url: https://b/helm\n"
+	for name, tc := range map[string]struct {
+		body string
+		bad  string
+	}{
+		"plan's own document":   {body: HelmDocument(HelmRepository("https://b"))},
+		"empty file":            {body: ""},
+		"emptied list":          {body: "repositories: []\n"},
+		"null entry":            {body: "repositories:\n  -\n", bad: "is null"},
+		"unknown keys":          {body: entry + "    extra: [1]\nother: {a: 1}\n"},
+		"bool spelled as YAML":  {body: entry + "    insecure_skip_tls_verify: yes\n"},
+		"syntax":                {body: entry + "broken: [\n", bad: "did not find expected"},
+		"pass_credentials_all":  {body: entry + "    pass_credentials_all: [wrong-type]\n", bad: "cannot unmarshal"},
+		"insecure as a string":  {body: entry + "    insecure_skip_tls_verify: \"maybe\"\n", bad: "cannot unmarshal"},
+		"name as a list":        {body: "repositories:\n  - name: [a]\n    url: https://b/helm\n", bad: "cannot unmarshal"},
+		"caFile as a mapping":   {body: entry + "    caFile: {a: b}\n", bad: "cannot unmarshal"},
+		"password as a list":    {body: entry + "    password: [x]\n", bad: "cannot unmarshal"},
+		"generated not a time":  {body: "generated: yesterday\n" + entry, bad: "parsing time"},
+		"apiVersion as a list":  {body: "apiVersion: [v1]\n" + entry, bad: "cannot unmarshal"},
+		"repositories a string": {body: "repositories: none\n", bad: "cannot unmarshal"},
+		"entry a string":        {body: "repositories:\n  - bodega\n", bad: "cannot unmarshal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "repositories.yaml")
+			if err := os.WriteFile(file, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			doc, err := LoadHelmFile(file)
+			switch {
+			case tc.bad == "" && (err != nil || doc == nil):
+				t.Fatalf("LoadHelmFile = %v, %v; helm loads this file", doc, err)
+			case tc.bad != "" && (err == nil || !strings.Contains(err.Error(), tc.bad) || !strings.Contains(err.Error(), file)):
+				t.Fatalf("LoadHelmFile error = %v; want one naming %s and %q", err, file, tc.bad)
+			}
+			helm := oracletest.Helm(t)
+			cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()}
+			out, _ := cmd.CombinedOutput()
+			// helm prints a load error and panics on a null entry; either way it
+			// has stopped before any request.
+			if refused := strings.Contains(string(out), "failed loading file") || strings.Contains(string(out), "nil pointer dereference"); refused != (tc.bad != "") {
+				t.Errorf("native helm refused the file: %v (%s); LoadHelmFile error = %v", refused, out, err)
+			}
+		})
+	}
+	if doc, err := LoadHelmFile(filepath.Join(t.TempDir(), "absent.yaml")); doc != nil || err != nil {
+		t.Errorf("a path holding no file = %v, %v; want a helm with no repositories", doc, err)
+	}
+}
+
+// F116 R1, R2: one resolver names the repositories.yaml helm reads, in
+// helm's own order on every platform, and native helm names the same file.
+func TestHelmRepositoryFileFollowsHelmpath(t *testing.T) {
+	cases := []struct {
+		goos string
+		env  map[string]string
+		want string
+	}{
+		{OSLinux, nil, "/h/.config/helm/repositories.yaml"},
+		{OSDarwin, nil, "/h/Library/Preferences/helm/repositories.yaml"},
+		{OSLinux, map[string]string{"XDG_CONFIG_HOME": "/x"}, "/x/helm/repositories.yaml"},
+		{OSDarwin, map[string]string{"XDG_CONFIG_HOME": "/x"}, "/x/helm/repositories.yaml"},
+		{OSDarwin, map[string]string{"XDG_CONFIG_HOME": "/x", "HELM_CONFIG_HOME": "/c"}, "/c/repositories.yaml"},
+		{OSLinux, map[string]string{"XDG_CONFIG_HOME": "/x", "HELM_CONFIG_HOME": "/c", "HELM_REPOSITORY_CONFIG": "/r.yaml"}, "/r.yaml"},
+	}
+	for _, tc := range cases {
+		got := HelmRepositoryFile(func(k string) string { return tc.env[k] }, tc.goos, "/h")
+		if got != tc.want {
+			t.Errorf("%s %v = %s; want %s", tc.goos, tc.env, got, tc.want)
+		}
+	}
+	if got := HelmRepositoryFile(nil, OSLinux, ""); got != "" {
+		t.Errorf("no home and no environment = %q; want none", got)
+	}
+	helm := oracletest.Helm(t)
+	for _, tc := range cases {
+		if tc.goos != runtime.GOOS {
+			continue
+		}
+		cmd := exec.Command(helm, "env", "HELM_REPOSITORY_CONFIG")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=/h"}
+		for k, v := range tc.env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		out, err := cmd.Output()
+		if err != nil || strings.TrimSpace(string(out)) != tc.want {
+			t.Errorf("%s %v: native helm reads %s (%v); want %s", tc.goos, tc.env, out, err, tc.want)
+		}
+	}
+}
+
+// F116 R1: a repositories.yaml helm cannot load is refused before any edit
+// is built, on the file the plan writes and on the one the environment
+// selects, and on a second run as on the first.
+func TestCAPlanRefusesUnloadableHelmFile(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := HelmDocument(HelmRepository(testBase, "pass_credentials_all: [wrong-type]"))
+	for name, selected := range map[string]bool{"plan's own file": false, "file the environment selects": true} {
+		t.Run(name, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			target := filepath.Join(home, ".config/helm/repositories.yaml")
+			env := map[string]string{}
+			if selected {
+				target = filepath.Join(t.TempDir(), "repositories.yaml")
+				env["HELM_REPOSITORY_CONFIG"] = target
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(broken), 0600); err != nil {
+				t.Fatal(err)
+			}
+			h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string { return env[k] }}
+			for range 2 {
+				_, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+				if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "pass_credentials_all") {
+					t.Fatalf("AddCA error = %v; want a refusal naming %s and the field", err, target)
+				}
+			}
+		})
+	}
+}
+
+func TestAudit21AptLoadErrorsRefuseCAPlan(t *testing.T) {
+	for _, location := range []string{"APT_CONFIG", "etc/apt/apt.conf", "etc/apt/apt.conf.d/99local"} {
+		for _, body := range []string{"Acquire::https::CAInfo \"/unused.pem\"\n", "Acquire::Retries \"3\" extra;\n"} {
+			t.Run(location+"/"+strings.TrimSpace(body), func(t *testing.T) {
+				home := t.TempDir()
+				file := filepath.Join(home, location)
+				if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				caPEM, _, _ := testCA(t, "bodega.example.com")
+				ca, err := ParseCA(caPEM)
+				if err != nil {
+					t.Fatal(err)
+				}
+				getenv := func(key string) string {
+					if location == "APT_CONFIG" && key == "APT_CONFIG" {
+						return file
+					}
+					return ""
+				}
+				f := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+				in, err := AddCA(caPlan(t, home, f), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: getenv})
+				if err == nil || !strings.Contains(err.Error(), file) || len(in.Changes) != 0 {
+					t.Errorf("CA plan accepted apt's unloadable file %s: err=%v changes=%d step=%v", file, err, len(in.Changes), in.Step)
+				}
+			})
+		}
+	}
+}
+
+func TestAudit22GomodInvalidProxyRefusesCAPlan(t *testing.T) {
+	for _, tail := range []string{"broken", "ftp://mirror.invalid", "file://mirror.invalid/cache"} {
+		t.Run(tail, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			caPEM, _, _ := testCA(t, "bodega.example.com")
+			ca, err := ParseCA(caPEM)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, CAHost{
+				Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string {
+					if key == "GOPROXY" {
+						return testBase + "/go," + tail
+					}
+					return ""
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "GOPROXY") || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("invalid GOPROXY accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+			}
+		})
+	}
+}
+
+// F116 R1: a value the client refuses when it comes to use it, or sends
+// somewhere this package does not work out, refuses the CA plan before any
+// change is built, in whichever documented input holds it. Each client's
+// plan is accepted on the same host without that value.
+func TestAudit23EndpointValuesRefuseCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "apt, an entry with no suite in another list", plan: apt,
+			files: map[string]string{"etc/apt/sources.list.d/extra.list": "deb https://mirror.example/ubuntu\n"}, names: "(Suite)"},
+		{name: "apt, an unknown type in sources.list", plan: apt,
+			files: map[string]string{"etc/apt/sources.list": "rpm https://mirror.example/ubuntu stable main\n"}, names: "Type 'rpm' is not known"},
+		{name: "npm, a registry with no scheme in the environment", plan: Npm(testBase, nil),
+			env: map[string]string{"npm_config_registry": "//bodega.example.com/npm/"}, names: "npm_config_registry"},
+		{name: "npm, a scoped registry in another scheme", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "@corp:registry=ftp://corp.example/npm/\n"}, names: "@corp:registry=ftp://corp.example/npm/"},
+		{name: "npm, a registry Node's URL parser reads and net/url does not", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "@corp:registry=https:bodega.example.com/npm/\n"}, names: "@corp:registry"},
+		{name: "git, a rewrite to a URL git does not normalize", plan: Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			files: map[string]string{".gitconfig": "[url \"https://bodega.example.com/git/%zz/\"]\n\tinsteadOf = https://example.org/\n"}, names: "invalid %XX escape sequence"},
+		{name: "helm, a repository in a scheme with no getter", plan: Helm(testBase),
+			files: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: other\n  url: ftp://charts.example/\n"}, names: "could not find protocol handler for: ftp"},
+		{name: "docker, a client certificate with no key", plan: DockerDaemon(testBase, nil),
+			files: map[string]string{"etc/docker/certs.d/bodega.example.com/client.cert": string(caPEM)}, names: "missing key client.key"},
+		{name: "containerd, a ca another host of the file names and nothing holds", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: map[string]string{"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n\n[host.\"https://mirror.example\"]\n  ca = \"/missing/mirror-ca.pem\"\n"}, names: "unable to read CA cert"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string { return tc.env[key] }}
+			clean := h
+			clean.Getenv = func(string) string { return "" }
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, clean); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			for name, body := range tc.files {
+				path := filepath.Join(home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: the one-line sources format as APT 3.0.3's ParseFileOldStyle
+// and Type::ParseLine read it, each refusal in apt's words.
+func TestAudit23AptSourcesListReadsAsApt(t *testing.T) {
+	for _, tc := range []struct {
+		line, refused string
+		uri           string
+	}{
+		{line: "deb https://a.example/ubuntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "deb-src https://a.example/ubuntu stable main contrib # trailing", uri: "https://a.example/ubuntu"},
+		{line: "deb [arch=amd64 signed-by=/k.gpg] https://a.example/ubuntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "deb [ arch=amd64 ] https://a.example/ubuntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "deb [arch=amd64] \"https://a.example/ubuntu\" stable/", uri: "https://a.example/ubuntu"},
+		{line: "deb https://a.example/%75buntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "  # deb https://a.example/ubuntu stable main"},
+		{line: "deb", refused: "Malformed line 1 in source list"},
+		{line: "rpm https://a.example/ubuntu stable main", refused: "Type 'rpm' is not known on line 1"},
+		{line: "deb [arch=amd64", refused: "([option] unparsable)"},
+		{line: "deb [arch=\"amd64 https://a.example/ubuntu stable main", refused: "([option] unparsable)"},
+		{line: "deb [arch=amd64 https://a.example/ubuntu stable main", refused: "([option] not assignment)"},
+		{line: "deb [a] https://a.example/ubuntu stable main", refused: "([option] too short)"},
+		{line: "deb [abc] https://a.example/ubuntu stable main", refused: "([option] not assignment)"},
+		{line: "deb [=amd64] https://a.example/ubuntu stable main", refused: "([option] no key)"},
+		{line: "deb [arch=] https://a.example/ubuntu stable main", refused: "([option] no value)"},
+		{line: "deb [arch=amd64]", refused: "(URI)"},
+		{line: "deb https://a.example/ubuntu", refused: "(Suite)"},
+		{line: "deb a.example/ubuntu stable main", refused: "(URI parse)"},
+		{line: "deb https://a.example/ubuntu stable", refused: "(Component)"},
+		{line: "deb https://a.example/ubuntu stable/ main", refused: "(absolute Suite Component)"},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, AptSourcesList)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.line+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := LoadAptSources(root)
+			switch {
+			case tc.refused != "":
+				if err == nil || !strings.Contains(err.Error(), tc.refused) {
+					t.Errorf("LoadAptSources = %+v, %v; apt refuses this line with %q", entries, err, tc.refused)
+				}
+			case err != nil:
+				t.Errorf("LoadAptSources refuses a line apt loads: %v", err)
+			case tc.uri == "" && len(entries) != 0, tc.uri != "" && (len(entries) != 1 || entries[0].URIs[0] != tc.uri):
+				t.Errorf("LoadAptSources = %+v; want the URI %q", entries, tc.uri)
+			}
+		})
+	}
+	for uri, want := range map[string][3]string{
+		"https://bodega.example.com:8443/apt":        {"https", "bodega.example.com", "8443"},
+		"https://user:pw@bodega.example.com/apt":     {"https", "bodega.example.com", "0"},
+		"mirror+https://bodega.example.com/list.txt": {"https", "bodega.example.com", "0"},
+		"http://[fd00::1]:8080/apt":                  {"http", "fd00::1", "8080"},
+		"file:/srv/mirror":                           {"file", "", "0"},
+		"cdrom:[Ubuntu 26.04]/":                      {"cdrom", "", "0"},
+	} {
+		access, host, port := AptURIHost(uri)
+		if got := [3]string{access, host, strconv.Itoa(port)}; got != want {
+			t.Errorf("AptURIHost(%q) = %v, want %v", uri, got, want)
+		}
+	}
+}
+
+// F116: the trust-store diagnostics for a refused endpoint never carry a URL
+// password, whether the client's own parser accepted the URL or not.
+func TestAudit23EndpointRefusalsRedactPasswords(t *testing.T) {
+	const secret = "hunter2"
+	for _, list := range []string{
+		"https://bodega.example.com/go,ftp://ci:" + secret + "@mirror.example/go",
+		"https://bodega.example.com/go,file://ci:" + secret + "@mirror.example/cache",
+		"https://bodega.example.com/go,https://ci:" + secret + "@mirror.example:port/go",
+	} {
+		if _, err := GoProxyList(list); err == nil || strings.Contains(err.Error(), secret) {
+			t.Errorf("GoProxyList(%q) = %v; want a refusal without the password", list, err)
+		}
+	}
+	if list, err := GoProxyList("https://bodega.example.com/go,off,ftp://never.example"); err != nil || len(list) != 2 {
+		t.Errorf("an entry past off is never checked: %v, %v", list, err)
+	}
+	regs := []NpmRegistry{{Option: "registry", Value: "ftp://ci:" + secret + "@mirror.example/npm/", From: "the test"}}
+	if unread := NpmRegistryUnread(regs); unread == "" || strings.Contains(unread, secret) {
+		t.Errorf("NpmRegistryUnread = %q; want the registry named without the password", unread)
+	}
+	for value, read := range map[string]bool{
+		"https://bodega.example.com/npm/":            true,
+		" HTTPS://ci:pw@Bodega.Example.com:8443/n ":  true,
+		"https://127.0.0.1:8443/npm/":                true,
+		"https://[fd00::1]:8443/npm/":                true,
+		"https://0x7f.1/npm/":                        false,
+		"https://bodega.example.com:99999/npm/":      false,
+		"https://bodega.example.com\\@evil.example/": false,
+		"https://bodega.example.com:08443/npm/":      false,
+		"https:///bodega.example.com/npm/":           false,
+	} {
+		if _, err := NpmRegistryURL(value); (err == nil) != read {
+			t.Errorf("NpmRegistryURL(%q) = %v; read should be %v", value, err, read)
+		}
+	}
+}
+
+func TestAudit24PipOptionTypeRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, "etc/pip.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("[global]\nindex-url = https://pypi.org/simple/\ntimeout = abc\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Pip(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || !strings.Contains(err.Error(), "timeout") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("CA plan accepted pip's invalid timeout: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+func TestAudit24GomodEmptyProxyListRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, CAHost{
+		Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+		Getenv: func(key string) string {
+			if key == "GOPROXY" {
+				return ",|"
+			}
+			return ""
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "GOPROXY") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("empty proxy list accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+// nativePip261 finds a python3 whose pip is the 26.2.1 PipInstallError
+// ports: another pip declares other options.
+func nativePip261(t *testing.T) string {
+	t.Helper()
+	return oracletest.Pip(t)
+}
+
+// nativeGit254 finds the git whose 2.54 the configuration port is of: another
+// release converts other variables.
+func nativeGit254(t *testing.T) string {
+	t.Helper()
+	return oracletest.Git(t)
+}
+
+// TestPipInstallOptionsMatchNativePip compares the option table
+// PipInstallError converts by with the parser pip install builds.
+func TestPipInstallOptionsMatchNativePip(t *testing.T) {
+	python := nativePip261(t)
+	const dump = `
+from pip._internal.commands import create_command
+from pip._internal.cli.main_parser import create_main_parser
+general = {l for o in create_main_parser().option_list_all for l in o._long_opts}
+for o in create_command("install").parser.option_list_all:
+    for l in o._long_opts:
+        print(l[2:], o.action, o.type or "-", o.callback.__name__ if o.callback else "-", ",".join(o.choices or ()) or "-", int(l in general))
+`
+	cmd := exec.Command(python, "-I", "-c", dump)
+	cmd.Dir = t.TempDir()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("native pip: %v", err)
+	}
+	kind := func(action, typ, callback string) (pipKind, bool) {
+		switch {
+		case action == "store_true" || action == "store_false":
+			return pipBool, true
+		case action == "count":
+			return pipCount, true
+		case action == "callback":
+			k, ok := map[string]pipKind{
+				"_handle_no_cache_dir": pipNoCacheDir, "_handle_python_version": pipPythonVersion, "_handle_src": pipText,
+				"_handle_config_settings": pipConfigSettings, "_handle_dependency_group": pipGroup,
+				"_handle_all_releases": pipNoDash, "_handle_only_final": pipNoDash, "_handle_no_binary": pipNoDash,
+				"_handle_only_binary": pipNoDash, "_handle_refresh_package": pipNoDash, "_handle_uploaded_prior_to": pipUploadedPriorTo,
+			}[callback]
+			return k, ok && (typ == "string" || typ == "path" || typ == "-")
+		case action != "store" && action != "append" && action != "help":
+			return 0, false
+		}
+		k, ok := map[string]pipKind{"string": pipText, "path": pipText, "-": pipText, "int": pipInt, "float": pipFloat, "choice": pipChoice}[typ]
+		return k, ok
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != len(pipInstallOpts) {
+		t.Fatalf("native pip install declares %d long options, the table %d", len(lines), len(pipInstallOpts))
+	}
+	for i, l := range lines {
+		f := strings.Fields(l)
+		k, ok := kind(f[1], f[2], f[3])
+		if !ok {
+			t.Errorf("native option %q converts in a way the port does not model", l)
+			continue
+		}
+		want := pipOpt{name: f[0], kind: k, list: f[1] == "append", general: f[5] == "1"}
+		if f[4] != "-" {
+			want.choices = strings.Split(f[4], ",")
+		}
+		if got := pipInstallOpts[i]; got.name != want.name || got.kind != want.kind || got.list != want.list || got.general != want.general || !slices.Equal(got.choices, want.choices) {
+			t.Errorf("option %d: table has %+v, native pip %+v", i, got, want)
+		}
+	}
+}
+
+// TestPipInstallErrorMatchesNativePip compares PipInstallError with whether
+// pip install gets past its option conversion: an offline install of a
+// package that does not exist reaches "No matching distribution" only when
+// the configuration converts. The cases cover each conversion, the order of
+// the three groups, a later file replacing an earlier one's value, and the
+// empty value that is no setting.
+func TestPipInstallErrorMatchesNativePip(t *testing.T) {
+	python := nativePip261(t)
+	type tc struct {
+		legacy, user string
+		env          []string
+	}
+	global := func(lines ...string) tc { return tc{user: "[global]\n" + strings.Join(lines, "\n") + "\n"} }
+	cases := []tc{
+		global("timeout = abc"),
+		global("timeout = 5"),
+		global("timeout = 1_0.5e1_0"),
+		global("timeout = 1__0"),
+		global("timeout = 1_"),
+		global("timeout = 1e"),
+		global("timeout = .5"),
+		global("timeout = 5."),
+		global("timeout = ."),
+		global("timeout = +inf"),
+		global("timeout = -1"),
+		global("timeout = 0"),
+		global("timeout = -0.0"),
+		global("timeout = nan"),
+		global("timeout = 0.001"),
+		global("timeout = -NaN"),
+		global("timeout = Infinity"),
+		global("timeout = 0x10"),
+		global("timeout = 1e999"),
+		global("timeout = ٣٫٥"),
+		global("timeout = ٣"),
+		global("default_timeout = abc"),
+		global("--Timeout: abc"),
+		global("retries = 5"),
+		global("retries = 08"),
+		global("retries = 017"),
+		global("retries = 0o17"),
+		global("retries = 0x1F"),
+		global("retries = 0x_1f"),
+		global("retries = 0x"),
+		global("retries = 0b"),
+		global("retries = 0b101"),
+		global("retries = 0b2"),
+		global("retries = 0B-1"),
+		global("retries = 1_000"),
+		global("retries = 1__0"),
+		global("retries = -3"),
+		global("retries = +3"),
+		global("retries = 3.0"),
+		global("retries = ٣"),
+		global("retries = 0٣"),
+		global("retries = 0٩"),
+		global("retries = " + strings.Repeat("9", 4300)),
+		global("retries = " + strings.Repeat("9", 4301)),
+		global("resume-retries = x"),
+		global("no-input = maybe"),
+		global("no-input = ON"),
+		global("no-input = t"),
+		global("version = abc"),
+		global("help = abc"),
+		global("verbose = 2"),
+		global("verbose = yes"),
+		global("verbose = -1"),
+		global("verbose = -0"),
+		global("verbose = 1.5"),
+		global("quiet = 0x1"),
+		global("keyring-provider = nope"),
+		global("keyring-provider = disabled"),
+		global("exists-action = s w"),
+		global("exists-action = s\n  w"),
+		global("exists-action = s q"),
+		global("use-feature = truststore fast-deps"),
+		global("use-feature = truststore nope"),
+		global("use-deprecated = legacy-certs"),
+		global("no-cache-dir = false"),
+		global("no-cache-dir = perhaps"),
+		global("progress-bar = loud"),
+		global("progress-bar = raw"),
+		global("upgrade-strategy = sometimes"),
+		global("root-user-action = shrug"),
+		global("python-version = 3.12"),
+		global("python-version = 312"),
+		global("python-version = 3.12.1.0"),
+		global("python-version = 3.x"),
+		global("python-version = 3."),
+		global("python-version = 3. 1_2"),
+		global("config-settings = novalue"),
+		global("config-settings = key=value"),
+		global("group = dev"),
+		global("group = other.toml:dev"),
+		global("group = sub/pyproject.toml/.:dev"),
+		global("no-binary = -x"),
+		global("no-binary = :all:"),
+		global("only-binary = -x"),
+		global("all-releases = -x"),
+		global("only-final = -x"),
+		global("refresh-package = -x"),
+		global("uploaded-prior-to = P3D"),
+		global("uploaded-prior-to = 2026-01-01"),
+		global("uploaded-prior-to = 2026-01-01T00:00:00Z"),
+		global("uploaded-prior-to = 2026-01-01T00:00:00+02:00"),
+		global("no-such-option = abc", "timeout_ = abc"),
+		global("upgrade = maybe"),
+		global("upgrade = yes", "pre = n", "compile = 0", "no-compile = F"),
+		global("cert = /nowhere.pem", "index-url = not a url", "proxy = ::", "trusted-host = a b", "find-links = /a\n  /b", "target = x", "src = y"),
+		{user: "[global]\ntimeout = abc\n[install]\ntimeout = 5\n"},
+		{user: "[global]\ntimeout = 5\n[install]\ntimeout = abc\n"},
+		{user: "[install]\nupgrade = maybe\n"},
+		{user: "[download]\ntimeout = abc\n[freeze]\nupgrade = maybe\n"},
+		{user: "[DEFAULT]\ntimeout = abc\n[global]\nretries = 1\n"},
+		{user: "[DEFAULT]\ntimeout = abc\n[global]\ntimeout = 1\n"},
+		{user: "[DEFAULT]\ntimeout = abc\n[download]\nretries = 1\n"},
+		{user: "[global]\ntimeout = abc\n--timeout = 1\n"},
+		{user: "[global]\n--timeout = 1\ntimeout = abc\n"},
+		{user: "[global.x]\ntimeout = abc\n"},
+		{user: "[global]\ntimeout =\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[global]\ntimeout = 5\n"},
+		{legacy: "[global]\ntimeout = 5\n", user: "[global]\ntimeout = abc\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[global]\ntimeout =\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[install]\ntimeout = 5\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[global]\nretries = 2\n"},
+		{env: []string{"PIP_TIMEOUT=abc"}},
+		{env: []string{"PIP_TIMEOUT=5"}},
+		{env: []string{"PIP_TIMEOUT= 5 "}},
+		{env: []string{"PIP_DEFAULT_TIMEOUT=abc"}},
+		{env: []string{"PIP_RETRIES= 0x10"}},
+		{env: []string{"PIP_NO_CACHE_DIR=perhaps"}},
+		{env: []string{"PIP_NO_INPUT=maybe"}},
+		{env: []string{"PIP_VERSION=abc", "PIP_HELP=abc"}},
+		{env: []string{"PIP_UPGRADE_STRATEGY=sometimes"}},
+		{user: "[global]\ntimeout = abc\n", env: []string{"PIP_TIMEOUT=5"}},
+		{user: "[global]\ntimeout = 5\n", env: []string{"PIP_TIMEOUT=abc"}},
+	}
+	// pip is started once per case, several at a time.
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, c := range cases {
+		home, cwd := t.TempDir(), t.TempDir()
+		var layers []PipLayer
+		for _, f := range []struct{ rel, body string }{{".pip/pip.conf", c.legacy}, {".config/pip/pip.conf", c.user}} {
+			if f.body == "" {
+				continue
+			}
+			path := filepath.Join(home, f.rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(f.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := PipLoadError([]byte(f.body)); err != nil {
+				t.Fatalf("case %+v does not load: %v", c, err)
+			}
+			layers = append(layers, PipLayer{File: path, Data: []byte(f.body)})
+		}
+		if err := os.WriteFile(filepath.Join(cwd, "pyproject.toml"), []byte("[dependency-groups]\ndev = []\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			// --no-deps and --target satisfy the checks pip install runs on
+			// its merged options after converting them, which argv can
+			// always complete and the configuration alone does not fail.
+			cmd := exec.Command(python, "-m", "pip", "install", "--dry-run", "--no-index", "--no-deps", "--target", filepath.Join(home, "target"), "bodega-audit-does-not-exist")
+			cmd.Dir = cwd
+			cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "XDG_CONFIG_HOME=" + filepath.Join(home, ".config"), "XDG_CONFIG_DIRS=" + filepath.Join(home, "none"), "PIP_DISABLE_PIP_VERSION_CHECK=1"}, c.env...)
+			out, _ := cmd.CombinedOutput()
+			// A group path that passes its conversion is opened afterwards.
+			native := strings.Contains(string(out), "No matching distribution found") || strings.Contains(string(out), "Cannot resolve '--group' option")
+			env := map[string]string{}
+			for _, kv := range c.env {
+				k, v, _ := strings.Cut(kv, "=")
+				env[k] = v
+			}
+			err := PipInstallError(layers, func(k string) string { return env[k] })
+			if (err == nil) != native {
+				t.Errorf("%+v\n PipInstallError = %v\n native pip starts = %v: %s", c, err, native, strings.TrimSpace(string(out)))
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestPipInstallErrorRefusesWhatItDoesNotInterpret covers the two settings
+// PipInstallError refuses without judging, and that an error names its
+// source.
+func TestPipInstallErrorRefusesWhatItDoesNotInterpret(t *testing.T) {
+	for body, want := range map[string]string{
+		"[global]\npython = /opt/other/bin/python\n":                "python",
+		"[global]\nuploaded-prior-to = 2026-W01\n":                  "uploaded-prior-to",
+		"[global]\nuploaded-prior-to = P999999999D\n":               "uploaded-prior-to",
+		"[global]\nretries = 2\n\n[install]\nDefault_Timeout = x\n": "default_timeout under [install], pip.conf line 5",
+	} {
+		if err := PipInstallError([]PipLayer{{File: "pip.conf", Data: []byte(body)}}, nil); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("PipInstallError(%q) = %v; want a refusal naming %s", body, err, want)
+		}
+	}
+	env := func(k string) string { return map[string]string{"PIP_PYTHON": "/opt/other/bin/python"}[k] }
+	if err := PipInstallError(nil, env); err == nil || !strings.Contains(err.Error(), "PIP_PYTHON") {
+		t.Errorf("PIP_PYTHON = %v; want a refusal naming it", err)
+	}
+	if err := PipInstallError([]PipLayer{{File: "pip.conf", Data: []byte("[global]\nindex-url = https://x/simple/\ncert = /a.pem\ntimeout = 15\n")}}, nil); err != nil {
+		t.Errorf("valid configuration refused: %v", err)
+	}
+}
+
+// TestGitConvertErrorMatchesNativeGit compares GitConvertError with whether
+// git-remote-https, the process that reads http.sslCAInfo and connects, gets
+// past its configuration: started on a URL nothing listens at with no
+// command on stdin, it exits 128 with "fatal:" when a variable does not
+// convert and 1 when all of them do. Every variable of http_options and
+// git_default_config is given every value below, alone and under an
+// [http "<url>"] section matching the remote, beside names the port leaves
+// alone. TestGitOperationVarsMatchNativeGit holds the variables git fetch and
+// git clone convert themselves against those commands.
+func TestGitConvertErrorMatchesNativeGit(t *testing.T) {
+	git := nativeGit254(t)
+	const remote = "https://127.0.0.1:1/"
+	const novalue = "\x00"
+	common := []string{"maybe", "true", "ON", "1", "abc", "auto", "", novalue}
+	numbers := []string{"-1", "-2", "3", "9", "10", "1k", "2G", "4g", "0x10", "08", " 7", "99999999999",
+		"9223372036854775807", "9223372036854775808", "18446744073709551615", "18446744073709551616", "8589934591g"}
+	words := []string{"AUTO", "input", "warn", "initial", "always", "never", "simple", "inherit", "none", "default", "Minimal",
+		"rename", "link", "nothing", "tracking", "local", "commit", "a\\nb", "~/x", ":(optional)~/x", "10"}
+	type entry struct {
+		section, name string
+		conv          gitConv
+	}
+	var entries []entry
+	for name, v := range gitHTTPVars {
+		// The backend is refused as not interpreted, which is no claim
+		// about git.
+		if v.conv != gitBackend {
+			entries = append(entries, entry{"[http]", name, v.conv}, entry{`[http "` + remote + `"]`, name, v.conv})
+		}
+	}
+	for key, v := range gitDefaultVars {
+		if v.conv != gitColor {
+			section, name, _ := strings.Cut(key, ".")
+			entries = append(entries, entry{"[" + section + "]", name, v.conv})
+		}
+	}
+	entries = append(entries, []entry{
+		{section: "[advice]", name: "detachedHead"}, {section: "[advice]", name: "statushints"}, {section: "[advice]", name: "noSuchAdvice"},
+		{section: `[advice "x"]`, name: "detachedhead"}, {section: "[http]", name: "nosuchkey"}, {section: `[http "` + remote + `"]`, name: "nosuchkey"},
+		{section: "[core]", name: "eol"}, {section: "[color]", name: "ui"}, {section: "[alias]", name: "co"}, {section: "[CORE]", name: "FileMode"},
+	}...)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	home := t.TempDir()
+	for i, e := range entries {
+		values := slices.Clone(common)
+		switch e.conv {
+		case gitInt, gitSsize, gitUlong, gitLevel, gitAbbrev, gitBool:
+			values = append(values, numbers...)
+		default:
+			values = append(values, words...)
+		}
+		for j, v := range values {
+			// git converts these two and then acts on them: it parses a
+			// proxy as a URL once a request needs one, and asks for a
+			// username under proactive authentication.
+			if e.name == "proxy" && strings.ContainsAny(v, `/\`) || e.name == "proactiveauth" && v == "auto" {
+				continue
+			}
+			body := e.section + "\n\t" + e.name + " = \"" + v + "\"\n"
+			if v == novalue {
+				body = e.section + "\n\t" + e.name + "\n"
+			}
+			file := filepath.Join(home, strconv.Itoa(i)+"-"+strconv.Itoa(j))
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				cmd := exec.Command(git, "remote-https", "origin", remote+"x.git")
+				cmd.Dir = home
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + file, "LC_ALL=C"}
+				out, _ := cmd.CombinedOutput()
+				native := strings.Contains(string(out), "fatal:")
+				cfg := ParseGitConfig([]byte(body))
+				if cfg.BadLine != 0 {
+					t.Errorf("%q does not parse", body)
+					return
+				}
+				if _, msg := GitConvertError(cfg); (msg != "") != native {
+					t.Errorf("%q\n GitConvertError = %q\n native git: %s", body, msg, strings.TrimSpace(string(out)))
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// TestGitConvertErrorRefusals covers what GitConvertError refuses beyond
+// git's own verdict, each in the direction of refusing: an http variable
+// under a URL the remote may not match, a color and another account's home.
+// It also pins the line and message GitLoadError carries.
+func TestGitConvertErrorRefusals(t *testing.T) {
+	for body, want := range map[string]string{ //nolint:gosec // G101: names of git's credential section, no credential
+		"[http \"https://other.example/\"]\n\tsslVerify = maybe\n": "bad boolean config value 'maybe' for 'http.sslverify'",
+		"[color \"advice\"]\n\thint = red\n":                       "color.advice.hint",
+		"[http]\n\tsslCAInfo = ~bob/ca.pem\n":                      "the account bob",
+		"[user]\n\tname = x\n[http]\n\tpostBuffer = 1x\n":          "bad numeric config value '1x' for 'http.postbuffer': invalid unit",
+		// A name in a section git fetch and git clone read that the port
+		// holds no conversion for, which git itself ignores.
+		"[core]\n\tnosuchkey = 1\n":                  "'core.nosuchkey' is in a section git fetch and git clone read",
+		"[core \"x\"]\n\tfilemode = true\n":          "'core.x.filemode' is in a section",
+		"[user \"x\"]\n\tname = y\n":                 "'user.x.name' is in a section",
+		"[fetch]\n\tprunee = true\n":                 "'fetch.prunee' is in a section",
+		"[remote \"origin\"]\n\turl = https://x/y\n": "git clone then fetches from what this file names",
+		"[remote \"up\"]\n\tfetch = main\n":          "is a refspec git dies on when it is malformed",
+		"[hook \"x\"]\n\tevent = post-checkout\n":    "has git run a configured command",
+		"[clone]\n\tdefaultRemoteName = a/b\n":       "is a remote name git clone checks",
+		"[core]\n\tsharedRepository = 0640\n":        "is the file mode 0640",
+		"[credential]\n\tuseHttpPath = maybe\n":      "bad boolean config value 'maybe' for 'credential.usehttppath'",
+		"[credential]\n\thelper\n":                   "missing value for 'credential.helper'",
+		"[submodule \"a\"]\n\tactive = maybe\n":      "bad boolean config value 'maybe' for 'submodule.a.active'",
+		"[filter \"lfs\"]\n\trequired = maybe\n":     "bad boolean config value 'maybe' for 'filter.lfs.required'",
+		"[protocol \"https\"]\n\tallow = never\n":    "transport 'https' not allowed",
+	} {
+		if _, msg := GitConvertError(ParseGitConfig([]byte(body))); !strings.Contains(msg, want) {
+			t.Errorf("GitConvertError(%q) = %q; want %q", body, msg, want)
+		}
+	}
+	file := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(file, []byte("[user]\n\tname = x\n[core]\n\tcompression = fast\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := GitLoadError([]string{file}); !strings.Contains(got, file+" (line 4: bad numeric config value 'fast' for 'core.compression': invalid unit") {
+		t.Errorf("GitLoadError = %q", got)
+	}
+	ok := "[user]\n\tname = x\n\temail = x@example.com\n\tsigningkey = ABCD\n[core]\n\tautocrlf = input\n\tcompression = 9\n\tpager = less\n\tfsmonitor = true\n[http]\n\tsslVerify = true\n\tpostBuffer = 512m\n\tsslCAInfo = ~/ca.pem\n[http \"https://bodega.example.com/\"]\n\tsslCAInfo = /etc/ca.pem\n[fetch]\n\tprune = true\n" +
+		"[alias]\n\tco = checkout\n[pull]\n\trebase = maybe\n[lfs]\n\tanything = 1\n[credential]\n\thelper = osxkeychain\n\tcredentialStore = cache\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n" +
+		"[init]\n\tdefaultBranch = main\n[push]\n\tautoSetupRemote = true\n[branch]\n\tsort = -committerdate\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n\trebase = true\n" +
+		"[remote \"up\"]\n\turl = https://example.com/x.git\n\tfetch = +refs/heads/*:refs/remotes/up/*\n\tfetch = +refs/pull/*/head:refs/remotes/up/pr/*\n[url \"https://bodega.example.com/git/gh/\"]\n\tinsteadOf = https://github.com/\n" +
+		"[maintenance]\n\trepo = /src/x\n\tstrategy = incremental\n[gc]\n\tauto = 0\n[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n" +
+		"[fetch \"fsck\"]\n\tzeroPaddedFilemode = ignore\n\tnoSuchId = whatever\n[protocol]\n\tversion = 2\n[submodule]\n\trecurse = true\n\tfetchJobs = 4\n[advice]\n\tdetachedHead = false\n\tnoSuchAdvice = maybe\n"
+	if line, msg := GitConvertError(ParseGitConfig([]byte(ok))); msg != "" {
+		t.Errorf("valid configuration refused at line %d: %s", line, msg)
+	}
+}
+
+// TestGitOperationVarsMatchNativeGit compares the conversions gitOpVars holds
+// with git fetch and git clone themselves: each variable the table converts
+// is given each value below in the global configuration, and both commands
+// are run over https against a port nothing listens at, where a command that
+// got past its configuration ends "unable to access", and over file:// from a
+// repository holding one commit, where it exits 0. The port must refuse the
+// value exactly when one of the four runs stops. The serving side of the
+// file:// runs reads no configuration, so only the client's conversions are
+// held to it.
+//
+// Not held to it: a refusal that is doctor's own (a value it does not
+// interpret), and a conversion git runs only in a state these runs do not
+// reach (gitVar.later, and the one value named below).
+func TestGitOperationVarsMatchNativeGit(t *testing.T) {
+	git := nativeGit254(t)
+	home := t.TempDir()
+	env := func(global string) []string {
+		return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + global, "LC_ALL=C", "GIT_TERMINAL_PROMPT=0"}
+	}
+	// A run that outlives its limit is a value that has git start something
+	// which keeps the output open, and is reported in place of hanging the
+	// package's tests.
+	run := func(global string, args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, git, args...)
+		cmd.Dir = home
+		cmd.Env = env(global)
+		cmd.WaitDelay = time.Second
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil {
+			t.Errorf("git %v under %s did not exit within a minute", args, global)
+		}
+		return string(out), err
+	}
+	must := func(args ...string) {
+		t.Helper()
+		if out, err := run(os.DevNull, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	seed, empty := filepath.Join(home, "seed"), filepath.Join(home, "empty")
+	must("init", "--quiet", "-b", "main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "f.txt"), []byte("x\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	must("-C", seed, "add", ".")
+	must("-C", seed, "-c", "user.name=a", "-c", "user.email=a@example.com", "commit", "--quiet", "-m", "c")
+	must("init", "--quiet", empty)
+	const remote = "https://127.0.0.1:1/x.git"
+	serve := "--upload-pack=GIT_CONFIG_GLOBAL=" + os.DevNull + " '" + git + "' upload-pack"
+	// stops reports whether git fetch or git clone stops under the global
+	// configuration file, and what the run that stopped printed.
+	stops := func(global, scratch string) (bool, string) {
+		if out, _ := run(global, "-C", empty, "fetch", remote); !strings.Contains(out, "unable to access") {
+			return true, out
+		}
+		if out, _ := run(global, "clone", remote, filepath.Join(scratch, "c1")); !strings.Contains(out, "unable to access") {
+			return true, out
+		}
+		if out, err := run(global, "clone", serve, "file://"+seed, filepath.Join(scratch, "c2")); err != nil {
+			return true, out
+		}
+		fresh := filepath.Join(scratch, "f")
+		if out, err := run(os.DevNull, "init", "--quiet", fresh); err != nil {
+			return true, "init: " + out
+		}
+		if out, err := run(global, "-C", fresh, "fetch", serve, "file://"+seed); err != nil {
+			return true, out
+		}
+		return false, ""
+	}
+	const novalue = "\x00"
+	values := func(v gitVar) []string {
+		switch v.conv {
+		case gitBool:
+			return []string{"maybe", "true", "no", "1k", "99999999999", "", novalue}
+		case gitInt, gitUlong:
+			return []string{"maybe", "true", "1", "2", "3", "-1", "0", "1k", "99999999999", "", novalue}
+		case gitString, gitAny:
+			return []string{"maybe", "", novalue}
+		case gitPath:
+			return []string{"~nosuchuser-bodega/x", "/nonexistent/x", novalue}
+		}
+		return append([]string{"maybe", "true", "1", "always", "ALWAYS", "never", "user", "auto", "error", "warn", "ignore", "", novalue}, v.words...)
+	}
+	// later holds the one value-dependent refusal git reaches only in a state
+	// these runs do not: fsck_set_msg_type refuses to demote a fatal message
+	// once fsckObjects has index-pack check the pack, and not before.
+	later := func(key, value string) bool {
+		return key == "fetch.fsck.nulinheader" && (value == "warn" || value == "ignore")
+	}
+	keys := []string{"fetch.fsck.baddate", "fetch.fsck.nulinheader", "fetch.fsck.nosuchid", "fetch.fsck.skiplist", "protocol.https.allow", "core.pager", "init.defaultbranch", "gc.auto"}
+	for key, v := range gitOpVars {
+		if v.conv != gitAny && !v.later {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for i, key := range keys {
+		parts := strings.Split(key, ".")
+		header, name := "["+parts[0]+"]", parts[len(parts)-1]
+		if len(parts) == 3 {
+			sub := parts[1]
+			if sub == "*" {
+				sub = "other"
+			}
+			header = "[" + parts[0] + " \"" + sub + "\"]"
+		}
+		probe := ParseGitConfig([]byte(header + "\n\t" + name + " = x\n"))
+		_, v, ok, known := probe.Entries[0].lookup()
+		if !ok || !known {
+			t.Errorf("%s: the table has no conversion for its own key", key)
+			continue
+		}
+		for j, value := range values(v) {
+			if later(key, value) {
+				continue
+			}
+			body := header + "\n\t" + name + " = \"" + value + "\"\n"
+			if value == novalue {
+				body = header + "\n\t" + name + "\n"
+			}
+			cfg := ParseGitConfig([]byte(body))
+			if cfg.BadLine != 0 {
+				t.Errorf("%q does not parse", body)
+				continue
+			}
+			e := cfg.Entries[0]
+			full, _, _, _ := e.lookup()
+			msg, own := v.refuses(full, e.Value, e.HasValue)
+			if own {
+				continue
+			}
+			scratch := filepath.Join(home, strconv.Itoa(i)+"-"+strconv.Itoa(j))
+			if err := os.MkdirAll(scratch, 0700); err != nil {
+				t.Fatal(err)
+			}
+			global := filepath.Join(scratch, "gitconfig")
+			if err := os.WriteFile(global, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				if native, out := stops(global, scratch); native != (msg != "") {
+					t.Errorf("%q\n the port: %q\n native git stops = %v: %s", body, msg, native, strings.TrimSpace(out))
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// nativeNpm1120 finds the npm 11.20.0 the type port is of.
+func nativeNpm1120(t *testing.T) string {
+	t.Helper()
+	return oracletest.Npm(t)
+}
+
+// runNpmView runs npm view against a registry nothing listens at, with file
+// as the user's npmrc and env added to an otherwise empty environment, and
+// returns what it printed. The command line sets the log level and the
+// registry, which outrank the file and the environment without stopping npm
+// validating either.
+func runNpmView(t *testing.T, npm, file string, env []string) string {
+	t.Helper()
+	home := t.TempDir()
+	cmd := exec.Command(npm, "view", "left-pad", "version", "--registry=https://127.0.0.1:1/", "--loglevel=warn", "--fetch-retries=0", "--cache="+filepath.Join(home, "cache"), "--prefix="+filepath.Join(home, "prefix"))
+	cmd.Dir = home
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NPM_CONFIG_USERCONFIG=" + file, "NPM_CONFIG_GLOBALCONFIG=" + filepath.Join(home, "none"), "NPM_CONFIG_UPDATE_NOTIFIER=false"}, env...)
+	out, _ := cmd.CombinedOutput()
+	return string(out)
+}
+
+// TestNpmTypesMatchNativeNpm compares the type port with the options npm
+// itself warns "invalid config" about, for every typed option holding each
+// value below, from an npmrc and from the environment. Where the port says
+// it cannot tell, npm's answer is not held against it.
+func TestNpmTypesMatchNativeNpm(t *testing.T) {
+	npm := nativeNpm1120(t)
+	warned := regexp.MustCompile(`(?m)^npm warn invalid config ([^=\s]+)=`)
+	var keys []string
+	for key := range npmTypes {
+		// These two move the files npm reads, which the runner pins.
+		if key != "userconfig" && key != "globalconfig" {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	const bare = "\x00"
+	values := []string{"abc", "true", "false", "null", "undefined", "", " ", "0", "5", "1e3", "0x10", "0o7", "0b1", "1_000", "Infinity", "-.5", "5.", "+5", "0x", "1e",
+		"dev", "none", "warn", "1", "4", "public", "all", "022", "0o22", "18", "999", "511", "512", "00", "0777", "01000", "http://h/", "socks5://h:1", "localhost:8080", "/abs", "rel", "1.2.3", "legacy", bare}
+	// A path or list option holding true, false or null stops npm with no
+	// output at all, which would hide every other option's warning, so each
+	// of those runs alone, on the values that tell its type apart, and
+	// counts as refused when npm never reaches the request.
+	var batch, solo []string
+	for _, key := range keys {
+		if npmTypes[key].kind == npmPath || npmTypes[key].list {
+			solo = append(solo, key)
+		} else {
+			batch = append(batch, key)
+		}
+	}
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	run := func(keys []string, v string, fromEnv bool) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			file := filepath.Join(t.TempDir(), "npmrc")
+			var body strings.Builder
+			var env []string
+			for _, key := range keys {
+				switch {
+				case fromEnv:
+					env = append(env, "npm_config_"+strings.ReplaceAll(key, "-", "_")+"="+v)
+				case v == bare:
+					body.WriteString(key + "\n")
+				default:
+					body.WriteString(key + "=" + v + "\n")
+				}
+			}
+			if err := os.WriteFile(file, []byte(body.String()), 0600); err != nil {
+				t.Error(err)
+				return
+			}
+			out := runNpmView(t, npm, file, env)
+			native := map[string]bool{}
+			for _, m := range warned.FindAllStringSubmatch(out, -1) {
+				native[m[1]] = true
+			}
+			for _, key := range keys {
+				val := jsValue{word: v, str: true}
+				if !fromEnv {
+					switch v {
+					case bare:
+						val = jsTrue
+					case "true", "false", "null":
+						val = jsValue{word: v}
+					}
+					// npm/ini trims a value before anything reads it.
+					val.word = jsTrim(val.word)
+				}
+				// npm/ini takes a dotted name set to null for a section.
+				if val == jsNull && strings.Contains(key, ".") {
+					continue
+				}
+				refused := native[key] || len(keys) == 1 && !strings.Contains(out, "ECONNREFUSED")
+				invalid, unread := npmTypes[key].check(val)
+				if !unread && invalid != refused {
+					t.Errorf("%s=%q (environment: %v): port says invalid=%v, native npm refused=%v: %s", key, v, fromEnv, invalid, refused, strings.TrimSpace(out))
+				}
+			}
+		}()
+	}
+	for _, fromEnv := range []bool{false, true} {
+		for _, v := range values {
+			if fromEnv && (v == bare || jsTrim(v) == "") {
+				continue
+			}
+			run(batch, v, fromEnv)
+		}
+		for _, key := range solo {
+			for _, v := range []string{"true", "false", "null", "undefined", "abc", "dev", "", bare} {
+				if fromEnv && (v == bare || v == "") {
+					continue
+				}
+				run([]string{key}, v, fromEnv)
+			}
+		}
+	}
+	wg.Wait()
+}
+
+// TestNpmStartErrorMatchesNativeNpm compares NpmStartError's reading of an
+// unscoped credential with whether npm exits on ERR_INVALID_AUTH, and pins
+// the phrases it carries for a type npm reports invalid.
+func TestNpmStartErrorMatchesNativeNpm(t *testing.T) {
+	npm := nativeNpm1120(t)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, key := range append(slices.Clone(npmUnscopedAuth), "//127.0.0.1:1/:_authToken", "email", "password", "_authTOKEN") {
+		for _, line := range []string{"=abc", "=", "=false", "=null", "=undefined", "=true", "", "[]=abc", "=0"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				file := filepath.Join(t.TempDir(), "npmrc")
+				if err := os.WriteFile(file, []byte("fetch-retries=1\n"+key+line+"\n"), 0600); err != nil {
+					t.Error(err)
+					return
+				}
+				native := strings.Contains(runNpmView(t, npm, file, nil), "ERR_INVALID_AUTH")
+				if got := NpmStartError(file); (got != "") != native {
+					t.Errorf("%s%s: NpmStartError = %q, native npm ERR_INVALID_AUTH = %v", key, line, got, native)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+func TestNpmStartErrorNamesTheLine(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "npmrc")
+	for body, want := range map[string]string{
+		"registry=https://r.example/\nfetch-timeout=abc\n":        "line 2 of " + file + ", which sets fetch-timeout to a value npm reports as invalid config",
+		"fetch-timeout=abc\nfetch-timeout=5\n_authToken=secret\n": "line 3 of " + file + ", which sets _authToken outside a registry's own //host/: scope",
+		"before=2026-01-01\n":     "sets before to a value npm validates in a way doctor does not interpret",
+		"fetch-retries[]=1\n":     "sets fetch-retries to a value npm validates in a way doctor does not interpret",
+		"maxsockets=${SOCKETS}\n": "sets maxsockets to a value npm validates in a way doctor does not interpret",
+		"loglevel=loud\n":         "sets loglevel to a value npm reports as invalid config",
+		"registry=https://r.example/\n//r.example/:_authToken=x\n":                                         "",
+		"fetch-timeout=abc\nfetch-timeout=5\nstrict-ssl=maybe\nomit=dev\n\n[section]\nfetch-retries=abc\n": "",
+	} {
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := NpmStartError(file); got != want && (want == "" || !strings.Contains(got, want)) {
+			t.Errorf("NpmStartError(%q) = %q; want %q", body, got, want)
+		}
+		if strings.Contains(NpmStartError(file), "secret") {
+			t.Errorf("NpmStartError(%q) echoes the credential", body)
+		}
+	}
+	env := func(k string) string { return map[string]string{"NPM_CONFIG_FETCH_TIMEOUT": "abc"}[k] }
+	if got := NpmEnvInvalid(env); !strings.Contains(got, "NPM_CONFIG_FETCH_TIMEOUT") {
+		t.Errorf("NpmEnvInvalid = %q", got)
+	}
+	if got := NpmEnvInvalid(func(k string) string {
+		return map[string]string{"npm_config_fetch_timeout": "5", "npm_config_proxy": "false"}[k]
+	}); got != "" {
+		t.Errorf("valid environment refused: %s", got)
+	}
+}
+
+// F116 R1: a CA plan is refused, before any change is planned, for a client
+// that stops on a configured value while it converts its options: the CA
+// would be installed for a client that never reaches the handshake.
+func TestOptionConversionFailureRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "git, a boolean git dies on", plan: Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			files: map[string]string{".gitconfig": "[http]\n\tsslVerify = maybe\n"}, names: "bad boolean config value 'maybe' for 'http.sslverify'"},
+		{name: "git, a compression level out of range", plan: Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			files: map[string]string{".gitconfig": "[core]\n\tcompression = 12\n"}, names: "bad zlib compression level 12"},
+		{name: "npm, a credential outside a registry's scope", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "_authToken=abc\n"}, names: "ERR_INVALID_AUTH"},
+		{name: "npm, a number npm reports invalid and keeps", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "fetch-timeout=abc\n"}, names: "fetch-timeout"},
+		{name: "npm, the same from the environment", plan: Npm(testBase, nil),
+			env: map[string]string{"NPM_CONFIG_MAXSOCKETS": "abc"}, names: "NPM_CONFIG_MAXSOCKETS"},
+		{name: "pip, a choice from the environment", plan: Pip(testBase),
+			env: map[string]string{"PIP_KEYRING_PROVIDER": "nope"}, names: "PIP_KEYRING_PROVIDER"},
+		{name: "pip, a boolean under [install]", plan: Pip(testBase),
+			files: map[string]string{".config/pip/pip.conf": "[install]\nupgrade = maybe\n"}, names: "upgrade under [install]"},
+		{name: "apt, an option its https method no longer supports", plan: apt,
+			files: map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::SslForceVersion \"TLSv1.2\";\n"}, names: "the option 'SslForceVersion' is not supported anymore"},
+		{name: "apt, a client certificate that is not there", plan: apt,
+			files: map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::bodega.example.com::SslCert \"/missing/client.pem\";\n"}, names: "Could not load client certificate"},
+		{name: "helm, a client certificate with no key", plan: Helm(testBase),
+			files: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: mine\n  url: " + testBase + "/helm/mine\n  certFile: /missing/client.pem\n"}, names: "unable to read cert file"},
+		{name: "containerd, a wrong type in the image plugin's table", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: map[string]string{"etc/containerd/config.toml": "version = 3\n[plugins.\"io.containerd.cri.v1.images\"]\n  max_concurrent_downloads = \"three\"\n  [plugins.\"io.containerd.cri.v1.images\".registry]\n    config_path = \"/etc/containerd/certs.d\"\n"}, names: "row 3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string { return tc.env[key] }}
+			clean := h
+			clean.Getenv = func(string) string { return "" }
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, clean); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			for name, body := range tc.files {
+				path := filepath.Join(home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
+			}
+		})
+	}
+}
+
+func TestAudit25GitFetchConversionRefusesCAPlan(t *testing.T) {
+	git := oracletest.Git(t)
+	home := t.TempDir()
+	target := filepath.Join(home, ".gitconfig")
+	bad := "[fetch]\n\tprune = maybe\n"
+	if err := os.WriteFile(target, []byte(bad), 0600); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(home, "repo")
+	init := exec.Command(git, "init", "--quiet", repo)
+	init.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + target}
+	if out, err := init.CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+	fetch := exec.Command(git, "-C", repo, "fetch", "https://127.0.0.1:1/audit.git")
+	fetch.Env = init.Env
+	out, err := fetch.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "bad boolean config value 'maybe' for 'fetch.prune'") {
+		t.Fatalf("native fetch: %v: %s", err, out)
+	}
+	t.Logf("native fetch: %s", out)
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}))
+	in, err := AddCA(plan, ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || !strings.Contains(err.Error(), "fetch.prune") || len(in.Changes) != 0 {
+		t.Errorf("native-invalid fetch accepted: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+func TestAudit25HelmMissingPairRefusesCAPlan(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, ".config/helm/repositories.yaml")
+	cert, key := filepath.Join(home, "missing.crt"), filepath.Join(home, "missing.key")
+	body := "repositories:\n- name: bodega\n  url: " + testBase + "/helm\n  certFile: " + cert + "\n  keyFile: " + key + "\n"
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+	if err == nil || !strings.Contains(err.Error(), "cert") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("unloadable Helm pair accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+func TestAudit25MissingPipOracleFailsInCI(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.v", "-test.run=^TestPipInstallOptionsMatchNativePip$")
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "BODEGA_ORACLES=") {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "BODEGA_ORACLES=required", "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("missing native pip oracle passed CI:\n%s", out)
+	}
+}
+
+func TestAudit25ContainerdV2ConversionRefusesCAPlan(t *testing.T) {
+	home := t.TempDir()
+	file := filepath.Join(home, "etc/containerd/config.toml")
+	body := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\nmax_concurrent_downloads = \"three\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || len(in.Changes) != 0 {
+		t.Errorf("unloadable version 2 CRI policy accepted: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+// TestContainerdCRITablesDecodeAsContainerdDoes pins what makes containerd
+// v2.2.0 serve no CRI pull for each config.toml format: a wrong type or a
+// refused value in the image, runtime or CRI plugin's table, read from the
+// one table versions 1 and 2 keep them in as its migration moves the keys.
+func TestContainerdCRITablesDecodeAsContainerdDoes(t *testing.T) {
+	const v2 = "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\n"
+	const v3 = "version = 3\n"
+	for name, tc := range map[string]struct{ body, invalid, err string }{
+		"v2 as kubeadm writes it": {body: v2 + "sandbox_image = \"registry.k8s.io/pause:3.10\"\nmax_concurrent_downloads = 3\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" +
+			"[plugins.\"io.containerd.grpc.v1.cri\".containerd]\nsnapshotter = \"overlayfs\"\ndefault_runtime_name = \"runc\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\nsandbox_mode = \"podsandbox\"\n" +
+			"[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]\nSystemdCgroup = true\n[plugins.\"io.containerd.grpc.v1.cri\".cni]\nbin_dir = \"/opt/cni/bin\"\n"},
+		"v1 as containerd 1.x wrote it": {body: "[plugins.cri]\nstream_server_port = \"0\"\n[plugins.cri.registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"},
+		"v1 image key":                  {body: "[plugins.cri]\nmax_concurrent_downloads = \"three\"\n", invalid: "what it migrates its version 1 CRI table into"},
+		"v2 image duration":             {body: v2 + "image_pull_progress_timeout = \"soon\"\n", invalid: "invalid image pull progress timeout"},
+		"v2 runtime key":                {body: v2 + "enable_selinux = \"yes\"\n", invalid: "CRI runtime plugin"},
+		"v2 server duration":            {body: v2 + "stream_idle_timeout = \"soon\"\n", invalid: "invalid stream idle timeout"},
+		"v2 moved key":                  {body: v2 + "sandbox_image = 5\n", invalid: "what it migrates its version 2 CRI table into"},
+		"v2 containerd not a table":     {body: v2 + "containerd = \"runc\"\n", invalid: "what it migrates"},
+		"v2 default runtime undefined":  {body: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n", invalid: "no corresponding runtime configured"},
+		"v2 default runtime defined":    {body: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.kata]\nruntime_type = \"io.containerd.kata.v2\"\n"},
+		"v2 default runtime, imports":   {body: "imports = [\"/etc/containerd/conf.d/*.toml\"]\n" + v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n"},
+		"v2 beside a v3 table":          {body: v2 + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/x\"\n", invalid: "does not follow that merge"},
+		"v1 beside the long name":       {body: "[plugins.cri]\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/x\"\n", invalid: "does not follow that merge"},
+		"v3 runtime key":                {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\"]\nmax_container_log_line_size = \"big\"\n", invalid: "CRI runtime plugin"},
+		"v3 runtime io_type":            {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\nio_type = \"pipe\"\n", invalid: "`io_type` can only be"},
+		"v3 cgroup_writable":            {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\ncgroup_writable = true\n", invalid: "doctor does not interpret"},
+		"v3 server key":                 {body: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\ndisable_tcp_service = \"no\"\n", invalid: "CRI plugin"},
+		"v3 stream key without TLS":     {body: v3 + "[plugins.\"io.containerd.grpc.v1.cri\".x509_key_pair_streaming]\ntls_cert_file = \"/c.pem\"\n", invalid: "EnableTLSStreaming is not set"},
+		"v3 legacy keys are unknown":    {body: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nsandbox_image = 5\nmax_concurrent_downloads = \"three\"\n"},
+		"v3 as containerd 2.x writes":   {body: v3 + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc.options]\nSystemdCgroup = true\n"},
+	} {
+		r, err := ReadContainerdConfig([]byte(tc.body))
+		switch {
+		case tc.err != "":
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("%s: err = %v; want one naming %q", name, err, tc.err)
+			}
+		case err != nil:
+			t.Errorf("%s: %v", name, err)
+		case tc.invalid == "" && r.Invalid != "":
+			t.Errorf("%s: refused a configuration containerd starts its CRI plugins on: %s", name, r.Invalid)
+		case !strings.Contains(r.Invalid, tc.invalid):
+			t.Errorf("%s: Invalid = %q; want %q", name, r.Invalid, tc.invalid)
+		}
+	}
+}
+
+// TestPipIndexPolicyFollowsPipOrder pins which no-index pip install runs
+// with, by pip's own order of [global], [install] and the environment, and
+// that the pypi-url alias is reported wherever it is set.
+func TestPipIndexPolicyFollowsPipOrder(t *testing.T) {
+	layer := func(body string) []PipLayer { return []PipLayer{{File: "pip.conf", Data: []byte(body)}} }
+	env := func(kv ...string) func(string) string {
+		return func(key string) string {
+			for i := 0; i < len(kv); i += 2 {
+				if kv[i] == key {
+					return kv[i+1]
+				}
+			}
+			return ""
+		}
+	}
+	for name, tc := range map[string]struct {
+		body   string
+		getenv func(string) string
+		want   string
+	}{
+		"unset":                        {body: "[global]\nindex-url = https://x/simple/\n"},
+		"global":                       {body: "[global]\nno-index = true\n", want: "[global]"},
+		"global spelled as pip folds":  {body: "[global]\n--No_Index = YES\n", want: "[global]"},
+		"install replaces global":      {body: "[global]\nno-index = true\n[install]\nno-index = false\n"},
+		"install sets it":              {body: "[global]\nno-index = 0\n[install]\nno-index = on\n", want: "[install]"},
+		"another command's section":    {body: "[download]\nno-index = true\n"},
+		"environment replaces a file":  {body: "[install]\nno-index = true\n", getenv: env("PIP_NO_INDEX", "0")},
+		"environment sets it":          {body: "[global]\nno-index = false\n", getenv: env("PIP_NO_INDEX", "1"), want: "PIP_NO_INDEX"},
+		"an empty variable is not set": {body: "[global]\nno-index = true\n", getenv: env("PIP_NO_INDEX", ""), want: "[global]"},
+	} {
+		if got := PipNoIndex(layer(tc.body), tc.getenv); (got == "") != (tc.want == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: PipNoIndex = %q; want one naming %q", name, got, tc.want)
+		}
+	}
+	later := []PipLayer{{File: "a.conf", Data: []byte("[global]\nno-index = true\n")}, {File: "b.conf", Data: []byte("[global]\nno-index = false\n")}}
+	if got := PipNoIndex(later, nil); got != "" {
+		t.Errorf("a later file's value did not replace an earlier one's: %q", got)
+	}
+	for name, tc := range map[string]struct {
+		body   string
+		getenv func(string) string
+		want   string
+	}{
+		"unset":       {body: "[global]\nindex-url = https://x/simple/\n"},
+		"global":      {body: "[global]\npypi-url = https://x/simple/\n", want: "[global]"},
+		"install":     {body: "[install]\nPyPI_URL = https://x/simple/\n", want: "[install]"},
+		"environment": {body: "", getenv: env("PIP_PYPI_URL", "https://x/simple/"), want: "PIP_PYPI_URL"},
+	} {
+		if got := PipIndexAlias(layer(tc.body), tc.getenv); (got == "") != (tc.want == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: PipIndexAlias = %q; want one naming %q", name, got, tc.want)
+		}
+	}
+}
+
+// TestPipIndexPolicyMatchesNativePip holds PipNoIndex and PipIndexAlias
+// against pip install's own choice of indexes: pip download prints "Looking
+// in indexes" with each index it is about to ask and nothing of the kind
+// under no-index, and an index set through pypi-url is one it names there.
+func TestPipIndexPolicyMatchesNativePip(t *testing.T) {
+	python := nativePip261(t)
+	const index, alias = "http://127.0.0.1:9/index/", "http://127.0.0.1:9/alias/"
+	for name, tc := range map[string]struct {
+		body string
+		env  []string
+	}{
+		"plain":               {body: "[global]\nindex-url = " + index + "\n"},
+		"global no-index":     {body: "[global]\nindex-url = " + index + "\nno-index = true\n"},
+		"install overrides":   {body: "[global]\nindex-url = " + index + "\nno-index = true\n[install]\nno-index = false\n"},
+		"environment sets":    {body: "[global]\nindex-url = " + index + "\n", env: []string{"PIP_NO_INDEX=1"}},
+		"environment unsets":  {body: "[global]\nindex-url = " + index + "\nno-index = true\n", env: []string{"PIP_NO_INDEX=0"}},
+		"alias":               {body: "[global]\npypi-url = " + alias + "\n"},
+		"alias after index":   {body: "[global]\nindex-url = " + index + "\npypi-url = " + alias + "\n"},
+		"alias from the env":  {body: "[global]\nindex-url = " + index + "\n", env: []string{"PIP_PYPI_URL=" + alias}},
+		"download's own bool": {body: "[global]\nindex-url = " + index + "\n[download]\nno-index = true\n"},
+	} {
+		home := t.TempDir()
+		file := filepath.Join(home, "pip.conf")
+		if err := os.WriteFile(file, []byte(tc.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// pip install and pip download share the index options; install is
+		// what the configuration is judged for, so its section is read.
+		cmd := exec.Command(python, "-m", "pip", "install", "--dry-run", "--ignore-installed", "--no-deps", "--no-cache-dir", "--disable-pip-version-check", "--retries", "0", "--timeout", "1", "--target", filepath.Join(home, "t"), "bodega-ca-audit-does-not-exist==1.0.0")
+		cmd.Dir = home
+		cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + file}, tc.env...)
+		out, _ := cmd.CombinedOutput()
+		getenv := func(key string) string {
+			for _, kv := range tc.env {
+				if k, v, _ := strings.Cut(kv, "="); k == key {
+					return v
+				}
+			}
+			return ""
+		}
+		layers := []PipLayer{{File: file, Data: []byte(tc.body)}}
+		if native, got := !strings.Contains(string(out), "Looking in indexes"), PipNoIndex(layers, getenv) != ""; native != got {
+			t.Errorf("%s: PipNoIndex says pip asks no index = %v, native pip = %v: %s", name, got, native, strings.TrimSpace(string(out)))
+		}
+		if native, got := strings.Contains(string(out), alias), PipIndexAlias(layers, getenv) != ""; native && !got {
+			t.Errorf("%s: native pip asks the index pypi-url names and PipIndexAlias reports none: %s", name, strings.TrimSpace(string(out)))
+		}
+	}
+}
+
+// TestHelmEntryMovedToBodegaKeepsItsPairObligation covers the entry a plan
+// moves to bodega from another URL: it keeps the certFile and keyFile it had,
+// helm loads them with the caFile the install adds, and a pair that does not
+// load is refused before anything is written.
+func TestHelmEntryMovedToBodegaKeepsItsPairObligation(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".config/helm/repositories.yaml")
+	body := "repositories:\n- name: bodega\n  url: https://old.example/helm\n  certFile: " + filepath.Join(home, "missing.crt") + "\n  keyFile: " + filepath.Join(home, "missing.key") + "\n"
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+	if err == nil || !strings.Contains(err.Error(), "unable to read cert file") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("a moved entry's unloadable pair was accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+func TestAudit26NpmSectionValueMatchesNativeNpm(t *testing.T) {
+	npm := nativeNpm1120(t)
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	file := filepath.Join(home, ".npmrc")
+	body := "registry=" + testBase + "/npm/\n[ca]\nx=1\n"
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(npm, "view", "left-pad", "--registry=https://127.0.0.1:1/", "--fetch-retries=0", "--fetch-timeout=1000", "--loglevel=error")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NPM_CONFIG_USERCONFIG=" + file, "NPM_CONFIG_GLOBALCONFIG=" + filepath.Join(home, "empty-global")}
+	out, nativeErr := cmd.CombinedOutput()
+	if nativeErr == nil || !strings.Contains(string(out), "Cannot convert object to primitive value") {
+		t.Fatalf("native npm control: %v: %s", nativeErr, out)
+	}
+	t.Logf("npm 11.20.0: %v: %s", nativeErr, out)
+	in, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err == nil || len(in.Changes) != 0 {
+		t.Errorf("AddCA accepted npm's fatal nested ca: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+func TestAudit26MissingHelmOracleFailsInCI(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestHelmFileLoadsAsHelmLoadsIt$", "-test.v")
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "BODEGA_ORACLES=") {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "BODEGA_ORACLES=required", "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Errorf("missing native Helm passed CI:\n%s", out)
+	}
+}
+
+// F116 R1, R2: npmDefined is the option list of the npm the port is of.
+func TestNpmDefinedOptionsMatchNativeNpm(t *testing.T) {
+	npm := oracletest.Npm(t)
+	home := t.TempDir()
+	cmd := exec.Command(npm, "config", "ls", "-l", "--json")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NPM_CONFIG_USERCONFIG=" + filepath.Join(home, "no-user"), "NPM_CONFIG_GLOBALCONFIG=" + filepath.Join(home, "no-global")}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("npm config ls -l --json: %v", err)
+	}
+	var native map[string]any
+	if err := json.Unmarshal(out, &native); err != nil {
+		t.Fatal(err)
+	}
+	for name := range native {
+		if !npmDefined[name] {
+			t.Errorf("npm defines %s, which npmDefined lacks", name)
+		}
+	}
+	for name := range npmDefined {
+		if _, ok := native[name]; !ok {
+			t.Errorf("npmDefined holds %s, which npm does not define", name)
+		}
+	}
+}
+
+// F116 R1, R2: the one npm decoder reads what a section header or a dotted
+// null builds the way npm/ini does. Native npm is the oracle: on each file
+// it either reaches the request, which nothing answers, or stops before it,
+// and the decoder names a line exactly where npm stops. Where the decoder
+// refuses more than npm stops on, the case says so.
+func TestNpmObjectLinesMatchNativeNpm(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for _, tc := range []struct {
+		body string
+		// stricter is a file the decoder refuses and this npm command runs
+		// on: an object npm reads only for another package or command.
+		stricter bool
+	}{
+		{body: "[ca]\nx=1\n"},
+		{body: "[\"ca\"]\nx=1\n"},
+		{body: "[cafile]\n"},
+		{body: "[registry.x]\n"},
+		{body: "ca.x=null\n"},
+		{body: "[corp]\nx=1\n[ca]\ny=1\n"},
+		{body: "[corp]\nx=1\n"},
+		{body: "[corp]\ncafile=/x\nca.x=null\n"},
+		{body: "[corp.ca]\nx=1\n"},
+		{body: "[__proto__]\nca=1\n"},
+		{body: "corp=1\n[corp]\nx=1\n"},
+		{body: "corp.ca=null\n"},
+		{body: "[//h.example/]\nx=1\n"},
+		{body: "[@corp:registry]\nx=1\n", stricter: true},
+		{body: "[${F116_SECTION}]\nx=1\n", stricter: true},
+	} {
+		file := filepath.Join(t.TempDir(), "npmrc")
+		if err := os.WriteFile(file, []byte("fetch-timeout=1000\n"+tc.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		out := runNpmView(t, npm, file, nil)
+		reached := strings.Contains(out, "ECONNREFUSED")
+		refused := NpmUnclassified(file)
+		switch {
+		case !reached && refused == "":
+			t.Errorf("%q: npm stops before the request and the decoder names no line:\n%s", tc.body, out)
+		case reached && refused != "" && !tc.stricter:
+			t.Errorf("%q: npm reaches the request and the decoder refuses it: %s", tc.body, refused)
+		case tc.stricter && (!reached || refused == ""):
+			t.Errorf("%q: want npm running and the decoder refusing; reached=%v refused=%q", tc.body, reached, refused)
+		}
+	}
+}
+
+func TestAudit27ContainerdStartupObligations(t *testing.T) {
+	for name, extra := range map[string]string{
+		"missing required plugin": "required_plugins = [\"io.containerd.audit.v1.missing\"]\n",
+		"metadata plugin type":    "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = 42\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := []byte("version = 3\n" + extra + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n")
+			eff, err := ResolveContainerdConfig("", filepath.Join(t.TempDir(), "config.toml"), raw)
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a parent policy containerd cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit27HelmNullEntryMatchesNative(t *testing.T) {
+	helm := oracletest.Helm(t)
+	home := t.TempDir()
+	file := filepath.Join(home, "repositories.yaml")
+	body := "repositories:\n- null\n- name: bodega\n  url: https://127.0.0.1:1/helm\n"
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "HELM_REPOSITORY_CONFIG=" + file}
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "invalid memory address or nil pointer dereference") {
+		t.Fatalf("native control: %v: %s", err, out)
+	}
+	t.Logf("Helm v4.3.0: %v: %s", err, out)
+	if _, err := LoadHelmFile(file); err == nil {
+		t.Error("accepted a repository file that aborts Helm before any request")
+	}
+}
+
+// F116 R1, R2: refusing a file helm cannot start on must not refuse the file
+// helm itself writes. Helm v4.3.0 adds a repository against a local index, and
+// what it wrote loads.
+func TestHelmRepoAddFileIsAccepted(t *testing.T) {
+	helm := oracletest.Helm(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index.yaml" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("apiVersion: v1\nentries: {}\ngenerated: \"2026-01-01T00:00:00Z\"\n"))
+	}))
+	defer srv.Close()
+	home := t.TempDir()
+	file := filepath.Join(home, "repositories.yaml")
+	cmd := exec.Command(helm, "repo", "add", "bodega", srv.URL, "--repository-config", file, "--repository-cache", filepath.Join(home, "cache"))
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helm repo add: %v: %s", err, out)
+	}
+	doc, err := LoadHelmFile(file)
+	if err != nil {
+		t.Fatalf("refused the file helm repo add wrote: %v", err)
+	}
+	if len(doc.Repositories) != 1 || doc.Repositories[0].Name != "bodega" || doc.Repositories[0].URL != srv.URL {
+		written, _ := os.ReadFile(file)
+		t.Errorf("read %+v from:\n%s", doc.Repositories, written)
+	}
+}
+
+func TestAudit28ContainerdOperationValidity(t *testing.T) {
+	for name, extra := range map[string]string{
+		"metadata policy":     "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = \"audit-unknown\"\n",
+		"missing snapshotter": "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"audit-missing\"\n",
+		"runtime platform":    "[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.runc]\nplatform = \"linux/amd64/bad/extra\"\n",
+		"debug level":         "[debug]\nlevel = \"audit-unknown\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name != "missing snapshotter" {
+				extra = "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n" + extra
+			}
+			raw := []byte("version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n" + extra + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n")
+			eff, err := ResolveContainerdConfig("", filepath.Join(t.TempDir(), "config.toml"), raw)
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a parent policy containerd cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit29ContainerdComposedStartupValidity(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"unconfigured snapshotter": {"devmapper", ""},
+		"two content providers": {
+			"native", "[proxy_plugins.audit-content]\ntype = \"content\"\naddress = \"/tmp/audit-content.sock\"\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			eff, err := ResolveContainerdConfig("", file, []byte(conf))
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a composed configuration containerd v2.2.0 cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit30ContainerdComposedStartupValidity(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"no implicit differ for platform": {"native", "[[plugins.\"io.containerd.transfer.v1.local\".unpack_config]]\nplatform = \"windows/amd64\"\nsnapshotter = \"native\"\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			eff, err := ResolveContainerdConfig("", file, []byte(conf))
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a composed configuration containerd v2.2.0 cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit31ContainerdComposedStartupValidity(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"CRI server rejects stream port": {"native", "[plugins.\"io.containerd.grpc.v1.cri\"]\nstream_server_address = \"127.0.0.1\"\nstream_server_port = \"65536\"\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			eff, err := ResolveContainerdConfig("", file, []byte(conf))
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a composed configuration containerd v2.2.0 cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit32ContainerdComposedStartupValidity(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"command rejects grpc listener":    {"native", "[grpc]\ntcp_address = \"127.0.0.1:65536\"\n"},
+		"command rejects metrics listener": {"native", "[metrics]\naddress = \"127.0.0.1:65536\"\n"},
+		"command rejects debug listener":   {"native", "[debug]\naddress = \"127.0.0.1:65536\"\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			eff, err := ResolveContainerdConfig("", file, []byte(conf))
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a composed configuration containerd v2.2.0 cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit33ContainerdProxyConstructionValidity(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"proxy constructor rejects address":           {"audit", "[proxy_plugins.audit]\ntype = \"snapshot\"\naddress = \"/run/a%zz.sock\"\n"},
+		"collected proxy constructor rejects address": {"native", "[proxy_plugins.audit]\ntype = \"snapshot\"\naddress = \"/run/a%zz.sock\"\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			eff, err := ResolveContainerdConfig("", file, []byte(conf))
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a composed configuration containerd v2.2.0 cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+// TestGitHTTPKeysAreModeledOrAtDefault holds the Git reader to one rule:
+// every http variable git reads is on gitHTTPModeled or gitHTTPUnmodeled and
+// never both, and a variable on the second passes GitLoadError only at git's
+// default. A non-default value refuses, in [http] and under a URL, naming the
+// file, the section and the variable.
+func TestGitHTTPKeysAreModeledOrAtDefault(t *testing.T) {
+	for name := range gitHTTPVars {
+		_, unmodeled := gitHTTPUnmodeled[name]
+		if modeled := slices.Contains(gitHTTPModeled, name); modeled == unmodeled {
+			t.Errorf("http.%s: on the modeled list %v and on the unmodeled list %v; want exactly one", name, modeled, unmodeled)
+		}
+	}
+	for _, name := range gitHTTPModeled {
+		if _, ok := gitHTTPVars[name]; !ok {
+			t.Errorf("gitHTTPModeled holds %s, which http_options does not read", name)
+		}
+	}
+	dir := t.TempDir()
+	load := func(body string) (string, string) {
+		file := filepath.Join(dir, "gitconfig")
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return file, GitLoadError([]string{file})
+	}
+	const scope = `[http "https://bodega.example.com/"]`
+	for name, d := range gitHTTPUnmodeled {
+		if _, ok := gitHTTPVars[name]; !ok {
+			t.Errorf("gitHTTPUnmodeled holds %s, which http_options does not read", name)
+		}
+		set, unset := "/etc/x", ""
+		switch {
+		case d.isBool:
+			set, unset = strconv.FormatBool(!d.value), strconv.FormatBool(d.value)
+		case name == "sslversion":
+			set = "tlsv1.3"
+		}
+		for _, header := range []string{"[http]", scope} {
+			body := "[user]\n\tname = Kept\n" + header + "\n\tsslCAInfo = /etc/ca.pem\n\t" + name + " = " + set + "\n"
+			file, got := load(body)
+			for _, want := range []string{file + " (line 5: ", "'http." + name + "'", "the section " + header} {
+				if !strings.Contains(got, want) {
+					t.Errorf("%s under %s set to %q: GitLoadError = %q; want it to name %q", name, header, set, got, want)
+				}
+			}
+			if !d.isBool && !d.emptyIsUnset {
+				continue
+			}
+			if _, got := load(header + "\n\t" + name + " = " + unset + "\n"); got != "" {
+				t.Errorf("%s under %s at git's default %q is refused: %s", name, header, unset, got)
+			}
+		}
+	}
+	// A boolean with no = is true, which is the default of one and not of the other.
+	if _, got := load("[http]\n\tsslVerify\n"); got != "" {
+		t.Errorf("a bare http.sslVerify is true, git's default, and is refused: %s", got)
+	}
+	if _, got := load("[http]\n\tsslCertPasswordProtected\n"); !strings.Contains(got, "'http.sslcertpasswordprotected'") {
+		t.Errorf("a bare http.sslCertPasswordProtected is true and passes: %q", got)
+	}
+	// A later assignment at the default does not clear an earlier one doctor cannot follow.
+	if _, got := load("[http]\n\tsslVerify = false\n\tsslVerify = true\n"); !strings.Contains(got, "line 2: 'http.sslverify'") {
+		t.Errorf("an sslVerify = false ahead of a later true passes: %q", got)
+	}
+	// What bodega writes, beside settings that leave the handshake alone, stays accepted.
+	ok := "[url \"https://bodega.example.com/git/\"]\n\tinsteadOf = https://github.com/\n" + scope + "\n\tsslCAInfo = /home/u/.config/bodega/ca.pem\n" +
+		"[http]\n\tpostBuffer = 512m\n\tproxy = http://proxy.example:3128\n\tuserAgent = x\n\textraHeader = X-A: b\n\tsslVerify = yes\n\tsslVersion =\n\tnoSuchKey = 1\n"
+	if _, got := load(ok); got != "" {
+		t.Errorf("a configuration that sets bodega's URL and CA is refused: %s", got)
+	}
+}
+
+func TestAudit35ContainerdConfigureWithoutCAKeepsCustomRoot(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "version = 2\nroot = \"/srv/containerd\"\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := ContainerdConfig("https://bodega.internal")
+	sum := sha256.Sum256([]byte(f.Content))
+	rec := PlanRecord{System: f.System, Action: PlanInstall, Path: "~/etc/containerd/config.toml", SHA256: hex.EncodeToString(sum[:])}
+	change, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil {
+		t.Fatalf("plain configure, with no CA request, rejected a valid custom root: %v", err)
+	}
+	if !strings.Contains(string(change.New), "root = \"/srv/containerd\"") || !strings.Contains(string(change.New), "config_path = \"/etc/containerd/certs.d\"") {
+		t.Fatalf("plain configure lost the custom root or did not set config_path:\n%s", change.New)
+	}
+	if _, err := Apply([]Change{change}, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil || !again.Unchanged() {
+		t.Fatalf("plain configure is not idle: %v", err)
+	}
+}
+
+// F116 R1: a CA plan is refused, before any change is planned, for a client
+// given a TLS input other than the CA bundle the plan writes: a client
+// certificate or key, a revocation list, another root store, or an
+// environment selector the client stops on. Each refusal names the option
+// or the variable. The file that holds it loads, so the same host takes a
+// plan that installs no CA: caPlan builds it with the file in place.
+func TestUnmodeledTLSInputsRefuseCAPlan(t *testing.T) {
+	caPEM, leafPEM, keyPEM := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	pair := map[string]string{"client.pem": string(leafPEM), "client.key": string(keyPEM)}
+	with := func(files map[string]string) map[string]string {
+		out := maps.Clone(pair)
+		maps.Copy(out, files)
+		return out
+	}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "apt, a client certificate that loads", plan: apt,
+			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::SslCert \"/client.pem\";\n"}), names: "Acquire::https::SslCert"},
+		{name: "apt, a client key scoped to bodega's host", plan: apt,
+			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::bodega.example.com::SslKey \"/client.key\";\n"}), names: "Acquire::https::bodega.example.com::SslKey"},
+		{name: "apt, a revocation list", plan: apt,
+			files: with(map[string]string{"etc/apt/apt.conf": "Acquire::https::CrlFile \"/client.pem\";\n"}), names: "Acquire::https::CrlFile"},
+		{name: "apt, another root store from the environment", plan: apt,
+			env: map[string]string{"SSL_CERT_FILE": "/elsewhere/roots.pem"}, names: "SSL_CERT_FILE"},
+		{name: "gomod, another root directory from the environment", plan: Gomod(testBase),
+			env: map[string]string{"SSL_CERT_DIR": "/elsewhere/certs"}, names: "SSL_CERT_DIR"},
+		{name: "helm, another root store from the environment", plan: Helm(testBase),
+			env: map[string]string{"SSL_CERT_FILE": "/elsewhere/roots.pem"}, names: "SSL_CERT_FILE"},
+		{name: "pypi, a client certificate under [global]", plan: Pip(testBase),
+			files: with(map[string]string{".config/pip/pip.conf": "[global]\nclient-cert = /client.pem\n"}), names: "client-cert under [global]"},
+		{name: "pypi, a client certificate from the environment", plan: Pip(testBase),
+			env: map[string]string{"PIP_CLIENT_CERT": "/client.pem"}, names: "PIP_CLIENT_CERT"},
+		{name: "npm, a registry's certfile", plan: Npm(testBase, nil),
+			files: with(map[string]string{".npmrc": "//bodega.example.com/:certfile=/client.pem\n"}), names: "//bodega.example.com/:certfile"},
+		{name: "npm, a registry's keyfile", plan: Npm(testBase, nil),
+			files: with(map[string]string{".npmrc": "//bodega.example.com/:keyfile=/client.key\n"}), names: "//bodega.example.com/:keyfile"},
+		{name: "npm, an inline key from the environment", plan: Npm(testBase, nil),
+			env: map[string]string{"NPM_CONFIG_KEY": "PEM"}, names: "npm_config_key"},
+		{name: "npm, a NODE_OPTIONS entry doctor does not read", plan: Npm(testBase, nil),
+			env: map[string]string{"NODE_OPTIONS": "--use-system-ca --require=/opt/hook.js"}, names: "NODE_OPTIONS"},
+		{name: "git, a client certificate from the environment", plan: git,
+			env: map[string]string{"GIT_SSL_CERT": "/client.pem"}, names: "GIT_SSL_CERT"},
+		{name: "git, a client key from the environment", plan: git,
+			env: map[string]string{"GIT_SSL_KEY": "/client.key"}, names: "GIT_SSL_KEY"},
+		{name: "git, verification turned off in the environment", plan: git,
+			env: map[string]string{"GIT_SSL_NO_VERIFY": "1"}, names: "GIT_SSL_NO_VERIFY"},
+		{name: "git, a client certificate in the file", plan: git,
+			files: with(map[string]string{".gitconfig": "[http]\n\tsslCert = /client.pem\n"}), names: "'http.sslcert'"},
+		{name: "git, a selector git stops on", plan: git,
+			env: map[string]string{"GIT_CONFIG_NOSYSTEM": "maybe"}, names: "GIT_CONFIG_NOSYSTEM"},
+		{name: "docker, a certificate for dockerd's own listener", plan: DockerDaemon(testBase, nil),
+			files: with(map[string]string{"etc/docker/daemon.json": `{"tlscert": "/client.pem"}`}), names: "tlscert"},
+		{name: "containerd, a certificate for its own listener", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: with(map[string]string{"etc/containerd/config.toml": "version = 3\n[grpc]\n  tcp_tls_cert = \"/client.pem\"\n"}), names: "tcp_tls_cert"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string { return tc.env[key] }}
+			clean := h
+			clean.Getenv = func(string) string { return "" }
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, clean); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			for name, body := range tc.files {
+				path := filepath.Join(home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
+			}
+			if err != nil && (strings.Contains(err.Error(), string(keyPEM)) || strings.Contains(err.Error(), "/opt/hook.js")) {
+				t.Errorf("the refusal repeats a value it should only name the option of: %v", err)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: GIT_CONFIG_NOSYSTEM is read by git's own boolean conversion,
+// the numeric spellings of false included, and a value git stops on is an
+// error rather than a truthy switch. Native git is the oracle for which
+// spellings drop the system file and which it dies on.
+func TestGitNoSystemMatchesNativeGit(t *testing.T) {
+	git := oracletest.Git(t)
+	dir := t.TempDir()
+	system := filepath.Join(dir, "system")
+	if err := os.WriteFile(system, []byte("[bodega]\n\tmarker = system\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"0", "00", "0k", "0x0", "false", "FALSE", "no", "off", "1", "2", "1k", "-1", "true", "Yes", "on", "maybe", "0z", "k", " 1", "1 "} {
+		cmd := exec.Command(git, "config", "--get", "bodega.marker")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_SYSTEM=" + system, "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_NOSYSTEM=" + value, "LC_ALL=C"}
+		out, _ := cmd.CombinedOutput()
+		dies := strings.Contains(string(out), "bad boolean environment value")
+		reads := strings.TrimSpace(string(out)) == "system"
+		getenv := func(key string) string {
+			return map[string]string{"GIT_CONFIG_NOSYSTEM": value, "GIT_CONFIG_SYSTEM": system, "GIT_CONFIG_GLOBAL": os.DevNull}[key]
+		}
+		if got := GitEnvError(getenv) != ""; got != dies {
+			t.Errorf("GIT_CONFIG_NOSYSTEM=%q: GitEnvError reports an error = %v, git dies = %v (%s)", value, got, dies, strings.TrimSpace(string(out)))
+		}
+		if dies {
+			continue
+		}
+		if got := slices.Contains(GitConfigFiles(getenv, dir, ""), system); got != reads {
+			t.Errorf("GIT_CONFIG_NOSYSTEM=%q: GitConfigFiles lists the system file = %v, git reads it = %v", value, got, reads)
+		}
+	}
+}
+
+func TestAudit36ContainerdConfigureWithoutCAKeepsOtherVersionTable(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	original := "version = 2\nroot = \"/srv/containerd\"\n[plugins.\"io.containerd.cri.v1.images\"]\n  snapshotter = \"native\"\n"
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := ContainerdConfig("https://bodega.internal")
+	sum := sha256.Sum256([]byte(f.Content))
+	rec := PlanRecord{System: f.System, Action: PlanInstall, Path: "~/etc/containerd/config.toml", SHA256: hex.EncodeToString(sum[:])}
+	change, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil {
+		t.Fatalf("plain configure applied on main but rejects this preserved table: %v", err)
+	}
+	for _, kept := range []string{"root = \"/srv/containerd\"", "snapshotter = \"native\"", "config_path = \"/etc/containerd/certs.d\""} {
+		if !strings.Contains(string(change.New), kept) {
+			t.Fatalf("plain configure lost %q:\n%s", kept, change.New)
+		}
+	}
+	if _, err := Apply([]Change{change}, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil || !again.Unchanged() {
+		t.Fatalf("plain configure is not idle: %v", err)
+	}
+}
+
+// presenceEnv is an environment holding exactly set, a variable set to ""
+// included, as the doctor command hands the process's to a plan.
+func presenceEnv(set map[string]string) Environ {
+	return NewEnviron(func(k string) string { return set[k] }, func(k string) (string, bool) { v, ok := set[k]; return v, ok })
+}
+
+// F116 R1, R2: a variable set and empty is read by its own client's rule, not
+// as unset: git and helm take an empty file selector for the file, OpenSSL an
+// empty SSL_CERT_FILE for the store, git an empty TLS variable for a set one.
+func TestEnvironKeepsSetAndEmptyApart(t *testing.T) {
+	home := filepath.FromSlash("/h")
+	user := []string{filepath.Join(home, ".config/git/config"), filepath.Join(home, ".gitconfig")}
+	system := filepath.FromSlash("/etc/gitconfig")
+	for name, tc := range map[string]struct {
+		set  map[string]string
+		want []string
+	}{
+		"nothing set":                {nil, append([]string{system}, user...)},
+		"empty GIT_CONFIG_GLOBAL":    {map[string]string{"GIT_CONFIG_GLOBAL": ""}, []string{system}},
+		"empty GIT_CONFIG_SYSTEM":    {map[string]string{"GIT_CONFIG_SYSTEM": ""}, user},
+		"both empty":                 {map[string]string{"GIT_CONFIG_GLOBAL": "", "GIT_CONFIG_SYSTEM": ""}, nil},
+		"empty GIT_CONFIG_NOSYSTEM":  {map[string]string{"GIT_CONFIG_NOSYSTEM": ""}, append([]string{system}, user...)},
+		"empty XDG_CONFIG_HOME":      {map[string]string{"XDG_CONFIG_HOME": ""}, append([]string{system}, user...)},
+		"GIT_CONFIG_GLOBAL names it": {map[string]string{"GIT_CONFIG_GLOBAL": "/g"}, []string{system, "/g"}},
+	} {
+		if got := GitConfigFilesIn(presenceEnv(tc.set), home, ""); !slices.Equal(got, tc.want) {
+			t.Errorf("git, %s: reads %v; want %v", name, got, tc.want)
+		}
+	}
+	if got := GitEnvNoFile(presenceEnv(map[string]string{"GIT_CONFIG_GLOBAL": ""})); !strings.Contains(got, "GIT_CONFIG_GLOBAL") {
+		t.Errorf("an empty GIT_CONFIG_GLOBAL is not named as leaving git no per-user file: %q", got)
+	}
+	if got := GitEnvNoFile(presenceEnv(nil)); got != "" {
+		t.Errorf("an unset GIT_CONFIG_GLOBAL is named: %q", got)
+	}
+
+	helmDefault := filepath.Join(home, ".config/helm/repositories.yaml")
+	for name, tc := range map[string]struct {
+		set        map[string]string
+		want, none string
+	}{
+		"nothing set":                  {nil, helmDefault, ""},
+		"empty HELM_REPOSITORY_CONFIG": {map[string]string{"HELM_REPOSITORY_CONFIG": ""}, "", "HELM_REPOSITORY_CONFIG"},
+		"empty HELM_CONFIG_HOME":       {map[string]string{"HELM_CONFIG_HOME": ""}, helmDefault, ""},
+		"empty XDG_CONFIG_HOME":        {map[string]string{"XDG_CONFIG_HOME": ""}, helmDefault, ""},
+	} {
+		env := presenceEnv(tc.set)
+		if got := HelmRepositoryFileIn(env, OSLinux, home); got != tc.want {
+			t.Errorf("helm, %s: reads %q; want %q", name, got, tc.want)
+		}
+		if got := HelmEnvNoFile(env); (got != "") != (tc.none != "") || !strings.Contains(got, tc.none) {
+			t.Errorf("helm, %s: HelmEnvNoFile = %q; want one naming %q", name, got, tc.none)
+		}
+	}
+
+	for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+		empty := presenceEnv(map[string]string{name: ""})
+		if got := SystemStoreEnvIn(empty, true); !strings.Contains(got, name) {
+			t.Errorf("OpenSSL takes an empty %s for the store; got %q", name, got)
+		}
+		if got := SystemStoreEnvIn(empty, false); got != "" {
+			t.Errorf("Go's crypto/x509 reads an empty %s as unset; got %q", name, got)
+		}
+		if got := SystemStoreEnvIn(presenceEnv(map[string]string{name: "/x"}), false); !strings.Contains(got, name) {
+			t.Errorf("a set %s is not named: %q", name, got)
+		}
+	}
+
+	for _, e := range gitTLSEnv {
+		if got := GitEnvUnmodeledIn(presenceEnv(map[string]string{e.name: ""})); !strings.Contains(got, e.name) {
+			t.Errorf("git tests %s for presence, and an empty one is not named: %q", e.name, got)
+		}
+	}
+	if got := GitEnvUnmodeledIn(presenceEnv(map[string]string{"GIT_SSL_CAINFO": ""})); !strings.Contains(got, "GIT_SSL_CAINFO") {
+		t.Errorf("an empty GIT_SSL_CAINFO replaces http.sslCAInfo and is not named: %q", got)
+	}
+	if got := GitEnvUnmodeledIn(presenceEnv(map[string]string{"GIT_SSL_CAINFO": "/ca.pem"})); got != "" {
+		t.Errorf("a GIT_SSL_CAINFO naming a file is the probe's to read; got %q", got)
+	}
+	if _, set := NewEnviron(nil, func(string) (string, bool) { return "", true })("X"); set {
+		t.Error("a nil getenv is an environment holding nothing, whatever lookup says")
+	}
+}
+
+// F116 R1, R2: git reads GIT_CONFIG_SYSTEM as GitConfigFilesIn does, the
+// native client as the oracle: named, it is the system file; set and empty,
+// git reads no system file and does not fall back to its built-in path.
+func TestGitEmptySystemSelectorMatchesNativeGit(t *testing.T) {
+	git := oracletest.Git(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "system")
+	if err := os.WriteFile(file, []byte("[audit]\n\tkey = kept\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{file, ""} {
+		cmd := exec.Command(git, "config", "--system", "--list", "--show-origin")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_SYSTEM=" + value}
+		out, err := cmd.CombinedOutput()
+		ours := GitConfigFilesIn(presenceEnv(map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_SYSTEM": value}), dir, "")
+		if value != "" && (err != nil || !strings.Contains(string(out), "file:"+file) || !slices.Contains(ours, file)) {
+			t.Errorf("GIT_CONFIG_SYSTEM=%q: git err=%v out=%s; doctor reads %v", value, err, out, ours)
+		}
+		if value == "" && (err == nil || !strings.Contains(string(out), "unable to read config file ''") || !slices.Equal(ours, []string{os.DevNull})) {
+			t.Errorf("GIT_CONFIG_SYSTEM set and empty: git err=%v out=%s; doctor reads %v, want no system file", err, out, ours)
+		}
+	}
+}
+
+// F116 R1, R2: the three NODE_OPTIONS doctor reads are each valid alone, and
+// Node exits on --use-openssl-ca beside --use-bundled-ca or --use-system-ca,
+// in either order and with NODE_USE_SYSTEM_CA=1 standing for the last. The
+// native client is the oracle.
+func TestNodeOptionsCombinationMatchesNativeNode(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for _, tc := range []struct{ flags, systemCA string }{
+		{"", ""}, {"--use-bundled-ca", ""}, {"--use-openssl-ca", ""}, {"--use-system-ca", ""},
+		{"--use-bundled-ca --use-system-ca", ""}, {"--use-bundled-ca --use-bundled-ca", ""},
+		{"--use-bundled-ca", "1"}, {"--use-system-ca", "1"}, {"", "1"},
+		{"--use-openssl-ca", "0"}, {"--use-openssl-ca", "true"},
+		{"--use-bundled-ca --use-openssl-ca", ""}, {"--use-openssl-ca --use-bundled-ca", ""},
+		{"--use-system-ca --use-openssl-ca", ""}, {"--use-openssl-ca --use-system-ca", ""},
+		{"--use-openssl-ca", "1"}, {"--use-openssl-ca --use-system-ca --use-bundled-ca", ""},
+	} {
+		env := map[string]string{"NODE_OPTIONS": tc.flags}
+		cmd := exec.Command(npm, "--version")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "NODE_OPTIONS=" + tc.flags}
+		if tc.systemCA != "" {
+			env["NODE_USE_SYSTEM_CA"] = tc.systemCA
+			cmd.Env = append(cmd.Env, "NODE_USE_SYSTEM_CA="+tc.systemCA)
+		}
+		out, err := cmd.CombinedOutput()
+		refused := NodeOptionsUnread(func(key string) string { return env[key] })
+		if (err != nil) != (refused != "") {
+			t.Errorf("%v: node err=%v (%s); doctor says %q", env, err, strings.TrimSpace(string(out)), refused)
+		}
+		if refused != "" && !strings.Contains(refused, "NODE_OPTIONS") {
+			t.Errorf("%v: the refusal does not name the variable: %q", env, refused)
+		}
+	}
+}
+
+// F116 R1, R2: two options npm declares exclusive of one another stop npm as
+// it loads its configuration, across files and the environment and whatever
+// either is set to; each alone does not. The native client is the oracle.
+func TestNpmExclusiveOptionsMatchNativeNpm(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for name, tc := range map[string]struct {
+		user, global string
+		env          []string
+	}{
+		"one of a set":             {user: "save-dev=true\n"},
+		"one twice":                {user: "save-dev=true\nsave-dev=false\n"},
+		"two in one file":          {user: "save-dev=false\nsave-prod=true\n"},
+		"two across files":         {user: "save-peer=true\n", global: "save-optional=true\n"},
+		"file and environment":     {user: "expect-results=true\n", env: []string{"npm_config_expect_result_count=1"}},
+		"uppercase environment":    {user: "provenance=false\n", env: []string{"NPM_CONFIG_PROVENANCE_FILE=x"}},
+		"empty environment":        {user: "save-dev=true\n", env: []string{"npm_config_save_prod="}},
+		"options of separate sets": {user: "save-dev=true\nprovenance=true\nexpect-results=true\n"},
+	} {
+		home := t.TempDir()
+		user, global := filepath.Join(home, ".npmrc"), filepath.Join(home, "global-npmrc")
+		for file, body := range map[string]string{user: tc.user, global: tc.global} {
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		env := map[string]string{"npm_config_globalconfig": global}
+		for _, kv := range tc.env {
+			k, v, _ := strings.Cut(kv, "=")
+			env[k] = v
+		}
+		cmd := exec.Command(npm, "config", "get", "registry")
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		out, err := cmd.CombinedOutput()
+		native := err != nil && strings.Contains(string(out), "cannot be provided when using")
+		getenv := func(k string) string { return env[k] }
+		ours := NpmExclusive(getenv, NpmConfigFiles(getenv, OSLinux, home, home))
+		if native != (ours != "") {
+			t.Errorf("%s: npm err=%v (%s); doctor says %q", name, err, strings.TrimSpace(string(out)), ours)
+		}
+	}
+}
+
+// F116 R1: a version 2 config.toml holding a version 3 CRI table is one
+// containerd loads and doctor does not follow, so it bounds what a CA install
+// certifies and is no load failure: the reader records it without refusing
+// the file, and the CA plan still refuses it before any write.
+func TestContainerdUnfollowedMigrationIsUncertaintyNotLoadFailure(t *testing.T) {
+	body := "version = 2\nroot = \"/srv/containerd\"\n[plugins.\"io.containerd.cri.v1.images\"]\n  snapshotter = \"native\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	r, err := ReadContainerdConfig([]byte(body))
+	if err != nil || r.Refused != "" || !strings.Contains(r.Invalid, "does not follow that merge") || r.ConfigPath != ContainerdCertsDir {
+		t.Fatalf("reader: err=%v Refused=%q Invalid=%q ConfigPath=%q; want the merge recorded as unmodeled and the registry table read", err, r.Refused, r.Invalid, r.ConfigPath)
+	}
+	home := t.TempDir()
+	file := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ContainerdEditEffective("", file, []byte(body)); err != nil {
+		t.Errorf("a plain configure refuses a file containerd loads: %v", err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || !strings.Contains(err.Error(), "does not follow that merge") || len(in.Changes) != 0 {
+		t.Errorf("the CA plan certifies a migration doctor does not follow: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+// F116 R1, R2: NODE_OPTIONS splits on ASCII spaces outside double quotes and
+// on nothing else, as ParseNodeOptionsEnvVar does at Node v26.13.0, so no
+// other whitespace turns an argument Node rejects into a flag doctor reads.
+func TestNodeOptionsArgsSplitOnSpacesAlone(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		args  []string
+		bad   string
+	}{
+		{"", nil, ""},
+		{"   ", nil, ""},
+		{"--use-system-ca", []string{"--use-system-ca"}, ""},
+		{"  --use-system-ca   --use-bundled-ca ", []string{"--use-system-ca", "--use-bundled-ca"}, ""},
+		{"--use-system-ca\t", []string{"--use-system-ca\t"}, ""},
+		{"--use-system-ca\n--use-bundled-ca", []string{"--use-system-ca\n--use-bundled-ca"}, ""},
+		{"--use-bundled-ca ", []string{"--use-bundled-ca "}, ""},
+		{`"--use-system-ca"`, []string{"--use-system-ca"}, ""},
+		{`--use-"system"-ca`, []string{"--use-system-ca"}, ""},
+		{`"--require a b"`, []string{"--require a b"}, ""},
+		{`"a\"b\\c"`, []string{`a"b\c`}, ""},
+		{`a\b`, []string{`a\b`}, ""},
+		{`"" --use-bundled-ca`, []string{"--use-bundled-ca"}, ""},
+		{`"--use-system-ca`, []string{"--use-system-ca"}, "unterminated string"},
+		{`"--use-system-ca\`, []string{"--use-system-ca"}, "invalid escape"},
+	} {
+		args, bad := NodeOptionsArgs(tc.value)
+		if !slices.Equal(args, tc.args) || (bad == "") != (tc.bad == "") || !strings.Contains(bad, tc.bad) {
+			t.Errorf("NodeOptionsArgs(%q) = %q, %q; want %q, %q", tc.value, args, bad, tc.args, tc.bad)
+		}
+	}
+	roots, unread := NodeOptions(func(key string) string {
+		return map[string]string{"NODE_OPTIONS": `"--use-bundled-ca" --use-system-ca`}[key]
+	})
+	if unread != "" || roots != (NodeRoots{Bundled: true, System: true}) {
+		t.Errorf("a quoted flag is the flag: roots = %+v, unread = %q", roots, unread)
+	}
+	for _, value := range []string{"--use-system-ca\t", "\n--use-openssl-ca", "--use-bundled-ca ", "--use-system-ca\v--use-bundled-ca", `"--use-system-ca`, `"--use-system-ca "`} {
+		roots, unread := NodeOptions(func(key string) string { return map[string]string{"NODE_OPTIONS": value}[key] })
+		if !strings.Contains(unread, "NODE_OPTIONS") || roots != (NodeRoots{}) {
+			t.Errorf("NODE_OPTIONS=%q: roots = %+v, unread = %q; want no root store read and a refusal naming the variable", value, roots, unread)
+		}
+	}
+}
+
+// F116 R1, R2: doctor refuses NODE_OPTIONS wherever Node exits on it, over
+// the bytes between and around the three flags it reads, and reads a flag
+// wherever Node takes one. An argument that is no option at all Node starts
+// on and takes no flag from; doctor refuses it as one it does not interpret.
+// The native client is the oracle.
+func TestNodeOptionsLexingMatchesNativeNode(t *testing.T) {
+	node := oracletest.Node(t)
+	for _, tc := range []struct {
+		value          string
+		starts, refuse bool
+	}{
+		{"", true, false}, {" ", true, false}, {"--use-system-ca", true, false}, {"  --use-system-ca  ", true, false},
+		{"--use-bundled-ca  --use-system-ca", true, false}, {`"--use-system-ca"`, true, false},
+		{`--use-"system"-ca`, true, false}, {`"" --use-bundled-ca`, true, false},
+		{`"--use-bundled-ca" --use-system-ca`, true, false}, {`"--use\-system-ca"`, true, false},
+
+		{"--use-system-ca\t", false, true}, {"--use-openssl-ca\n", false, true}, {"--use-bundled-ca\u00a0", false, true},
+		{"--use-system-ca\v", false, true}, {"--use-system-ca\t--use-bundled-ca", false, true}, {"--use-system-ca\r\n", false, true},
+		{`"--use-system-ca`, false, true}, {`"--use-system-ca\`, false, true}, {`--use-system-ca\`, false, true},
+		{`"--use-system-ca "`, false, true},
+
+		{"\t--use-system-ca", true, true}, {`" --use-system-ca"`, true, true},
+	} {
+		cmd := exec.Command(node, "--version")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "NODE_OPTIONS=" + tc.value}
+		out, err := cmd.CombinedOutput()
+		refused := NodeOptionsUnread(func(key string) string { return map[string]string{"NODE_OPTIONS": tc.value}[key] })
+		if (err == nil) != tc.starts || (refused != "") != tc.refuse {
+			t.Errorf("NODE_OPTIONS=%q: node err=%v (%s), want it to start = %v; doctor says %q, want a refusal = %v", tc.value, err, strings.TrimSpace(string(out)), tc.starts, refused, tc.refuse)
+		}
+	}
+}
+
+func TestAudit38HelmDuplicateNamesKeepEveryPolicy(t *testing.T) {
+	helm := oracletest.Helm(t)
+	home := t.TempDir()
+	file := filepath.Join(home, ".config/helm/repositories.yaml")
+	before := HelmDocument("- name: bodega\n  url: https://bodega.example.com/helm\n  username: first-account\n  password: first-secret\n- name: bodega\n  url: https://second.example/charts\n  username: second-account\n  password: second-secret\n  pass_credentials_all: true\n")
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(helm, "repo", "list", "-o", "json")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "HELM_REPOSITORY_CONFIG=" + file}
+	out, err := cmd.CombinedOutput()
+	if err != nil || !bytes.Contains(out, []byte("bodega.example.com")) || !bytes.Contains(out, []byte("second.example")) {
+		t.Fatalf("native Helm does not accept the original document: %v %s", err, out)
+	}
+	t.Logf("native Helm reads both entries: %s", out)
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+	if err != nil {
+		return
+	}
+	got := changeAt(t, in.Changes, file).New
+	for _, kept := range []string{"first-account", "first-secret", "second-account", "second-secret", "pass_credentials_all: true"} {
+		if !bytes.Contains(got, []byte(kept)) {
+			t.Errorf("CA plan discards unowned Helm policy %q without refusing %s:\n%s", kept, file, got)
+		}
+	}
+}
+
+// A second entry of the name a plan edits is not the plan's to drop: helm
+// loads both, each with its own settings, so the merge refuses the file.
+func TestEntryMergeRefusesASecondEntryOfThePlannedName(t *testing.T) {
+	helm := fileKind{blocks: func(o, p []string) []string { return mergeYAML(o, p, "repositories") }, holds: yamlHolds("repositories"), keeps: yamlKeeps("repositories")}
+	old := "repositories:\n  - name: bodega\n    url: https://old/helm\n  - name: bodega\n    url: https://dup\n    username: second\n"
+	planned := "repositories:\n" + HelmRepository("https://b")
+	merged, err := helm.merge([]byte(old), []byte(planned))
+	if err == nil {
+		err = helm.keeps([]byte(old), merged, []byte(planned))
+	}
+	if err == nil && !bytes.Contains(merged, []byte("username: second")) {
+		t.Errorf("the merge dropped the second entry named bodega without refusing:\n%s", merged)
+	}
+	if name := HelmDuplicate([]byte(HelmDocument("- name: bodega\n  url: https://old/helm\n- name: bodega\n  url: https://dup\n")), []byte(HelmDocument(HelmRepository("https://b")))); name != "bodega" {
+		t.Errorf("HelmDuplicate = %q; want bodega", name)
+	}
+}
+
+// commonConfigurations is, per client, a configuration of the kind operators
+// run, in the settings its modeled list holds, and one setting outside the
+// list. BASE is bodega's URL.
+var commonConfigurations = []struct {
+	name     string
+	plan     func() File
+	path     string
+	body     string
+	kept     []string
+	unlisted map[string]string
+	names    string
+}{
+	{name: "npm", plan: func() File { return Npm(testBase, nil) }, path: ".npmrc",
+		body:     "registry=https://registry.npmjs.org/\n//npm.corp.example/:_authToken=tok-123\n@corp:registry=https://npm.corp.example/\ncafile=/etc/ssl/corp-roots.pem\nfund=false\naudit=false\nsave-exact=true\nprogress=false\nloglevel=warn\n",
+		kept:     []string{"//npm.corp.example/:_authToken=tok-123", "@corp:registry=https://npm.corp.example/", "fund=false", "audit=false", "save-exact=true", "progress=false", "loglevel=warn"},
+		unlisted: map[string]string{".npmrc": "offline=true\n"}, names: "offline"},
+	{name: "pypi", plan: func() File { return Pip(testBase) }, path: ".config/pip/pip.conf",
+		body:     "[global]\nindex-url = https://pypi.org/simple\nextra-index-url = https://pypi.corp.example/simple\ntrusted-host = pypi.corp.example\ntimeout = 30\nretries = 3\ncert = /etc/ssl/corp-roots.pem\ndisable-pip-version-check = true\nno-cache-dir = false\n",
+		kept:     []string{"trusted-host = pypi.corp.example", "timeout = 30", "retries = 3", "disable-pip-version-check = true", "no-cache-dir = false"},
+		unlisted: map[string]string{".config/pip/pip.conf": "[global]\nproxy = http://proxy.corp.example:3128\n"}, names: "proxy"},
+	{name: "gomod", plan: func() File { return Gomod(testBase) }, path: ".config/go/env",
+		body:     "GOPROXY=https://proxy.golang.org,direct\nGOPRIVATE=git.corp.example\nGONOPROXY=git.corp.example\nGONOSUMDB=git.corp.example\nGOSUMDB=sum.golang.org\nGOINSECURE=legacy.corp.example\nGOFLAGS=-mod=mod -modcacherw\n",
+		kept:     []string{"GOPRIVATE=git.corp.example", "GONOPROXY=git.corp.example", "GONOSUMDB=git.corp.example", "GOSUMDB=sum.golang.org", "GOINSECURE=legacy.corp.example", "GOFLAGS=-mod=mod -modcacherw"},
+		unlisted: map[string]string{".config/go/env": "GOTOOLCHAIN=go1.99.0\n"}, names: "GOTOOLCHAIN"},
+	// What helm repo add --username --password --pass-credentials writes.
+	{name: "helm", plan: func() File { return Helm(testBase) }, path: ".config/helm/repositories.yaml",
+		body:     "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- caFile: \"\"\n  certFile: \"\"\n  insecure_skip_tls_verify: false\n  keyFile: \"\"\n  name: corp\n  pass_credentials_all: true\n  password: s3cret\n  url: https://charts.corp.example\n  username: deploy\n- caFile: \"\"\n  certFile: \"\"\n  insecure_skip_tls_verify: false\n  keyFile: \"\"\n  name: public\n  pass_credentials_all: false\n  password: \"\"\n  url: https://charts.example.org\n  username: \"\"\n",
+		kept:     []string{"name: corp", "pass_credentials_all: true", "password: s3cret", "username: deploy", "name: public"},
+		unlisted: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: corp\n  url: https://charts.corp.example\n  proxy: http://proxy.corp.example:3128\n"}, names: "proxy"},
+	{name: "apt", plan: func() File {
+		return File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	}, path: "etc/apt/apt.conf.d/90corp",
+		body:     "Acquire::http::Proxy \"http://proxy.corp.example:3128\";\nAcquire::https::Proxy \"http://proxy.corp.example:3128\";\nAcquire::Retries \"3\";\nAPT::Install-Recommends \"false\";\nAPT::Get::Assume-Yes \"true\";\nAcquire::Languages \"none\";\nAcquire::http::Pipeline-Depth \"0\";\nAcquire::Changelogs::AlwaysOnline \"true\";\nAcquire::http::User-Agent-Non-Interactive \"true\";\nAPT::Periodic::Update-Package-Lists \"1\";\n",
+		unlisted: map[string]string{"etc/apt/apt.conf.d/95limit": "Acquire::http::Dl-Limit \"70\";\n"}, names: "acquire::http::dl-limit"},
+}
+
+func writeUnder(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, body := range files {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A configuration in the settings a modeled list holds takes the CA and
+// keeps what it held, and one setting outside the list refuses the plan,
+// naming it.
+func TestCommonConfigurationsTakeACAAndAnUnlistedSettingRefuses(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range commonConfigurations {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+			writeUnder(t, home, map[string]string{tc.path: tc.body})
+			in, err := AddCA(caPlan(t, home, tc.plan()), ca, h)
+			if err != nil {
+				t.Fatalf("a common configuration is refused: %v", err)
+			}
+			if len(tc.kept) > 0 {
+				got := changeAt(t, in.Changes, filepath.Join(home, tc.path)).New
+				for _, line := range tc.kept {
+					if !bytes.Contains(got, []byte(line)) {
+						t.Errorf("the plan drops %q:\n%s", line, got)
+					}
+				}
+			}
+			writeUnder(t, home, tc.unlisted)
+			in, err = AddCA(caPlan(t, home, tc.plan()), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || !strings.Contains(err.Error(), "docs/usage.md") || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d; want a refusal naming %q and the next step", err, len(in.Changes), tc.names)
+			}
+		})
+	}
+}
+
+// A setting that turns peer verification off for bodega refuses the plan,
+// naming it, and is left as it is.
+func TestDisabledVerificationRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "npm strict-ssl", plan: Npm(testBase, nil), files: map[string]string{".npmrc": "strict-ssl=false\n"}, names: "strict-ssl"},
+		{name: "npm strict-ssl from the environment", plan: Npm(testBase, nil), env: map[string]string{"npm_config_strict_ssl": "false"}, names: "npm_config_strict_ssl"},
+		{name: "npm under a Node told to verify nothing", plan: Npm(testBase, nil), env: map[string]string{"NODE_TLS_REJECT_UNAUTHORIZED": "0"}, names: "NODE_TLS_REJECT_UNAUTHORIZED"},
+		{name: "pip trusted-host", plan: Pip(testBase), files: map[string]string{".config/pip/pip.conf": "[global]\ntrusted-host = pypi.corp.example bodega.example.com\n"}, names: "trusted-host"},
+		{name: "pip trusted-host from the environment", plan: Pip(testBase), env: map[string]string{"PIP_TRUSTED_HOST": "bodega.example.com:443"}, names: "PIP_TRUSTED_HOST"},
+		{name: "apt Verify-Peer", plan: apt, files: map[string]string{"etc/apt/apt.conf": "Acquire::https::Verify-Peer \"false\";\n"}, names: "Acquire::https::Verify-Peer"},
+		{name: "apt Verify-Host for bodega's host", plan: apt, files: map[string]string{"etc/apt/apt.conf": "Acquire::https::bodega.example.com::Verify-Host \"no\";\n"}, names: "Acquire::https::Verify-Host"},
+		{name: "helm insecure_skip_tls_verify", plan: Helm(testBase), files: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: bodega\n  url: " + testBase + "/helm\n  insecure_skip_tls_verify: true\n"}, names: "insecure_skip_tls_verify"},
+		{name: "go GOINSECURE", plan: Gomod(testBase), files: map[string]string{".config/go/env": "GOINSECURE=*.example.com\n"}, names: "GOINSECURE"},
+		{name: "containerd skip_verify", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: map[string]string{"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n\n[host.\"" + testBase + "\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n"}, names: "skip_verify"},
+		{name: "docker insecure-registries", plan: DockerDaemon(testBase, nil), files: map[string]string{"etc/docker/daemon.json": `{"insecure-registries": ["bodega.example.com"]}`}, names: "insecure-registries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, h); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			writeUnder(t, home, tc.files)
+			h.Getenv = func(key string) string { return tc.env[key] }
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d; want a refusal naming %q", err, len(in.Changes), tc.names)
+			}
+			for name, body := range tc.files {
+				if got, err := os.ReadFile(filepath.Join(home, name)); err != nil || string(got) != body {
+					t.Errorf("%s was changed: %v\n%s", name, err, got)
+				}
+			}
+		})
+	}
+}
+
+// Every setting on a modeled list names how its client refuses a bad value,
+// and the function it names does refuse one, or says why none fails.
+func TestModeledSettingsCarryTheirNativeFailure(t *testing.T) {
+	for _, list := range [][]ModeledSetting{NpmModeled, PipModeled, GoEnvModeled, HelmModeled, AptModeled} {
+		for _, m := range list {
+			if m.Name == "" || m.Fails == "" {
+				t.Errorf("%+v carries no native validation", m)
+			}
+		}
+	}
+	dir := t.TempDir()
+	for _, m := range NpmModeled {
+		_, typed := npmTypes[m.Name]
+		starts := strings.HasPrefix(m.Fails, "NpmStartError")
+		if typed != starts {
+			t.Errorf("npm %s: typed=%v, and its list entry says %q", m.Name, typed, m.Fails)
+		}
+		if !starts {
+			continue
+		}
+		rc := filepath.Join(dir, m.Name+".npmrc")
+		if err := os.WriteFile(rc, []byte(m.Name+"=not-a-value\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if NpmStartError(rc) == "" {
+			t.Errorf("npm %s=not-a-value is not refused", m.Name)
+		}
+		if got := NpmUncertified(nil, []string{rc}); got != "" {
+			t.Errorf("npm %s is on the list and refused as unlisted: %s", m.Name, got)
+		}
+	}
+	for _, m := range PipModeled {
+		err := PipInstallError([]PipLayer{{File: "pip.conf", Data: []byte("[global]\n" + m.Name + " = not-a-value\n")}}, nil)
+		if fails := strings.HasPrefix(m.Fails, "PipInstallError"); fails != (err != nil) {
+			t.Errorf("pip %s = not-a-value: err=%v, and its list entry says %q", m.Name, err, m.Fails)
+		}
+	}
+	base, _ := url.Parse(testBase)
+	for value, refused := range map[string]bool{
+		"GOFLAGS=-mod=mod": false, "GOFLAGS=-mod=readonly -modcacherw": false, "GOFLAGS=-modcacherw=false": false, "GOFLAGS=": false,
+		"GOFLAGS=-bodega-unknown-flag": true, "GOFLAGS=-mod=vendor": true, "GOFLAGS='-mod=mod'": true, "GOFLAGS=-modcacherw=maybe": true,
+		"GOSUMDB=off": false, "GOSUMDB=sum.golang.org": false, "GOSUMDB=sum.golang.org https://sum.corp.example": true, "GOSUMDB=a b c": true,
+		"GOINSECURE=legacy.corp.example": false, "GOINSECURE=bodega.example.com": true, "GOINSECURE=*.example.com": true,
+		"GOPRIVATE=[": false, "GONOPROXY=git.corp.example/*": false, "GONOSUMDB=*": false,
+		"GOTOOLCHAIN=local": true, "GOROOT=/opt/go": true, "GOPATH=": false,
+	} {
+		got := GoEnvUncertified("go/env", []byte(value+"\n"), base)
+		name, _, _ := strings.Cut(value, "=")
+		if refused != (got != "") || refused && !strings.Contains(got, name) {
+			t.Errorf("%s: refused=%q, want refused=%v naming %s", value, got, refused, name)
+		}
+	}
+	for value, refused := range map[string]bool{
+		"": false, "DIRECT": false, "http://proxy.corp.example:3128": false, "socks5h://proxy.corp.example:1080": false,
+		"https://proxy.corp.example": true, "ftp://proxy.corp.example": true, "proxy.corp.example:3128": true,
+	} {
+		if got := aptProxyRefused(value); refused != (got != "") {
+			t.Errorf("apt proxy %q: refused=%q, want %v", value, got, refused)
+		}
+	}
+	for _, body := range []string{"generated: not-a-time\n", "repositories:\n- name: a\n  url: https://a\n  pass_credentials_all: maybe\n", "repositories:\n- name: a\n  url: https://a\n  insecure_skip_tls_verify: 7\n"} {
+		if _, err := ParseHelmFile([]byte(body)); err == nil {
+			t.Errorf("helm loads %q", body)
+		}
+	}
+	// A key helm's decoder would match in another case is not read as the
+	// key of the list.
+	if got := HelmUncertified("repositories.yaml", []byte("repositories:\n- name: a\n  url: https://a\n  CAFILE: /x.pem\n"), base); !strings.Contains(got, "CAFILE") {
+		t.Errorf("helm key in another case: %q", got)
+	}
+}
+
+// The GOFLAGS arguments the list holds start go mod download, which reaches
+// the proxy, and one outside it stops the go command first.
+func TestGoFlagsModeledStartNativeGo(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	file := filepath.Join(root, "go.env")
+	base, _ := url.Parse(testBase)
+	for _, flags := range append(slices.Clone(goFlagsModeled), "-mod=mod -modcacherw", "-mod=bogus-for-download-only", "-C=/nowhere") {
+		if err := os.WriteFile(file, []byte("GOPROXY="+srv.URL+"\nGOFLAGS="+flags+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		oracletest.QuietGo(t, root)
+		cmd := exec.Command(goBin, "mod", "download", "example.com/audit@v1.0.0")
+		cmd.Dir = root
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "GOENV=" + file, "GOTOOLCHAIN=" + oracletest.GoVersion, "GOSUMDB=off", "GOPATH=" + filepath.Join(root, "gopath"), "GOWORK=off"}
+		requests.Store(0)
+		out, _ := cmd.CombinedOutput()
+		modeled := GoEnvUncertified(file, []byte("GOFLAGS="+flags+"\n"), base) == ""
+		if modeled && requests.Load() == 0 {
+			t.Errorf("GOFLAGS=%q is on the list and native go reached no proxy: %s", flags, out)
+		}
+		t.Logf("GOFLAGS=%q: modeled=%v requests=%d", flags, modeled, requests.Load())
+	}
+}
+
+// TestPlannedFilesAreCertifiedBeforeWrites drives the gate AddCA runs over
+// each file as the plan would write it: a setting the host's file scopes to
+// another URL, or a value the merge carries in, refuses there for every
+// reader whose settings can travel with a merged entry, and the same files
+// without it pass.
+func TestPlannedFilesAreCertifiedBeforeWrites(t *testing.T) {
+	h := CAHost{Base: testBase, Getenv: func(string) string { return "" }, GOOS: OSLinux}
+	cases := []struct {
+		system, target, bad, good, names string
+	}{
+		{manifest.TypeHelm, "/home/u/.config/helm/repositories.yaml",
+			"apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- name: bodega\n  url: " + testBase + "/helm\n  insecure_skip_tls_verify: true\n",
+			"apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- name: bodega\n  url: " + testBase + "/helm\n",
+			"insecure_skip_tls_verify"},
+		{manifest.TypeGomod, "/home/u/.config/go/env",
+			"GOPROXY=" + testBase + "/go\nGOFLAGS=-modcacherw \n",
+			"GOPROXY=" + testBase + "/go\nGOFLAGS=-modcacherw\n",
+			"GOFLAGS"},
+		{manifest.TypePypi, "/home/u/.config/pip/pip.conf",
+			"[global]\nindex-url = " + testBase + "/pypi/simple/\ntimeout = -1\n",
+			"[global]\nindex-url = " + testBase + "/pypi/simple/\ntimeout = 30\n",
+			"timeout"},
+	}
+	for _, c := range cases {
+		change := func(body string) []Change {
+			return []Change{{Record: PlanRecord{System: c.system, Path: c.target}, Target: c.target, New: []byte(body)}}
+		}
+		if err := h.plannedUncertified(change(c.bad), CA{}); err == nil || !strings.Contains(err.Error(), c.names) || !strings.Contains(err.Error(), "Nothing was written") {
+			t.Errorf("%s: planned file with %s: err = %v, want a refusal naming it", c.system, c.names, err)
+		}
+		if err := h.plannedUncertified(change(c.good), CA{}); err != nil {
+			t.Errorf("%s: planned file without %s refused: %v", c.system, c.names, err)
+		}
+	}
+}
+
+func TestCARefusesContainerdEquivalentHostBypass(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/containerd/certs.d/docker.io/hosts.toml"
+	writeUnder(t, home, map[string]string{file: "server = \"https://registry-1.docker.io\"\n\n[host.\"" + testBase + "/v2\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n"})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, file))
+	doc, err := ParseContainerdHostsFile(filepath.Dir(c.Target), c.New)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := doc.Hosts[0]
+	if first.Host != "bodega.example.com" || first.Path != "/v2" || !first.Pull || first.SkipVerify == nil || !*first.SkipVerify {
+		t.Fatalf("fixture no longer reaches bodega without verification: %+v", first)
+	}
+	t.Fatal("AddCA accepted a first-choice bodega host with skip_verify=true because its table key includes /v2")
+}
+
+func TestCARefusesContainerdMergedServerBypass(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/containerd/certs.d/bodega.example.com/hosts.toml"
+	writeUnder(t, home, map[string]string{file: "server = \"https://old.example.com\"\nskip_verify = true\n"})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "bodega.example.com", testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, file))
+	doc, err := ParseContainerdHostsFile(filepath.Dir(c.Target), c.New)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key := doc.SkipsVerify(func(key string) bool { return key == testBase }); key == "" {
+		t.Fatalf("fixture lost the merged server's bypass:\n%s", c.New)
+	}
+	t.Fatal("AddCA accepted a merged server pointing to bodega with skip_verify=true; its second hosts.toml check still reads the old server")
+}
+
+func TestCARefusesHelmEquivalentHostBypass(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/helm/repositories.yaml"
+	writeUnder(t, home, map[string]string{file: HelmDocument("- name: insecure-alias\n  url: https://bodega.example.com:443/helm\n  insecure_skip_tls_verify: true\n")})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, file))
+	doc, err := ParseHelmFile(c.New)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Repositories) != 2 || !doc.Repositories[0].InsecureSkipTLSVerify || doc.Repositories[0].URL != "https://bodega.example.com:443/helm" {
+		t.Fatalf("fixture lost the unverified alias:\n%s", c.New)
+	}
+	t.Fatal("AddCA accepted an insecure Helm repository at bodega's endpoint because its URL spells the default HTTPS port explicitly")
+}
+
+func TestCARefusesNpmCAPathInjectsVerificationBypass(t *testing.T) {
+	npm := oracletest.Npm(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer srv.Close()
+	home := filepath.Join(t.TempDir(), "home\nstrict-ssl=false\n#")
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeUnder(t, home, map[string]string{".npmrc": "audit=false\n"})
+	h := CAHost{Base: srv.URL, Home: home, Root: t.TempDir(), GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Npm(srv.URL, nil)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, ".npmrc"))
+	if !slices.ContainsFunc(NpmOptions(c.New), func(o NpmOption) bool { return o.Key == "strict-ssl" && o.Value == "false" }) {
+		t.Fatalf("fixture did not produce a TLS bypass:\n%s", c.New)
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, npm, "ping", "--fetch-retries=0", "--fetch-timeout=3000", "--loglevel=error", "--cache="+t.TempDir())
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native npm did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted strict-ssl=false injected by its CA path; native npm sent %d requests to an HTTPS server whose certificate the installed CA does not sign", requests.Load())
+}
+
+func TestCARefusesPipDownloadTrustedHostBypass(t *testing.T) {
+	python := oracletest.Pip(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>"))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "unrelated.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/pip.conf"
+	writeUnder(t, home, map[string]string{file: "[global]\nretries=0\ndisable-pip-version-check=true\n[download]\ntrusted-host=" + u.Host + "\n"})
+	h := CAHost{Base: srv.URL, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Pip(srv.URL)), ca, h)
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, python, "-m", "pip", "download", "--no-deps", "--dest", filepath.Join(home, "downloads"), "bodega-loop1-does-not-exist")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + filepath.Join(home, file)}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native pip did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted [download] trusted-host; native pip sent %d requests to an HTTPS server whose certificate the installed CA does not sign", requests.Load())
+}
+
+func TestCARefusesGoModuleSubpathBypass(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "bodega.example.com:443" {
+			http.Error(w, "unexpected proxy target", http.StatusBadRequest)
+			return
+		}
+		upstream, err := net.DialTimeout("tcp", strings.TrimPrefix(srv.URL, "https://"), 5*time.Second)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		client, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go func() {
+			_, _ = io.Copy(upstream, buffered)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(client, upstream)
+	}))
+	defer proxy.Close()
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/go/env"
+	writeUnder(t, home, map[string]string{file: "GONOPROXY=bodega.example.com/private\nGOINSECURE=bodega.example.com/private\n"})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	oracletest.QuietGo(t, home)
+	cmd := exec.CommandContext(ctx, goBin, "mod", "download", "bodega.example.com/private@v1.0.0")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GOENV=" + filepath.Join(home, file), "GOTOOLCHAIN=local", "GOSUMDB=off", "GOWORK=off", "GOPATH=" + filepath.Join(home, "gopath"), "HTTPS_PROXY=" + proxy.URL}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native Go did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted GOINSECURE scoped below bodega's host; native Go sent %d requests through GONOPROXY without verifying the server certificate", requests.Load())
+}
+
+// TestStockUbuntuAptConfigurationCertifies loads the apt.conf.d an Ubuntu
+// 26.04 cloud image ships (copied from one, hooks and all) and asserts doctor
+// certifies apt under it: the stock hooks outside Acquire decide no trust.
+func TestStockUbuntuAptConfigurationCertifies(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "etc", "apt", "apt.conf.d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stock, err := filepath.Glob(filepath.Join("testdata", "ubuntu-26.04-apt.conf.d", "*"))
+	if err != nil || len(stock) < 10 {
+		t.Fatalf("stock apt.conf.d fixture: %d files, %v", len(stock), err)
+	}
+	for _, f := range stock {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, filepath.Base(f)), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf, err := LoadAptConfig(root, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("LoadAptConfig: %v", err)
+	}
+	if u := conf.Uncertified("bodega.example.com"); u != "" {
+		t.Errorf("stock Ubuntu apt.conf.d is not certified: %s", u)
+	}
+	if u := conf.TLSUnmodeled("bodega.example.com"); u != "" {
+		t.Errorf("stock Ubuntu apt.conf.d is unmodeled for TLS: %s", u)
+	}
+	if err := conf.HTTPSError("bodega.example.com", root); err != nil {
+		t.Errorf("stock Ubuntu apt.conf.d stops apt's https method: %v", err)
+	}
+}
+
+func TestCARefusesPipPaddedEndpointPort(t *testing.T) {
+	python := oracletest.Pip(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>"))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "https://" + net.JoinHostPort(u.Hostname(), "0"+u.Port())
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "unrelated.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/pip.conf"
+	writeUnder(t, home, map[string]string{file: "[global]\nretries=0\ndisable-pip-version-check=true\ntrusted-host=" + u.Host + "\n"})
+	h := CAHost{Base: base, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Pip(base)), ca, h)
+	if err != nil {
+		if !strings.Contains(err.Error(), "trusted-host") {
+			t.Fatalf("unexpected refusal: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, python, "-m", "pip", "download", "--no-deps", "--dest", filepath.Join(home, "downloads"), "bodega-loop2-does-not-exist")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + filepath.Join(home, file)}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native pip did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted trusted-host=%s for %s; native pip sent %d requests with an unrelated installed CA", u.Host, base, requests.Load())
+}
+
+func TestCARefusesHelmPaddedEndpointPort(t *testing.T) {
+	helm := oracletest.Helm(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte("apiVersion: v1\nentries: {}\n"))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := "https://" + net.JoinHostPort(u.Hostname(), "0"+u.Port()) + "/helm"
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "unrelated.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/helm/repositories.yaml"
+	writeUnder(t, home, map[string]string{file: HelmDocument("- name: insecure-alias\n  url: " + alias + "\n  insecure_skip_tls_verify: true\n")})
+	h := CAHost{Base: srv.URL, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, Helm(srv.URL)), ca, h)
+	if err != nil {
+		if !strings.Contains(err.Error(), "insecure_skip_tls_verify") {
+			t.Fatalf("unexpected refusal: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, helm, "repo", "update", "insecure-alias")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "HELM_REPOSITORY_CONFIG=" + filepath.Join(home, file), "HELM_REPOSITORY_CACHE=" + filepath.Join(home, "cache")}
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil || requests.Load() == 0 {
+		t.Fatalf("native Helm did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA accepted insecure_skip_tls_verify at %s; native Helm fetched %d indexes without trusting the installed CA", alias, requests.Load())
+}
+
+func TestCARefusesGoDistributionBypass(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "bodega.example.com:443" {
+			http.Error(w, "unexpected proxy target", http.StatusBadRequest)
+			return
+		}
+		upstream, err := net.DialTimeout("tcp", strings.TrimPrefix(srv.URL, "https://"), 5*time.Second)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		client, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go func() {
+			_, _ = io.Copy(upstream, buffered)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(client, upstream)
+	}))
+	defer proxy.Close()
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = ".config/go/env"
+	rootOut, err := exec.Command(goBin, "env", "GOROOT").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualRoot := strings.TrimSpace(string(rootOut))
+	goroot := t.TempDir()
+	entries, err := os.ReadDir(actualRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != "go.env" {
+			if err := os.Symlink(filepath.Join(actualRoot, entry.Name()), filepath.Join(goroot, entry.Name())); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeUnder(t, goroot, map[string]string{"go.env": "GONOPROXY=bodega.example.com/private\nGOINSECURE=bodega.example.com/private\n"})
+	getenv := func(key string) string {
+		if key == "GOROOT" {
+			return goroot
+		}
+		return ""
+	}
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: getenv}
+	in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	oracletest.QuietGo(t, home)
+	cmd := exec.CommandContext(ctx, goBin, "mod", "download", "bodega.example.com/private@v1.0.0")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GOENV=" + filepath.Join(home, file), "GOTOOLCHAIN=local", "GOROOT=" + goroot, "GOSUMDB=off", "GOWORK=off", "GOPATH=" + filepath.Join(home, "gopath"), "HTTPS_PROXY=" + proxy.URL}
+	out, runErr := cmd.CombinedOutput()
+	if requests.Load() == 0 {
+		t.Fatalf("native Go did not reproduce the bypass: %v\n%s", runErr, out)
+	}
+	t.Fatalf("AddCA ignored GOINSECURE in GOROOT/go.env; native Go sent %d requests through GONOPROXY without verifying the server certificate", requests.Load())
+}
+
+func TestCARefusesContainerdImplicitRegistryServer(t *testing.T) {
+	home := t.TempDir()
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const file = "etc/containerd/certs.d/bodega.example.com/hosts.toml"
+	const before = "skip_verify = true\n"
+	writeUnder(t, home, map[string]string{file: before})
+	h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, Getenv: func(string) string { return "" }}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"), ContainerdConfig(testBase)), ca, h)
+	if err != nil {
+		return
+	}
+	c := changeAt(t, in.Changes, filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml"))
+	if !strings.Contains(string(c.New), "ca = ") {
+		t.Fatalf("fixture did not install the mirror CA:\n%s", c.New)
+	}
+	doc, err := LoadContainerdHostsFile(filepath.Join(home, file))
+	if err != nil || doc == nil || len(doc.Hosts) != 1 {
+		t.Fatalf("fixture does not load: %+v, %v", doc, err)
+	}
+	server := doc.Hosts[0]
+	if !server.Server || server.Key != "" || server.SkipVerify == nil || !*server.SkipVerify {
+		t.Fatalf("fixture lost its implicit server's skip_verify: %+v", server)
+	}
+	t.Fatal("AddCA accepted skip_verify=true for bodega's own registry directory; containerd fills an omitted server from the registry name, but preflight matches only the empty server key")
+}
+
+// Every pip setting doctor admits is classified as naming a location or not,
+// and each location-bearing one reaches PipEndpoints from a file and from the
+// environment with pip's precedence, so admitting a setting without
+// classifying it, or classifying it without feeding the endpoint list, fails.
+func TestPipModeledLocationsFeedEndpoints(t *testing.T) {
+	base, _ := url.Parse(testBase)
+	plain := strings.Replace(testBase, "https://", "http://", 1) + "/x"
+	names := map[string]bool{}
+	for _, m := range PipModeled {
+		names[m.Name] = true
+		bearing, classified := pipLocations[m.Name]
+		if !classified {
+			t.Errorf("pip %s is modeled but not classified in pipLocations", m.Name)
+			continue
+		}
+		layers := []PipLayer{{File: "pip.conf", Data: []byte("[global]\n" + m.Name + " = " + plain + "\n")}}
+		setting, route := PipPlainRoute(PipEndpoints(layers, nil), base)
+		if bearing != (route == plain) || bearing && !strings.HasPrefix(setting, m.Name+" (") {
+			t.Errorf("pip %s (location=%v) in a file: setting=%q route=%q", m.Name, bearing, setting, route)
+		}
+		env := "PIP_" + strings.ToUpper(strings.ReplaceAll(m.Name, "-", "_"))
+		getenv := func(k string) string {
+			if k == env {
+				return plain
+			}
+			return ""
+		}
+		if _, route := PipPlainRoute(PipEndpoints(nil, getenv), base); bearing != (route == plain) {
+			t.Errorf("pip %s (location=%v) from %s: route=%q", m.Name, bearing, env, route)
+		}
+	}
+	for name := range pipLocations {
+		if !names[name] {
+			t.Errorf("pipLocations classifies %s, which PipModeled does not admit", name)
+		}
+	}
+	// [install] replaces [global]'s value for pip install, and the environment
+	// replaces both, so a replaced plain route is no route.
+	layers := []PipLayer{{File: "pip.conf", Data: []byte("[global]\nfind-links = " + plain + "\n[install]\nfind-links = /srv/wheels\n")}}
+	if _, route := PipPlainRoute(PipEndpoints(layers, nil), base); route != "" {
+		t.Errorf("a find-links [install] replaced still counts: %q", route)
+	}
+	getenv := func(k string) string {
+		if k == "PIP_FIND_LINKS" {
+			return "/srv/wheels " + plain
+		}
+		return ""
+	}
+	if setting, route := PipPlainRoute(PipEndpoints(nil, getenv), base); route != plain || !strings.Contains(setting, "PIP_FIND_LINKS") {
+		t.Errorf("the second word of PIP_FIND_LINKS: setting=%q route=%q", setting, route)
+	}
+}
+
+// A pip location resolves to the host pip connects to, or is reported
+// unresolved: no form pip may send to bodega drops out of the endpoint list.
+func TestPipEndpointDestResolvesAsPip(t *testing.T) {
+	base, _ := url.Parse("https://bodega.example.com:8443")
+	for _, c := range []struct {
+		raw        string
+		plain, tls bool
+		unresolved bool
+	}{
+		{raw: "http://bodega%2eexample%2ecom:8443/x", plain: true},
+		{raw: "HTTP://user@BODEGA.example.com:8443/x", plain: true},
+		{raw: "http://bodega.example.com./x", plain: true},
+		{raw: "https://bodega%2eexample.com:8443/simple/", tls: true},
+		{raw: "https://bodega.example.com:08443/simple/", tls: true},
+		{raw: "https://elsewhere.example/simple/"},
+		{raw: "/srv/wheels"},
+		{raw: "file:///srv/wheels"},
+		{raw: "git+https://bodega.example.com/x"},
+		{raw: "http://bodega%zzexample.com/x", unresolved: true},
+		{raw: "http://bödega.example.com/x", unresolved: true},
+		{raw: "https://bodega%c3%a9.example.com/x", unresolved: true},
+		{raw: "https:bodega.example.com/x", unresolved: true},
+		{raw: "http://bodega.example.com:84a3/x", unresolved: true},
+		{raw: "http://bodega.example.com:99999/x", unresolved: true},
+		{raw: "http://[::1/x", unresolved: true},
+		{raw: "http:///x", unresolved: true},
+	} {
+		e := PipEndpoint{Setting: "find-links", From: "pip.conf", Raw: c.raw}
+		eps := []PipEndpoint{e}
+		_, route := PipPlainRoute(eps, base)
+		tls := e.TLS()
+		reaches := tls != nil && tls.Hostname() == base.Hostname() && tls.Port() == base.Port()
+		unresolved := PipUnresolved(eps)
+		if (route != "") != c.plain || reaches != c.tls || (unresolved != "") != c.unresolved {
+			t.Errorf("%s: plain route %q, TLS to bodega %v, unresolved %q", c.raw, route, reaches, unresolved)
+		}
+		if c.unresolved && !strings.Contains(unresolved, "find-links (pip.conf)") {
+			t.Errorf("%s: the unresolved report names no setting and source: %q", c.raw, unresolved)
+		}
+	}
+}
+
+// The preflight's system store is the one the rebuild leaves: an anchor the
+// plan rewrites takes its old certificate out, rather than keeping it beside
+// the new one.
+func TestProposedSystemRootsDropsReplacedAnchor(t *testing.T) {
+	oldPEM, _, _ := testCA(t, "old.example.com")
+	newPEM, _, _ := testCA(t, "new.example.com")
+	otherPEM, _, _ := testCA(t, "other.example.com")
+	root := t.TempDir()
+	h := CAHost{Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+	bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	for path, data := range map[string][]byte{bundle: append(append([]byte{}, oldPEM...), otherPEM...), anchor: oldPEM} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(certs []*x509.Certificate) []string {
+		var out []string
+		for _, c := range certs {
+			sum := sha256.Sum256(c.Raw)
+			out = append(out, hex.EncodeToString(sum[:]))
+		}
+		slices.Sort(out)
+		return out
+	}
+	replace := []Change{{Target: anchor, Old: oldPEM, Existed: true, New: newPEM}}
+	got, err := ProposedSystemRoots(h, replace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNames, oldCA, newCA, otherCA := names(got), names(pemCerts(oldPEM)), names(pemCerts(newPEM)), names(pemCerts(otherPEM))
+	if slices.Contains(gotNames, oldCA[0]) || !slices.Contains(gotNames, newCA[0]) || !slices.Contains(gotNames, otherCA[0]) {
+		t.Errorf("replacing the anchor: store %v, want %v and %v without %v", gotNames, newCA, otherCA, oldCA)
+	}
+	idle := []Change{{Target: anchor, Old: oldPEM, Existed: true, New: oldPEM}}
+	if got, _ := ProposedSystemRoots(h, idle); !slices.Contains(names(got), oldCA[0]) {
+		t.Errorf("an unchanged anchor lost its certificate: %v", names(got))
+	}
+}
+
+func TestRedactLocationsWithoutParsing(t *testing.T) {
+	const secret = "marker-pw"
+	for _, in := range []string{
+		"https://u:" + secret + "@bödega.internal:8443/x.whl",
+		`http://u:` + secret + `@host\name/simple/`,
+		"find-links (file line 3) is https://" + secret + "@[::1/x, and it fails",
+		"git+ssh://u:" + secret + "@host/repo",
+		"https://host/simple/?token=" + secret + "&page=2",
+		"https://host/x?X-Amz-Signature=" + secret,
+		"https://host/simple/?%74oken=" + secret,
+		`registry="https:\u002f\u002fu:` + secret + `@creds.example/repo/"`,
+		`registry=https:\/\/u:` + secret + `@creds.example/`,
+		"https:u:" + secret + "@creds.example/",
+		`https:\\u:` + secret + `@creds.example/`,
+		"https://u:" + secret + "@ho%zzst/",
+		"https://host/#" + secret,
+		"https://u,x:" + secret + "@host/",
+		"GOPROXY=https://a.example,https://u:" + secret + "@b.example,direct",
+		"registry=https://u " + secret + ":x@h/",
+		"registry=https://u:a " + secret + "@h/",
+		`registry = "https://u:a ` + secret + `@h/repo/"`,
+		"index-url=https://packages.example/simple/?token=prefix," + secret,
+		"index-url=https://packages.example/simple/#prefix|" + secret,
+		"find-links=http://h/x.whl?token=a," + secret + " and more",
+		"https://a.example/p,https://u:" + secret + "@b.example/",
+		"GONOSUMDB=corp.example/*,u:" + secret + "@x",
+	} {
+		got := RedactLocations(in)
+		if strings.Contains(got, secret) {
+			t.Errorf("RedactLocations(%q) = %q, still carries the secret", in, got)
+		}
+	}
+	//nolint:gosec // G101: synthetic userinfo the redactor has to strip.
+	for in, want := range map[string]string{
+		"index-url = https://host/simple/?page=2":                              "index-url = https://host/simple/",
+		`registry="https:\u002f\u002fu:pw@creds.example:8443/r/"`:              `registry="https://<redacted>@creds.example:8443/r/"`,
+		`"registry-mirrors": ["https://mirror.example"]`:                       `"registry-mirrors": ["https://mirror.example"]`,
+		"proxy ftp://u:pw@host:x/p is invalid":                                 "proxy " + LocationWithheld + " is invalid",
+		"no location here: http: error":                                        "no location here: http: error",
+		"GOPROXY=https://u:pw@proxy.golang.org,direct":                         "GOPROXY=https://<redacted>@proxy.golang.org,direct",
+		"GOPROXY=https://a.example|https://b.example/p?t=x,off":                "GOPROXY=https://a.example|https://b.example/p,off",
+		"GOPROXY=https://u:pw@c.example/r/?token=pw,direct":                    "GOPROXY=https://<redacted>@c.example/r/,direct",
+		"https://u,x:pw@host/":                                                 "https://<redacted>@host/",
+		"https://h/simple/?a=1,b=2":                                            "https://h/simple/",
+		`[url "https://u:pw@creds.example/repo/?token=pw"]`:                    `[url "https://<redacted>@creds.example/repo/"]`,
+		"go env -w GOPROXY=http://<bodega>/go,https://proxy.golang.org,direct": "go env -w GOPROXY=http://<bodega>/go,https://proxy.golang.org,direct",
+		"index-url=https://packages.example/simple/?token=a,b":                 "index-url=https://packages.example/simple/",
+		"https://packages.example/simple/#a|b":                                 "https://packages.example/simple/",
+		"GOPRIVATE=corp.example/*,*.internal":                                  "GOPRIVATE=corp.example/*,*.internal",
+		"GOPROXY='https://a.example/?t=x|direct'":                              "GOPROXY='https://a.example/|direct'",
+	} {
+		if got := RedactLocations(in); got != want {
+			t.Errorf("RedactLocations(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

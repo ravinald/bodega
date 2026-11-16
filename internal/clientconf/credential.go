@@ -1,7 +1,9 @@
 package clientconf
 
 import (
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -262,4 +264,243 @@ func redactXMLElements(l string) string {
 		last = m[5]
 	}
 	return sb.String() + l[last:]
+}
+
+// LocationWithheld stands in for a location whose authority cannot be
+// rebuilt as a plain host and port, so no part of its text is printed.
+const LocationWithheld = "<location withheld>"
+
+var (
+	schemeStart     = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*:`)
+	printableEscape = regexp.MustCompile(`\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|x([0-9A-Fa-f]{2})|(/))`)
+	// cleanHost and cleanPort also take the <bodega> and {host} placeholders
+	// remediation text writes in place of a real address.
+	cleanHost = regexp.MustCompile(`^(?:\[[0-9A-Fa-f:.]+\]|(?:[\p{L}\p{N}._~-]|<[A-Za-z_]+>|\{[A-Za-z_]+\})*)$`)
+	cleanPort = regexp.MustCompile(`^(?:[0-9]*|<[A-Za-z_]+>)$`)
+)
+
+// specialSchemes are the WHATWG special schemes, which npm's URL parser
+// accepts with any run of slashes or backslashes, or none, before the
+// authority.
+var specialSchemes = map[string]bool{"http": true, "https": true, "ws": true, "wss": true, "ftp": true, "file": true}
+
+// RedactLocations rewrites every location in text, as a diagnostic prints
+// it, to scheme://host[:port]/path: userinfo becomes the Redacted marker,
+// and query and fragment are dropped whole, so no credential survives whatever encoding a client
+// decodes in them (a percent-escaped query key, a JSON-escaped userinfo).
+// A line holding escapes for printable characters is read decoded when that
+// reveals a location, because npm/ini, YAML, TOML and JSON strings all
+// decode \u002f and its kin before the client sees a URL. An authority that
+// is not a plain host and port after the userinfo goes prints as
+// LocationWithheld. Only diagnostics pass through here; the bytes a client
+// reads are never rewritten.
+func RedactLocations(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if d := decodePrintableEscapes(l); d != l && schemeStart.MatchString(d) {
+			l = d
+		}
+		lines[i] = renderLine(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// decodePrintableEscapes decodes \uXXXX, \UXXXXXXXX, \xXX and \/ wherever
+// the result is printable ASCII other than a quote or backslash, leaving
+// every other escape, and so the line's quoting, as it was.
+func decodePrintableEscapes(l string) string {
+	return printableEscape.ReplaceAllStringFunc(l, func(m string) string {
+		if m == `\/` {
+			return "/"
+		}
+		n, err := strconv.ParseUint(m[2:], 16, 32)
+		if err != nil || n < 0x21 || n > 0x7e || n == '"' || n == '\'' || n == '\\' {
+			return m
+		}
+		return string(rune(n))
+	})
+}
+
+func renderLocations(l string) string {
+	var sb strings.Builder
+	last := 0
+	for _, m := range schemeStart.FindAllStringIndex(l, -1) {
+		if m[0] < last || (m[0] > 0 && isSchemeChar(l[m[0]-1])) {
+			continue
+		}
+		scheme, after, ok := locationStart(l, m)
+		if !ok {
+			continue
+		}
+		token := tokenAt(l, after)
+		trimmed := strings.TrimRight(token, `"'),;]>}`+"`")
+		sb.WriteString(l[last:m[0]])
+		if span := spannedUserinfo(l[after:], len(token)); span > 0 {
+			sb.WriteString(LocationWithheld)
+			last = after + span
+			continue
+		}
+		sb.WriteString(rebuildLocation(scheme, trimmed, specialSchemes[scheme]))
+		sb.WriteString(token[len(trimmed):])
+		last = after + len(token)
+	}
+	return sb.String() + l[last:]
+}
+
+// locationStart reports whether the scheme match m in l opens a location,
+// and where its authority begins. Any scheme followed by // qualifies. A
+// special scheme also qualifies with any run of slashes and backslashes, or
+// with none when an @ follows, because npm's WHATWG parser reads
+// https:user:pass@host as an authority.
+func locationStart(l string, m []int) (scheme string, after int, ok bool) {
+	scheme = strings.ToLower(l[m[0] : m[1]-1])
+	if !specialSchemes[scheme] {
+		return scheme, m[1] + 2, strings.HasPrefix(l[m[1]:], "//")
+	}
+	after = m[1]
+	for after < len(l) && (l[after] == '/' || l[after] == '\\') {
+		after++
+	}
+	if after == m[1] && !strings.Contains(tokenAt(l, after), "@") {
+		return scheme, after, false
+	}
+	return scheme, after, true
+}
+
+// spannedUserinfo is how far a userinfo holding whitespace runs into rest,
+// the text after scheme://, or 0 when it holds none. WHATWG URL parsing
+// percent-encodes a space in userinfo rather than ending the authority
+// there, so npm reads https://u p:x@h/ as host h with password x, and an
+// @ before the next path, query or fragment delimiter means the authority
+// spans the whitespace.
+func spannedUserinfo(rest string, token int) int {
+	if strings.ContainsAny(rest[:token], "/?#\\") {
+		return 0
+	}
+	end := len(rest)
+	if i := strings.IndexAny(rest[token:], "/?#\\"); i >= 0 {
+		end = token + i
+	}
+	if at := strings.LastIndexByte(rest[token:end], '@'); at >= 0 {
+		return token + at + 1
+	}
+	return 0
+}
+
+// tokenAt is the run of l from i up to the next whitespace.
+func tokenAt(l string, i int) string {
+	j := i
+	for j < len(l) && l[j] != ' ' && l[j] != '\t' && l[j] != '\r' {
+		j++
+	}
+	return l[i:j]
+}
+
+func isSchemeChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '+' || c == '.' || c == '-'
+}
+
+// goListSetting matches a Go environment setting whose value the go command
+// splits into a list, with the value that follows its =. Only these values
+// are split: GOPROXY at commas and pipes (proxyList in
+// cmd/go/internal/modfetch/proxy.go), the other four at commas
+// (module.MatchPrefixPatterns). Every other location is one URL whatever
+// punctuation its path, query or fragment holds, because its client reads
+// it as one, and a comma in a pip query split off as a list member would
+// print the credential after it.
+var goListSetting = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])(GOPROXY|GONOSUMDB|GOPRIVATE|GONOPROXY|GOINSECURE)=["']?([^ \t\r"']*)`)
+
+// renderLine renders every location in l, splitting only the value of a Go
+// list setting named in the line.
+func renderLine(l string) string {
+	var sb strings.Builder
+	last := 0
+	for _, m := range goListSetting.FindAllStringSubmatchIndex(l, -1) {
+		sb.WriteString(renderLocations(l[last:m[4]]))
+		sb.WriteString(RenderGoList(l[m[2]:m[3]], l[m[4]:m[5]]))
+		last = m[5]
+	}
+	return sb.String() + renderLocations(l[last:])
+}
+
+// RenderGoList renders the value of the Go environment setting name as the
+// go command splits it, each member that is a location rebuilt on its own
+// and each other member (direct, off, a module path pattern) kept unless it
+// carries userinfo, a query or a fragment, when it prints as
+// LocationWithheld.
+func RenderGoList(name, value string) string {
+	seps := ","
+	if name == "GOPROXY" {
+		seps = ",|"
+	}
+	var sb strings.Builder
+	for value != "" {
+		member := value
+		sep := ""
+		if i := strings.IndexAny(value, seps); i >= 0 {
+			member, sep, value = value[:i], value[i:i+1], value[i+1:]
+		} else {
+			value = ""
+		}
+		sb.WriteString(renderGoListMember(member))
+		sb.WriteString(sep)
+	}
+	return sb.String()
+}
+
+func renderGoListMember(member string) string {
+	if m := schemeStart.FindStringIndex(member); m != nil && m[0] == 0 {
+		if scheme, after, ok := locationStart(member, m); ok {
+			return rebuildLocation(scheme, member[after:], specialSchemes[scheme])
+		}
+	}
+	if strings.ContainsAny(member, "@?#") {
+		return LocationWithheld
+	}
+	return member
+}
+
+// rebuildLocation renders the part of a location after scheme:// with its
+// userinfo replaced by the Redacted marker and its query and fragment gone. A special scheme ends its authority at
+// a backslash as well, as WHATWG URL parsing does.
+func rebuildLocation(scheme, rest string, special bool) string {
+	stops := "/?#"
+	if special {
+		stops += "\\"
+	}
+	cut := len(rest)
+	if i := strings.IndexAny(rest, stops); i >= 0 {
+		cut = i
+	}
+	authority, tail := rest[:cut], rest[cut:]
+	userinfo := ""
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authority, userinfo = authority[at+1:], Redacted+"@"
+	}
+	if i := strings.IndexAny(tail, "?#"); i >= 0 {
+		tail = tail[:i]
+	}
+	// A path holding another authority with userinfo is a list this
+	// renderer was not told to split; its second member's credential would
+	// print as path text.
+	if i := strings.Index(tail, "//"); i >= 0 && strings.Contains(tail[i:], "@") {
+		return LocationWithheld
+	}
+	host, port := authority, ""
+	if i := strings.LastIndexByte(authority, ':'); i >= 0 && !strings.HasSuffix(authority, "]") {
+		host, port = authority[:i], authority[i:]
+		port = port[1:]
+	}
+	if strings.Contains(host, "%") {
+		if h, err := url.PathUnescape(host); err == nil {
+			host = h
+		}
+	}
+	if !cleanHost.MatchString(host) || !cleanPort.MatchString(port) {
+		return LocationWithheld
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + userinfo + host + tail
 }

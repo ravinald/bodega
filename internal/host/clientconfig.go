@@ -3,7 +3,6 @@ package host
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -23,6 +21,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // publicUpstreams maps each package-manager check to the substrings that, if
@@ -53,7 +52,7 @@ func checkAptSources(root, goos string) Finding {
 		f.Detail = "apt is Linux-only; check not applicable on this platform"
 		return f
 	}
-	if _, err := os.Stat(filepath.Join(root, "/etc/apt")); errors.Is(err, fs.ErrNotExist) {
+	if _, err := plannedfs.Stat(filepath.Join(root, "/etc/apt")); errors.Is(err, fs.ErrNotExist) {
 		f.Status = StatusNA
 		f.Detail = "/etc/apt is absent; apt is not installed on this host"
 		return f
@@ -122,7 +121,7 @@ type aptMirrorError struct {
 // deb822 stanzas for a .sources file, one-line entries for anything else.
 // Comments and stanzas with Enabled: no are dropped, as apt drops them.
 func aptSourceURIs(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +174,7 @@ func deb822Stanzas(text string) []aptEntry {
 		}
 		if line[0] == ' ' || line[0] == '\t' {
 			if field == "uris" {
-				cur.uris = append(cur.uris, strings.Fields(line)...)
+				cur.uris = append(cur.uris, clientconf.AptWords(line)...)
 			}
 			continue
 		}
@@ -187,7 +186,7 @@ func deb822Stanzas(text string) []aptEntry {
 		field = strings.ToLower(strings.TrimSpace(name))
 		switch field {
 		case "uris":
-			cur.uris = append(cur.uris, strings.Fields(value)...)
+			cur.uris = append(cur.uris, clientconf.AptWords(value)...)
 		case "enabled":
 			cur.setsEnabled = true
 			cur.enabled = !aptFalse(strings.TrimSpace(value))
@@ -220,7 +219,7 @@ func oneLineEntries(text string) []aptEntry {
 	var out []aptEntry
 	for i, line := range strings.Split(text, "\n") {
 		line, _, _ = strings.Cut(line, "#")
-		fields := strings.Fields(line)
+		fields := clientconf.AptWords(line)
 		if len(fields) < 2 || (fields[0] != "deb" && fields[0] != "deb-src") {
 			continue
 		}
@@ -253,7 +252,7 @@ func aptMirrorFile(uri string) (string, bool) {
 // aptMirrorURIs reads a mirror list: one URI per line, optionally followed by
 // tab-separated metadata, with '#' lines as comments.
 func aptMirrorURIs(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -292,7 +291,9 @@ func CheckPipConfig() Finding {
 	return checkPipConfig("", runtime.GOOS, home)
 }
 
-// pipPaths lists the files pip reads, system-wide first. On FreeBSD pip's
+// pipPaths lists the files pip reads, system-wide first, in the order pip
+// loads them, so a later file's setting replaces an earlier one's. macOS
+// adds the global file under /Library, where the plan writes. On FreeBSD pip's
 // global search is /etc/xdg/pip/pip.conf, /etc/pip.conf and
 // sys.prefix/pip.conf (measured with `pip config debug`, py312-pip 23.3.2 on
 // 15.1-RELEASE). /usr/local/etc/pip.conf is read by nothing, and is scanned
@@ -302,6 +303,9 @@ func pipPaths(goos, home string) []string {
 	paths := []string{"/etc/pip.conf"}
 	if goos == "freebsd" {
 		paths = append(paths, "/etc/xdg/pip/pip.conf", "/usr/local/pip.conf", "/usr/local/etc/pip.conf")
+	}
+	if goos == "darwin" {
+		paths = append(paths, "/Library/Application Support/pip/pip.conf")
 	}
 	if home != "" {
 		paths = append(paths,
@@ -385,12 +389,14 @@ func checkNpmConfig(root, goos, home string) Finding {
 }
 
 // rubyTools is what the rubygems check reads from the host, so a test can
-// stand in for gem and for the environment Bundler resolves its config from.
+// stand in for which tools are on PATH and for the environment and files gem
+// and Bundler resolve their config from.
 type rubyTools struct {
-	lookPath   func(string) (string, error)
-	gemSources func(gem string) (string, error)
-	getenv     func(string) string
-	home       string
+	lookPath    func(string) (string, error)
+	getenv      func(string) string
+	lookupEnv   func(string) (string, bool)
+	home        string
+	systemGemrc string
 }
 
 // CheckRubygems reports whether gem or Bundler still fetch from
@@ -398,24 +404,11 @@ type rubyTools struct {
 // would describe a client nobody runs.
 func CheckRubygems() (f Finding, ok bool) {
 	home, _ := os.UserHomeDir()
-	return checkRubygems(rubyTools{lookPath: exec.LookPath, gemSources: runGemSources, getenv: os.Getenv, home: home})
-}
-
-// runGemSources asks gem itself, because the list it uses merges the system
-// gemrc, ~/.gemrc (or its XDG location) and every file $GEMRC names, and
-// falls back to rubygems.org when none of them sets :sources:.
-func runGemSources(gem string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, gem, "sources", "--list").Output()
-	if err != nil {
-		return "", fmt.Errorf("%s sources --list: %w", gem, err)
-	}
-	return string(out), nil
+	return checkRubygems(rubyTools{lookPath: exec.LookPath, getenv: os.Getenv, lookupEnv: os.LookupEnv, home: home, systemGemrc: systemGemrc(runtime.GOOS)})
 }
 
 func checkRubygems(t rubyTools) (Finding, bool) {
-	gem, gemErr := t.lookPath("gem")
+	_, gemErr := t.lookPath("gem")
 	_, bundleErr := t.lookPath("bundle")
 	if gemErr != nil && bundleErr != nil {
 		return Finding{}, false
@@ -423,11 +416,11 @@ func checkRubygems(t rubyTools) (Finding, bool) {
 	f := Finding{Check: "rubygems"}
 	var found, unread, clean []string
 	if gemErr == nil {
-		switch out, err := t.gemSources(gem); {
+		switch sources, err := gemSources(gemrcEnv{lookupEnv: t.lookupEnv, home: t.home, system: t.systemGemrc}); {
 		case err != nil:
-			unread = append(unread, "gem's sources could not be listed: "+err.Error())
-		case rubygemsOrgSource(out) != "":
-			found = append(found, "gem sources lists "+rubygemsOrgSource(out))
+			unread = append(unread, "unchecked: gem's sources cannot be decided from its gemrc files, and doctor does not run gem: "+err.Error())
+		case rubygemsOrgSource(sources) != "":
+			found = append(found, "gem sources lists "+rubygemsOrgSource(sources))
 		default:
 			clean = append(clean, "gem sources")
 		}
@@ -460,11 +453,10 @@ func checkRubygems(t rubyTools) (Finding, bool) {
 	return f, true
 }
 
-// rubygemsOrgSource is the first source `gem sources --list` prints on
-// rubygems.org, or "". The list is one URL per line under a banner.
-func rubygemsOrgSource(out string) string {
-	for _, line := range strings.Split(out, "\n") {
-		if src := strings.TrimSpace(line); isRubygemsOrg(src) {
+// rubygemsOrgSource is the first of gem's sources on rubygems.org, or "".
+func rubygemsOrgSource(sources []string) string {
+	for _, src := range sources {
+		if isRubygemsOrg(src) {
 			return src
 		}
 	}
@@ -510,7 +502,7 @@ func bundlerMirror(getenv func(string) string, home string) (mirror, from string
 	default:
 		return "", "", nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", "", nil
 	}
@@ -628,7 +620,7 @@ func toolPresent(lookPath func(string) (string, error), name, home string) bool 
 	if home == "" {
 		return false
 	}
-	entries, err := os.ReadDir(filepath.Join(home, "wrapper", "dists"))
+	entries, err := plannedfs.ReadDir(filepath.Join(home, "wrapper", "dists"))
 	return err == nil && len(entries) > 0
 }
 
@@ -637,7 +629,7 @@ func toolPresent(lookPath func(string) (string, error), name, home string) bool 
 // the repositories it names ahead of a * pattern. A missing file has no
 // mirror and is no error.
 func mavenMirror(path string) (mirror string, others []string, err error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil, nil
 	}
@@ -668,7 +660,7 @@ func mavenMirror(path string) (mirror string, others []string, err error) {
 // gradleInitURL is the repository bodega's init script at path sets, or ""
 // when the file sets none.
 func gradleInitURL(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -711,7 +703,7 @@ func checkComposer(t composerTools) (Finding, bool) {
 		return f, true
 	}
 	path := filepath.Join(dir, "config.json")
-	data, err := os.ReadFile(path)
+	data, err := plannedfs.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		f.Status = StatusWarn
@@ -789,30 +781,9 @@ func CheckGoproxyEnv() Finding {
 func checkGoproxy(getenv func(string) string, configDir func() (string, error)) Finding {
 	f := Finding{Check: "goproxy-env"}
 
-	val, source := getenv("GOPROXY"), "the environment"
-	if val == "" {
-		file, err := goEnvFile(getenv, configDir)
-		if err != nil {
-			f.Status = StatusSkip
-			f.Detail = "GOPROXY unset in the environment and the go env file could not be located: " + err.Error()
-			f.Remediation = "set GOENV to the go env file's path, or HOME, and run doctor again"
-			return f
-		}
-		if file != "" {
-			fileVal, found, err := readGoEnvFile(file, "GOPROXY")
-			if err != nil {
-				f.Status = StatusSkip
-				f.Detail = "GOPROXY unset in the environment and " + file + " could not be read: " + err.Error()
-				f.Remediation = "run doctor as the user whose go env file that is, or check its permissions"
-				return f
-			}
-			if found {
-				val, source = fileVal, file
-			}
-		}
-	}
-
-	reached := reachableProxies(val)
+	set := effectiveGoproxy(getenv, configDir)
+	val, source := set.val, set.source
+	reached := set.reached
 	public, direct := "", false
 	for _, entry := range reached {
 		switch {
@@ -824,13 +795,19 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 	}
 
 	switch {
-	case val == "":
+	case set.err != nil:
+		// The value is left out of the row: it is the one thing here that
+		// can hold a password, and the error names the entry redacted.
+		f.Status = StatusWarn
+		f.Detail = fmt.Sprintf("the go command refuses the GOPROXY list from %s (%v); it checks every entry before it asks the first proxy, so no module downloads through any of them and what the list reaches is unchecked", source, set.err)
+		f.Remediation = "correct or remove the entry the error names, or go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
+	case !set.found:
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY unset in the environment and the go env file; Go falls back to proxy.golang.org,direct which bypasses bodega"
 		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
-	case len(reached) == 0:
+	case set.dist && (public != "" || direct):
 		f.Status = StatusWarn
-		f.Detail = "GOPROXY=" + strconv.Quote(val) + " (from " + source + ") lists no proxy; the go command refuses every module download"
+		f.Detail = "GOPROXY unset in the environment and the go env file; Go falls back to " + val + " (from " + source + "), which bypasses bodega"
 		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
 	case public != "":
 		f.Status = StatusWarn
@@ -847,70 +824,21 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 	return f
 }
 
-// reachableProxies returns the GOPROXY entries the go command can reach, in
-// order, walking the list as cmd/go/internal/modfetch does: entries separated
-// by ',' or '|', each trimmed, empties skipped, and the walk ending at "off" or
-// "direct" inclusive, since nothing after either is ever consulted. The
-// separator only decides which errors fall through, and a fall-through to
-// direct or proxy.golang.org bypasses bodega either way.
-func reachableProxies(val string) []string {
-	var reached []string
-	for _, entry := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == '|' }) {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		reached = append(reached, entry)
-		if entry == "off" || entry == "direct" {
-			break
-		}
-	}
-	return reached
+// goSetting is clientconf.GoProxyPolicy under the names this package's rows
+// read it by.
+type goSetting struct {
+	val, source string
+	found, dist bool
+	// reached and err are clientconf.GoProxyList's answer for val.
+	reached []string
+	err     error
 }
 
-// goEnvFile is the file `go env -w` writes: $GOENV, or go/env under the user
-// config directory. "" means GOENV=off, where the go command reads no file.
-func goEnvFile(getenv func(string) string, configDir func() (string, error)) (string, error) {
-	switch file := getenv("GOENV"); file {
-	case "off":
-		return "", nil
-	case "":
-	default:
-		return file, nil
-	}
-	dir, err := configDir()
-	if err != nil {
-		return "", err
-	}
-	if dir == "" {
-		return "", errors.New("no user config directory")
-	}
-	return filepath.Join(dir, "go", "env"), nil
-}
-
-// readGoEnvFile returns key's value from a go env file, parsed as the go
-// command parses it: KEY=VALUE lines, untrimmed, the last assignment winning,
-// anything not opening with an uppercase letter skipped. A file that does not
-// exist is no value rather than an error, because that is what the go command
-// makes of it.
-func readGoEnvFile(path, key string) (string, bool, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	var val string
-	var found bool
-	for _, line := range strings.Split(string(data), "\n") {
-		k, v, ok := strings.Cut(line, "=")
-		if !ok || line[0] < 'A' || line[0] > 'Z' || k != key {
-			continue
-		}
-		val, found = v, true
-	}
-	return val, found, nil
+// effectiveGoproxy resolves GOPROXY, and what the go command makes of the
+// list, through clientconf.GoEnv: the one policy the CA install reads too.
+func effectiveGoproxy(getenv func(string) string, configDir func() (string, error)) goSetting {
+	p := clientconf.GoEnv{Getenv: getenv, ConfigDir: configDir}.Proxy()
+	return goSetting{val: p.Value, source: p.Source, found: p.Found, dist: p.Dist, reached: p.Proxies, err: p.Err}
 }
 
 // scanHit records the first config file that contains a public-upstream
@@ -925,7 +853,7 @@ type scanHit struct {
 // — the check is best-effort.
 func firstHit(paths, markers []string) scanHit {
 	for _, p := range paths {
-		data, err := os.ReadFile(p)
+		data, err := plannedfs.ReadFile(p)
 		if err != nil {
 			continue
 		}
@@ -950,9 +878,6 @@ type OCIHost struct {
 	// the main registries.conf in place of the system one.
 	Home           string
 	RegistriesConf string
-	// DockerdVersion runs the dockerd LookPath found with --version. Nil
-	// reads no version, which adds no note to the oci-docker row.
-	DockerdVersion func(dockerd string) (string, error)
 }
 
 const ociRemedy = "bodega doctor --configure oci --apply --url <bodega base URL>"
@@ -970,10 +895,10 @@ func (t OCIHost) Check(base string) []Finding {
 	}
 	var out []Finding
 	for _, rt := range []string{clientconf.RuntimeDocker, clientconf.RuntimeContainerd, clientconf.RuntimePodman} {
-		present, binPath := false, ""
+		present := false
 		for _, bin := range clientconf.RuntimeBinaries[rt] {
-			if p, err := t.LookPath(bin); err == nil {
-				present, binPath = true, p
+			if _, err := t.LookPath(bin); err == nil {
+				present = true
 			}
 		}
 		if !present {
@@ -982,11 +907,7 @@ func (t OCIHost) Check(base string) []Finding {
 		var f Finding
 		switch rt {
 		case clientconf.RuntimeDocker:
-			version := func() (string, error) { return "", errors.New("no version reader") }
-			if t.DockerdVersion != nil {
-				version = func() (string, error) { return t.DockerdVersion(binPath) }
-			}
-			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host, version)
+			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host)
 		case clientconf.RuntimeContainerd:
 			f = checkContainerdHosts(t.Root, host)
 		case clientconf.RuntimePodman:
@@ -1001,17 +922,9 @@ func (t OCIHost) Check(base string) []Finding {
 	return out
 }
 
-// mirrorIsBodega reports whether a mirror URL or location names host, or,
-// with no host to compare, whether there is a mirror at all.
-func mirrorIsBodega(mirror, host string) bool {
-	if host == "" {
-		return mirror != ""
-	}
-	m := strings.TrimPrefix(strings.TrimPrefix(mirror, "https://"), "http://")
-	return m == host || strings.HasPrefix(m, host+"/")
-}
-
-// RunDockerdVersion asks dockerd for its version string.
+// RunDockerdVersion runs dockerd --version. No doctor check calls it: a
+// binary found on PATH is not an admissible reader of where a client
+// connects. It is exported for the test that proves the report runs nothing.
 func RunDockerdVersion(dockerd string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1022,65 +935,42 @@ func RunDockerdVersion(dockerd string) (string, error) {
 	return string(out), nil
 }
 
-// dockerdNoLookup is the earliest Docker Engine measured not to resolve
-// docker.io while every pull is served by registry-mirrors; 26.1.5 (Debian
-// 13) asks systemd-resolved for it once per pull and connects nowhere.
-var dockerdNoLookup = [3]int{29, 1, 3}
+// dockerdLookupNote is on every mirrored dockerd's row. Whether it applies
+// turns on dockerd's version, which only running dockerd reports, and doctor
+// runs no client to learn where it connects: 26.1.5 (Debian 13) was measured
+// asking the resolver for docker.io once per pull and connecting nowhere,
+// and 29.1.3 is the earliest measured not to ask.
+const dockerdLookupNote = "; note: dockerd before 29.1.3 resolves docker.io on every pull, and no connection follows while the mirror answers, so on a host allowed to reach only bodega the name may be left unresolvable without breaking pulls (doctor does not run dockerd to read its version; dockerd --version reports it)"
 
-// dockerdVersionRe matches the whole version token, up to the comma before
-// "build", so a fourth component or trailing junk is unparseable rather than
-// truncated to a version dockerd never reported. Debian's +dfsg1 is build
-// metadata and a -rc1 a prerelease, as semver spells them.
-var dockerdVersionRe = regexp.MustCompile(`^Docker version (\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:,|$)`)
-
-// dockerdLookupNote is the note a mirrored dockerd's row carries when its
-// version is one that still resolves docker.io, or "" when the version is
-// later, or cannot be read: doctor never guesses one. The note names the
-// version with its prerelease, which is what ranks a 29.1.3-rc below the
-// measured release; build metadata ranks nothing and is left out.
-func dockerdLookupNote(version func() (string, error)) string {
-	out, err := version()
-	if err != nil {
-		return ""
+// mirrorIsBodega reports whether a mirror URL or location names host, or,
+// with no host to compare, whether there is a mirror at all.
+func mirrorIsBodega(mirror, host string) bool {
+	if host == "" {
+		return mirror != ""
 	}
-	m := dockerdVersionRe.FindStringSubmatch(strings.TrimSpace(out))
-	if m == nil {
-		return ""
-	}
-	var v [3]int
-	for i := range v {
-		n, err := strconv.Atoi(m[i+1])
-		if err != nil {
-			return ""
-		}
-		v[i] = n
-	}
-	switch c := slices.Compare(v[:], dockerdNoLookup[:]); {
-	case c > 0, c == 0 && m[4] == "":
-		return ""
-	}
-	read := m[1] + "." + m[2] + "." + m[3] + m[4]
-	floor := fmt.Sprintf("%d.%d.%d", dockerdNoLookup[0], dockerdNoLookup[1], dockerdNoLookup[2])
-	return "; note: dockerd " + read + " resolves docker.io on every pull, and no connection follows while the mirror answers, so on a host allowed to reach only bodega the name may be left unresolvable without breaking pulls (" + floor + " is the earliest version measured not to make the lookup)"
+	m := strings.TrimPrefix(strings.TrimPrefix(mirror, "https://"), "http://")
+	return m == host || strings.HasPrefix(m, host+"/")
 }
 
-func checkDockerMirror(path, host string, version func() (string, error)) Finding {
-	data, err := os.ReadFile(path)
+// checkDockerMirror judges the daemon.json at path as dockerd loads it,
+// whole: a file dockerd refuses over any key is one it does not start with,
+// so a mirror it names routes nothing.
+func checkDockerMirror(path, host string) Finding {
+	doc, err := clientconf.LoadDockerDaemonFile(path)
+	var unread *fs.PathError
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
-	case err != nil:
+	case errors.As(err, &unread):
 		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + path}
-	}
-	var doc struct {
-		Mirrors []string `json:"registry-mirrors"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return Finding{Status: StatusSkip, Detail: path + " is not JSON dockerd can read: " + err.Error(), Remediation: "repair " + path + "; dockerd refuses to start with it"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: "dockerd refuses to load its configuration (" + err.Error() + ") and does not start, so where it pulls from is unchecked", Remediation: "repair what the error names in " + path + "; dockerd --validate repeats it"}
+	case doc != nil && doc.StartError != "":
+		return Finding{Status: StatusSkip, Detail: "dockerd loads its configuration and exits as it starts (" + doc.StartError + "), so where it pulls from is unchecked", Remediation: "repair what the error names in " + path + "; dockerd --validate does not repeat it, starting dockerd does"}
+	case doc == nil:
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 	}
 	for _, m := range doc.Mirrors {
 		if mirrorIsBodega(m, host) {
-			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)" + dockerdLookupNote(version)}
+			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)" + dockerdLookupNote}
 		}
 	}
 	if len(doc.Mirrors) == 0 {
@@ -1091,7 +981,7 @@ func checkDockerMirror(path, host string, version func() (string, error)) Findin
 
 func checkContainerdHosts(root, host string) Finding {
 	cfgPath := filepath.Join(root, clientconf.ContainerdConfigPath)
-	data, err := os.ReadFile(cfgPath)
+	data, err := plannedfs.ReadFile(cfgPath)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return Finding{Status: StatusWarn, Detail: "no " + cfgPath + ", so containerd's CRI plugin has no config_path and reads no hosts.toml; bypasses bodega's registry"}
@@ -1099,7 +989,7 @@ func checkContainerdHosts(root, host string) Finding {
 		return Finding{Status: StatusSkip, Detail: cfgPath + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + cfgPath}
 	}
 	if _, err := clientconf.ReadContainerdConfig(data); err != nil {
-		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a config.toml containerd can load: " + err.Error(), Remediation: "repair " + cfgPath + "; containerd refuses to start with it"}
+		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a config.toml containerd can load, so where containerd pulls from is unchecked: " + err.Error(), Remediation: "repair " + cfgPath + "; containerd refuses to start with it"}
 	}
 	cfg, err := clientconf.ResolveContainerdConfig(root, clientconf.ContainerdConfigPath, data)
 	if err != nil {
@@ -1109,6 +999,8 @@ func checkContainerdHosts(root, host string) Finding {
 	switch {
 	case cfg.CRIDisabled:
 		return Finding{Status: StatusSkip, Detail: cfgPath + " disables the CRI plugin, so nothing here pulls through containerd's registry configuration; the oci-docker row covers dockerd"}
+	case cfg.Invalid != "":
+		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a configuration containerd can load, so where containerd pulls from is unchecked: " + cfg.Invalid, Remediation: "repair " + cfgPath + " or the import the error names; containerd refuses to start with it"}
 	case cfg.ConfigPath == "" && cfg.Legacy != "":
 		return Finding{Status: StatusSkip, Detail: cfgPath + " routes CRI pulls through the deprecated " + cfg.Legacy + " rather than config_path, which doctor does not judge",
 			Remediation: "move " + cfg.Legacy + " into hosts.toml files under " + clientconf.ContainerdCertsDir + " and remove it, then run " + ociRemedy}
@@ -1126,7 +1018,7 @@ func checkContainerdHosts(root, host string) Finding {
 		roots = append(roots, r)
 		for _, ns := range []string{"docker.io", "_default"} {
 			if p := filepath.Join(root, r, ns); dir == "" {
-				if _, err := os.Stat(p); err == nil {
+				if _, err := plannedfs.Stat(p); err == nil {
 					dir = p
 				}
 			}
@@ -1147,38 +1039,31 @@ func checkContainerdHosts(root, host string) Finding {
 	return f
 }
 
-// judgeContainerdHosts reads the hosts.toml containerd uses for docker.io.
-// containerd tries its hosts in file order and the upstream server last, so
-// bodega must be the first host that may pull.
+// judgeContainerdHosts reads the hosts.toml containerd uses for docker.io,
+// loaded whole as containerd loads it. containerd tries its hosts in file
+// order and the upstream server last, so bodega must be the first host that
+// may pull. A file containerd discards routes nothing: containerd falls back
+// to Docker Hub, whatever host the text names.
 func judgeContainerdHosts(path, host string) Finding {
-	data, err := os.ReadFile(path)
+	doc, err := clientconf.LoadContainerdHostsFile(path)
+	var unread *fs.PathError
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return Finding{Status: StatusWarn, Detail: "no " + path + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
-	case err != nil:
+	case errors.As(err, &unread):
 		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, or repair what the error names"}
+	case err != nil:
+		return Finding{Status: StatusWarn, Detail: "containerd discards its registry configuration (" + err.Error() + ") and pulls Docker Hub images from Docker Hub; bypasses bodega's registry",
+			Remediation: "fix the field the error names in " + path + " so containerd loads the file; its log repeats the error at each pull"}
+	case doc == nil:
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 	}
-	var doc struct {
-		Host map[string]struct {
-			Capabilities []string `toml:"capabilities"`
-		} `toml:"host"`
-	}
-	md, err := toml.Decode(string(data), &doc)
-	if err != nil {
-		return Finding{Status: StatusSkip, Detail: path + " is not TOML containerd can load: " + err.Error(), Remediation: "repair " + path + "; containerd fails every Docker Hub pull while it stands"}
-	}
-	for _, k := range md.Keys() {
-		if len(k) != 2 || k[0] != "host" {
+	for _, h := range doc.Hosts {
+		if h.Server || !h.Pull {
 			continue
 		}
-		caps := doc.Host[k[1]].Capabilities
-		if caps != nil && !slices.Contains(caps, "pull") {
-			continue
+		if !mirrorIsBodega(h.Key, host) {
+			return Finding{Status: StatusWarn, Detail: path + " sends containerd's Docker Hub pulls to " + h.Key + " before bodega" + inHost(host) + "; bypasses bodega's registry"}
 		}
-		if !mirrorIsBodega(k[1], host) {
-			return Finding{Status: StatusWarn, Detail: path + " sends containerd's Docker Hub pulls to " + k[1] + " before bodega" + inHost(host) + "; bypasses bodega's registry"}
-		}
-		return Finding{Status: StatusOK, Detail: path + " sends containerd's Docker Hub pulls to " + k[1]}
+		return Finding{Status: StatusOK, Detail: path + " sends containerd's Docker Hub pulls to " + h.Key}
 	}
 	return Finding{Status: StatusWarn, Detail: path + " names no host at bodega" + inHost(host) + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 }
@@ -1205,8 +1090,8 @@ func (t OCIHost) registriesConfFiles() []string {
 	if t.Home != "" {
 		userDir = filepath.Join(t.Home, ".config/containers/registries.conf.d")
 		if user := filepath.Join(t.Home, ".config/containers/registries.conf"); t.RegistriesConf == "" {
-			if _, err := os.Stat(user); err == nil {
-				drop, _ := filepath.Glob(filepath.Join(userDir, "*.conf"))
+			if _, err := plannedfs.Stat(user); err == nil {
+				drop, _ := plannedfs.Glob(filepath.Join(userDir, "*.conf"))
 				return append([]string{user}, drop...)
 			}
 		}
@@ -1216,10 +1101,10 @@ func (t OCIHost) registriesConfFiles() []string {
 		main = t.RegistriesConf
 	}
 	files := []string{main}
-	drop, _ := filepath.Glob(filepath.Join(t.Root, filepath.Dir(clientconf.RegistriesConfDropIn), "*.conf"))
+	drop, _ := plannedfs.Glob(filepath.Join(t.Root, filepath.Dir(clientconf.RegistriesConfDropIn), "*.conf"))
 	files = append(files, drop...)
 	if userDir != "" {
-		drop, _ = filepath.Glob(filepath.Join(userDir, "*.conf"))
+		drop, _ = plannedfs.Glob(filepath.Join(userDir, "*.conf"))
 		files = append(files, drop...)
 	}
 	return files
@@ -1234,7 +1119,7 @@ func (t OCIHost) checkRegistriesConf(host string) Finding {
 	effective := map[string]containersRegistry{}
 	files := t.registriesConfFiles()
 	for i, path := range files {
-		data, err := os.ReadFile(path)
+		data, err := plannedfs.ReadFile(path)
 		switch {
 		case i == 0 && errors.Is(err, fs.ErrNotExist):
 			continue

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // Where `bodega doctor --configure rpm` writes on a dnf host, and the route
@@ -247,7 +248,7 @@ func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 	c := DnfConfig{ReposDirs: defaultDirs}
 	var sections []iniSection
 	if mainConf != "" {
-		data, err := os.ReadFile(mainConf)
+		data, err := plannedfs.ReadFile(mainConf)
 		switch {
 		case err == nil:
 			if sections, err = parseDnfIni(data); err != nil {
@@ -276,7 +277,7 @@ func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 	add(mainConf, sections)
 	var files []string
 	for _, dir := range c.ReposDirs {
-		found, err := filepath.Glob(filepath.Join(dir, "*.repo"))
+		found, err := plannedfs.Glob(filepath.Join(dir, "*.repo"))
 		if err != nil {
 			return DnfConfig{}, err
 		}
@@ -286,7 +287,7 @@ func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 		return slices.Compare(strings.Split(strings.TrimSuffix(a, ".repo"), "/"), strings.Split(strings.TrimSuffix(b, ".repo"), "/"))
 	})
 	for _, path := range files {
-		data, err := os.ReadFile(path)
+		data, err := plannedfs.ReadFile(path)
 		if err != nil {
 			return DnfConfig{}, fmt.Errorf("read %s: %w", path, err)
 		}

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -18,6 +17,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // Container runtimes the oci system configures. Each reads its own file, so
@@ -247,11 +247,15 @@ func RegistriesConf(base string, registries []string) File {
 // already holds. Every other key keeps its value and its place. An empty
 // existing file gets planned.
 //
-// A file that is not a JSON object is refused: dockerd will not start with
-// it either, so it is the operator's to repair.
+// A file dockerd would not load is refused, whatever key the fault is in:
+// dockerd will not start with it either, so it is the operator's to repair,
+// and a mirror merged into it would be one no pull uses.
 func MergeDockerDaemon(existing, planned []byte) ([]byte, error) {
 	if len(bytes.TrimSpace(existing)) == 0 {
 		return planned, nil
+	}
+	if _, err := ParseDockerDaemonFile(existing); err != nil {
+		return nil, fmt.Errorf("dockerd refuses to load it (%w) and does not start; repair what the error names, or move the file aside, then re-run. Nothing was written", err)
 	}
 	plan, err := objectMembers(planned)
 	if err != nil {
@@ -271,7 +275,14 @@ func MergeDockerDaemon(existing, planned []byte) ([]byte, error) {
 		}
 		doc = setMember(doc, p, false)
 	}
-	return indentJSON(doc)
+	out, err := indentJSON(doc)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ParseDockerDaemonFile(out); err != nil {
+		return nil, fmt.Errorf("with bodega's settings merged in, dockerd would refuse to load it (%w). Nothing was written", err)
+	}
+	return out, nil
 }
 
 // unionStrings is the JSON list have with every entry of add it lacks
@@ -338,14 +349,53 @@ type ContainerdRegistry struct {
 	// with beside config_path (mirrors, configs.<host>.tls), "" for none.
 	Legacy string
 	// CRIDisabled is a disabled_plugins entry naming the CRI plugin, as
-	// Docker's packaged config.toml carries: nothing then reads the table.
+	// Docker's packaged config.toml carries, or its image plugin: nothing
+	// then reads the table.
 	CRIDisabled bool
+	// Disabled and Required are disabled_plugins and required_plugins by
+	// plugin URI, a version 1 file's short names migrated as containerd 2.x
+	// migrates them.
+	Disabled, Required []string
 	// Imports is the file's imports list as written.
 	Imports []string
 	// HasPlugin is whether the file holds the CRI plugin's table at all, and
 	// SetsConfigPath whether its registry table names config_path, even "".
 	HasPlugin      bool
 	SetsConfigPath bool
+	// Invalid is what containerd's ValidateVersion refuses once every file
+	// has loaded, on which containerd exits, what a CRI plugin refuses in its
+	// own table, on which containerd runs without it, or a disabled plugin
+	// whose effect on the CRI service doctor does not follow; "" for
+	// nothing. In each case no hosts.toml is known to be read. It is a field
+	// rather than an error so a caller can still say the CRI plugin is
+	// disabled, which is the more useful thing to tell whoever wrote
+	// disabled_plugins = ["cri"] under version = 2.
+	//
+	// Invalid is the bound on what a CA install and the trust verdict
+	// certify, so it also holds what doctor cannot say either way: a value
+	// the host decides, or one outside what the port follows to containerd's
+	// first CRI request. A file holding only that is one containerd may well
+	// run on. Refused is the part of Invalid that containerd itself refuses
+	// on the configuration alone, and the only part a plain configure, which
+	// certifies nothing, declines to edit.
+	Invalid, Refused string
+
+	// cri holds the CRI tables as this file decodes them, for
+	// ResolveContainerdConfig to load each import over.
+	cri *containerdCRI
+}
+
+// refuse records the first reason found: refused is what containerd refuses
+// on the configuration alone, and unmodeled what doctor cannot say of it. At
+// most one is set per call. Invalid keeps the first of either, and Refused
+// the first of its kind even behind an uncertainty.
+func (r *ContainerdRegistry) refuse(refused, unmodeled string) {
+	if r.Refused == "" {
+		r.Refused = refused
+	}
+	if r.Invalid == "" {
+		r.Invalid = refused + unmodeled
+	}
 }
 
 // ReadContainerdConfig decodes a config.toml and reports its CRI registry
@@ -361,6 +411,14 @@ func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
 // format's CRI plugin, is refused, since containerd 2.x migrates each file
 // on its own and doctor does not follow that.
 func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) {
+	// The typed load comes first: containerd v2.2.0 decodes the whole file
+	// into its Config with go-toml v2.2.4, which rejects TOML 1.1 syntax the
+	// decoder below accepts and any field of the wrong type, read here or
+	// not. A config.toml that fails it is one containerd does not start with.
+	cfg, err := decodeContainerdConfig(data)
+	if err != nil {
+		return ContainerdRegistry{}, err
+	}
 	var doc map[string]any
 	if _, err := toml.Decode(string(data), &doc); err != nil {
 		return ContainerdRegistry{}, err
@@ -382,6 +440,51 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	path, ok := containerdRegistryTable[r.Version]
 	if !ok {
 		return r, fmt.Errorf("it declares version = %d, a config.toml format this release does not know", r.Version)
+	}
+	if _, declared := doc["version"]; declared && r.Version > 1 {
+		if err := cfg.validatePluginURIs(); err != nil {
+			r.refuse(err.Error(), "")
+		}
+	}
+	// containerd 2.x migrates a version 1 or 2 file to version 3 before any
+	// plugin decodes its table: v1Migrate renames [plugins.cri], and the CRI
+	// plugins move that table's keys into their own. A file of an older
+	// version that also holds a table under a name the migration writes to is
+	// one containerd loads (configMigration in plugins/cri/images/plugin.go at
+	// v2.2.0 merges into a destination table it finds) and whose result
+	// depends on which table wins, which doctor does not follow. That bounds
+	// what is certified and is no load failure, so it is recorded and the
+	// registry table is still read: a plain configure edits such a file.
+	unfollowed := ""
+	if r.Version < 3 {
+		later := []string{containerdImagesPlugin, containerdRuntimePlugin}
+		if r.Version == 1 {
+			later = append(later, containerdCRIPlugin)
+		}
+		for _, name := range later {
+			if _, ok := tomlTable(doc, []string{"plugins"})[name]; ok && unfollowed == "" {
+				unfollowed = fmt.Sprintf("it declares version = %d and holds [plugins.%s], a table of a later format that containerd 2.x merges with the one it migrates [plugins.%s] into; doctor does not follow that merge. Move its settings into [plugins.%s], or migrate the file with containerd config migrate", r.Version, jsonString(name), strings.Trim(jsonString(path[1]), `"`), strings.Trim(jsonString(path[1]), `"`))
+			}
+		}
+	}
+	r.refuse("", unfollowed)
+	// A file that imports another, or is imported, is one part of what
+	// containerd validates: its tables are decoded here for their types, and
+	// ResolveContainerdConfig validates what the parts add up to. Tables
+	// whose migration is not followed are not decoded as if it were: what
+	// containerd makes of them is already recorded as unknown.
+	whole := version == 0 && len(cfg.Imports) == 0
+	r.cri = newContainerdCRI(r.Version, path[1])
+	if unfollowed == "" {
+		err = r.cri.load(data)
+		switch {
+		case err != nil:
+			r.refuse(err.Error(), "")
+		case whole:
+			if err := r.cri.validate(); err != nil {
+				r.refuse(containerdSplit(err.Error(), err))
+			}
+		}
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to
 	// the main file's before merging it, so [plugins.cri] there becomes the
@@ -415,10 +518,17 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 		return r, fmt.Errorf("imports = %v is not a list", v)
 	}
 	r.HasPlugin = tomlTable(doc, path[:2]) != nil
-	if list, ok := doc["disabled_plugins"].([]any); ok {
-		for _, p := range list {
-			r.CRIDisabled = r.CRIDisabled || p == "cri" || p == "io.containerd.grpc.v1.cri" || p == path[1]
+	r.Disabled, r.Required = slices.Clone(cfg.DisabledPlugins), slices.Clone(cfg.RequiredPlugins)
+	if r.Version == 1 {
+		for _, list := range [][]string{r.Disabled, r.Required} {
+			for i, name := range list {
+				list[i] = containerdV1PluginName(name)
+			}
 		}
+	}
+	var invalid, unmodeled string
+	if r.CRIDisabled, invalid, unmodeled = r.cri.pluginState(r.Disabled, r.Required); whole && unfollowed == "" {
+		r.refuse(invalid, unmodeled)
 	}
 	table := tomlTable(doc, path)
 	_, r.SetsConfigPath = table["config_path"]
@@ -487,7 +597,7 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 			continue
 		}
 		loaded[p] = true
-		b, err := os.ReadFile(filepath.Join(root, p))
+		b, err := plannedfs.ReadFile(filepath.Join(root, p))
 		if err != nil {
 			return eff, fmt.Errorf("it imports %s, which could not be read (%w); containerd will not start while an import fails to load", p, err)
 		}
@@ -495,7 +605,18 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 		if err != nil {
 			return eff, fmt.Errorf("its import %s cannot be judged: %w", p, err)
 		}
-		eff.CRIDisabled = eff.CRIDisabled || r.CRIDisabled
+		eff.Disabled, eff.Required = append(eff.Disabled, r.Disabled...), append(eff.Required, r.Required...)
+		if eff.Refused == "" {
+			eff.Refused = r.Refused
+		}
+		if eff.Invalid == "" {
+			eff.Invalid = r.Invalid
+		}
+		if eff.Invalid == "" {
+			if err := eff.cri.load(b); err != nil {
+				eff.refuse(fmt.Sprintf("with its import %s: %v", p, err), "")
+			}
+		}
 		if eff.Legacy == "" {
 			eff.Legacy = r.Legacy
 		}
@@ -510,6 +631,19 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 			return eff, err
 		}
 		pending = append(pending, next...)
+	}
+	// What containerd validates is what the files add up to, and it does so
+	// whether or not an import pattern matched a file: the checks a file with
+	// imports deferred run here, on the composed tables and plugin lists.
+	if len(main.Imports) > 0 {
+		var invalid, unmodeled string
+		eff.CRIDisabled, invalid, unmodeled = eff.cri.pluginState(eff.Disabled, eff.Required)
+		if eff.Invalid == "" {
+			if err := eff.cri.validate(); err != nil {
+				eff.refuse(containerdSplit(err.Error(), err))
+			}
+		}
+		eff.refuse(invalid, unmodeled)
 	}
 	if replaced != eff.ConfigPath {
 		return eff, fmt.Errorf("its import %s carries the CRI plugin table without config_path, so containerd 1.x reads none and 2.x keeps %q from %s; doctor cannot tell which runs here. Set config_path in %s", replacedFrom, eff.ConfigPath, eff.Source, replacedFrom)
@@ -530,7 +664,7 @@ func containerdImports(root, parent string, imports []string) ([]string, error) 
 			out = append(out, p)
 			continue
 		}
-		matches, err := filepath.Glob(filepath.Join(root, p))
+		matches, err := plannedfs.Glob(filepath.Join(root, p))
 		if err != nil {
 			return nil, fmt.Errorf("%s imports %q, which is not a pattern containerd can expand: %w", parent, p, err)
 		}
@@ -547,11 +681,18 @@ func containerdImports(root, parent string, imports []string) ([]string, error) 
 // ContainerdEditEffective reports why config_path set to certs.d in merged,
 // the config.toml at path, would not be the one containerd reads: an import
 // that fails to load or cannot be judged, or one whose CRI table supersedes
-// the main file's with a config_path that leaves certs.d out.
+// the main file's with a config_path that leaves certs.d out. A file
+// containerd refuses on its own content is one of these. A value doctor does
+// not follow to containerd's first CRI request is not: that is a limit on
+// what a CA install certifies, which containerdReads enforces, and no reason
+// to refuse writing config_path into a configuration containerd loads.
 func ContainerdEditEffective(root, path string, merged []byte) error {
 	eff, err := ResolveContainerdConfig(root, path, merged)
 	if err != nil {
 		return err
+	}
+	if eff.Refused != "" {
+		return fmt.Errorf("containerd refuses to load it (%s) and does not start; repair what the error names, then re-run. Nothing was written", eff.Refused)
 	}
 	if eff.Source != path && !slices.Contains(strings.Split(eff.ConfigPath, ":"), ContainerdCertsDir) {
 		return fmt.Errorf("its import %s sets config_path = %q, which containerd reads in place of this file's and which leaves out %s; add %s to config_path there, then re-run. Nothing was written", eff.Source, eff.ConfigPath, ContainerdCertsDir, ContainerdCertsDir)

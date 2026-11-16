@@ -109,7 +109,7 @@ func (h *aptSourcesHost) plan(written []string, baseURL string) ([]string, error
 		byFile[s.File] = append(byFile[s.File], s)
 	}
 	keep := func(s host.AptSource, why string) {
-		fmt.Printf("keep       %-10s %s:%d  %s %s; left in place\n", manifest.TypeApt, s.File, s.Line, strings.Join(s.URIs, " "), why)
+		fmt.Printf("keep       %-10s %s:%d  %s %s; left in place\n", manifest.TypeApt, s.File, s.Line, clientconf.RedactLocations(strings.Join(s.URIs, " ")), why)
 	}
 	for _, file := range order {
 		var disable []host.AptSource
@@ -134,7 +134,7 @@ func (h *aptSourcesHost) plan(written []string, baseURL string) ([]string, error
 			case s.Deb822:
 				how = "adds Enabled: no"
 			}
-			fmt.Printf("disable    %-10s %s:%d  %s names %s; %s\n", manifest.TypeApt, s.File, s.Line, strings.Join(s.URIs, " "), s.Public, how)
+			fmt.Printf("disable    %-10s %s:%d  %s names %s; %s\n", manifest.TypeApt, s.File, s.Line, clientconf.RedactLocations(strings.Join(s.URIs, " ")), s.Public, how)
 		}
 		e, err := host.DisableAptSources(h.root, file, disable[0].Deb822, lines)
 		if err != nil {

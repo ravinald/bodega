@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +29,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/provenance"
 )
@@ -50,7 +54,7 @@ var doctorExit = os.Exit
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
 	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS, restoreApt bool
-	var token, baseURL, pkgABI, aptSuite, composerLock string
+	var token, baseURL, pkgABI, aptSuite, composerLock, caFile string
 	var configure, ntpServers, aptArchives []string
 	var pkgRelease int
 	c := &cobra.Command{
@@ -138,6 +142,27 @@ restart stay with the served setup script (--systems osquery).
 --configure freebsd --apply. They combine with each other and with
 --configure.
 
+--ca-file, with --configure, installs a private CA where each named system's
+client reads one, for a bodega whose certificate no public CA issued: the
+system trust store for apt, gomod and helm, the client's own setting for npm
+(cafile), pip (cert) and git (http.<url>.sslCAInfo), and under oci Docker
+Engine's certs.d/<host>/ca.crt and the ca of each containerd hosts.toml.
+Every other system is refused under --ca-file before anything is written,
+and so is oci on a host whose plan configures podman, buildah or CRI-O:
+private-CA installation for those is not supported. The file is refused the
+same way when it holds no CA certificate, a certificate that is not a CA, or
+anything else. Every file the plan edits keeps its other settings under
+--ca-file. Pass the flag on every --configure run: a run without it replaces
+.npmrc and pip.conf whole. pip names the pypi system. After --apply, a
+client still reading a store without the CA (PIP_CERT, a setting in a file
+the run could not edit) is named in the error the run exits with.
+
+  sudo bodega doctor --configure apt,pip,oci --ca-file /root/internal-ca.pem --apply --url https://bodega.internal
+
+The report checks the same stores: a row whose client is configured for
+bodega warns when the store that client reads, as this host configures it,
+does not verify the certificate bodega serves.
+
 --token is optional: a host bound with "bodega identity bind cidr" is
 identified by its address and needs none. A host bodega cannot identify is
 refused with the command that would admit it.
@@ -201,7 +226,17 @@ is the operator's to choose. --restore-os-callers undoes the recorded steps.
 See docs/threat-model.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			systems := slices.Clone(configure)
+			// pip is the client and pypi the plan's name for it; both select
+			// the one system.
+			var systems []string
+			for _, name := range configure {
+				if name == "pip" {
+					name = manifest.TypePypi
+				}
+				if !slices.Contains(systems, name) {
+					systems = append(systems, name)
+				}
+			}
 			if writeAptSources && !slices.Contains(systems, manifest.TypeApt) {
 				systems = append(systems, manifest.TypeApt)
 			}
@@ -238,7 +273,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return writeClientCredentials(gf, token, baseURL)
 			}
 			if !configuring {
-				for _, f := range []string{"apply", "suite", "archive", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers"} {
+				for _, f := range []string{"apply", "suite", "archive", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers", "ca-file"} {
 					if cmd.Flags().Changed(f) {
 						return fmt.Errorf("--%s applies to --configure, and that flag is not set.\n"+
 							"  Add it:  bodega doctor --configure <system,...> --%s", f, f)
@@ -254,11 +289,11 @@ See docs/threat-model.md for the rationale behind each check.`,
 					"  Add it:  bodega doctor --configure apt --archive <codename>")
 			}
 			if configuring {
-				return configureFromPlan(gf, planRequest{
+				return redactedErr(configureFromPlan(gf, planRequest{
 					token: token, baseURL: baseURL, systems: systems,
 					suite: aptSuite, archives: aptArchives, abi: pkgABI, release: pkgRelease, quietPro: quietPro, quietOS: quietOS,
-					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
-				})
+					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext, caFile: caFile,
+				}))
 			}
 			var lockFinding *host.Finding
 			if composerLock != "" {
@@ -285,7 +320,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, DockerdVersion: doctorDockerdVersion, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
 			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
 			}
@@ -294,7 +329,14 @@ See docs/threat-model.md for the rationale behind each check.`,
 			}
 			findings = append(findings, osCallers.findings(internalTimeSources(gf, baseURL, ntpServers))...)
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
+			probe := doctorTrustProbe()
+			findings = append(findings, probe.Rows(base)...)
+			findings = probe.Apply(findings, base)
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
+			for i := range findings {
+				findings[i].Detail = clientconf.RedactLocations(findings[i].Detail)
+				findings[i].Remediation = clientconf.RedactLocations(findings[i].Remediation)
+			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tSTATUS\tDETAIL")
@@ -342,6 +384,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Undo the steps --quiet-os-callers recorded, and nothing else")
 	c.Flags().BoolVar(&restoreApt, "restore-apt-sources", false,
 		"Undo the edits --configure apt --apply made to the distro's apt sources, and nothing else")
+	c.Flags().StringVar(&caFile, "ca-file", "",
+		"With --configure: also install the CA certificates in this PEM file into the trust store each named system's client reads")
 	c.Flags().StringVar(&composerLock, "composer-lock", "",
 		"Also report whether the dist.url entries of this composer.lock are at bodega's /composer/ route")
 	c.Flags().StringSliceVar(&ntpServers, "ntp-server", nil,
@@ -362,6 +406,22 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Permit --url over http; refused by default because a bearer token would travel in the clear")
 	return c
 }
+
+// redactedErr is the boundary every --configure error crosses on its way to
+// the terminal: a refusal can quote a client's location from any reader or
+// planner, and a credential in it is removed here even when the producer
+// forgot. errors.Is and errors.As still see the original.
+func redactedErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return redactedError{err}
+}
+
+type redactedError struct{ err error }
+
+func (e redactedError) Error() string { return clientconf.RedactLocations(e.err.Error()) }
+func (e redactedError) Unwrap() error { return e.err }
 
 // printRemediation prints one block of next steps, one line per row the
 // predicate keeps. Findings and skipped checks get separate blocks because
@@ -520,6 +580,33 @@ type planRequest struct {
 	allowPlaintext bool
 	quietPro       bool
 	quietOS        bool
+	caFile         string
+}
+
+// readCAFile reads and checks --ca-file before the run reaches the server, so
+// a file doctor will not install stops it with nothing fetched or written.
+func readCAFile(path string) (clientconf.CA, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return clientconf.CA{}, fmt.Errorf("--ca-file: %w. Nothing was written", err)
+	}
+	ca, err := clientconf.ParseCA(data)
+	if err != nil {
+		return clientconf.CA{}, fmt.Errorf("--ca-file %s is refused, and nothing was written: %w", path, err)
+	}
+	return ca, nil
+}
+
+// planBase is the URL the plan's files name bodega by: the server's
+// public_url, read off a record's file URL, which is what a client's trust
+// has to cover. It need not be the --url this command reached the server at.
+func planBase(records []clientconf.PlanRecord, fallback string) string {
+	for _, r := range records {
+		if base, _, ok := strings.Cut(r.URL, "/client/"); ok {
+			return base
+		}
+	}
+	return fallback
 }
 
 // configureFromPlan applies the plan GET /client/plan returns for this host,
@@ -532,6 +619,21 @@ type planRequest struct {
 // has always let the server choose when it could, and a host on an instance
 // that generates one suite under its own name would lose that choice.
 func configureFromPlan(gf *globalFlags, req planRequest) error {
+	var ca *clientconf.CA
+	if req.caFile != "" {
+		parsed, err := readCAFile(req.caFile)
+		if err != nil {
+			return err
+		}
+		ca = &parsed
+		// Ahead of the plan: a system named here that no CA is installed
+		// for stops the run with nothing fetched or written.
+		for _, sys := range req.systems {
+			if err := clientconf.CAUnsupported(clientconf.PlanRecord{System: sys}); err != nil {
+				return fmt.Errorf("--ca-file: %w. Nothing was written", err)
+			}
+		}
+	}
 	if req.baseURL == "" {
 		cfg, err := loadConfig(gf)
 		if err != nil {
@@ -546,6 +648,20 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	client, err := NewClient(req.baseURL, req.token, req.allowPlaintext)
 	if err != nil {
 		return err
+	}
+	if ca != nil {
+		// This run fetches the plan from the server the CA is for, on a host
+		// that by definition does not trust it yet.
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		for _, cert := range ca.Certs {
+			pool.AddCert(cert)
+		}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+		client.HTTP.Transport = tr
 	}
 	q := url.Values{"os": {runtime.GOOS}}
 	if req.abi == "" && runtime.GOOS == clientconf.OSFreeBSD {
@@ -606,11 +722,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		if r.Profile != "" {
 			profile = "profile " + r.Profile
 		}
-		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, client.BaseURL)
+		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, clientconf.RedactLocations(client.BaseURL))
 	}
 	for _, rec := range records {
 		if rec.Reason != "" {
-			fmt.Printf("note       %-10s %s\n", rec.System, rec.Reason)
+			fmt.Printf("note       %-10s %s\n", rec.System, clientconf.RedactLocations(rec.Reason))
 		}
 	}
 	home, _ := os.UserHomeDir()
@@ -630,6 +746,24 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			return err
 		}
 		changes = append(changes, c)
+	}
+	var caStep []string
+	var caOSStore []string
+	caOwed := owedTrustChecks(records)
+	if ca != nil {
+		osRelease, _ := os.ReadFile(doctorOSRelease)
+		h := clientconf.CAHost{
+			Base: planBase(records, client.BaseURL), Home: home, Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease,
+			Getenv: os.Getenv, LookupEnv: os.LookupEnv,
+		}
+		in, err := clientconf.AddCA(changes, *ca, h)
+		if err != nil {
+			return fmt.Errorf("--ca-file: %w. Nothing was written", err)
+		}
+		changes, caStep, caOSStore = in.Changes, in.Step, in.System
+		if err := plannedCA(changes, caOwed, caOSStore, h.Base); err != nil {
+			return fmt.Errorf("--ca-file: %w", err)
+		}
 	}
 	changed := 0
 	for _, c := range changes {
@@ -651,6 +785,10 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	if dnfStep != nil {
 		fmt.Printf("\nrun        %-10s %s\n", manifest.TypeRpm, strings.Join(dnfStep, " "))
 		fmt.Println("           (turns off the vendor repositories bodega.repo replaces)")
+	}
+	if caStep != nil {
+		fmt.Printf("\nrun        %-10s %s\n", clientconf.SystemCA, strings.Join(caStep, " "))
+		fmt.Println("           (rebuilds the system trust store with the CA above in it)")
 	}
 	bodegaSources, aptWritten := bodegaAptSources(changes)
 	var aptPlan []string
@@ -677,11 +815,17 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		osPlan = steps
 	}
 	switch {
-	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil:
+	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
+		if ca != nil && req.apply {
+			return unreadCA(caOwed, caOSStore, planBase(records, client.BaseURL))
+		}
 		return nil
-	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan) > 0 || !req.apply && dnfStep != nil:
+	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
 		var runs []string
+		if caStep != nil {
+			runs = append(runs, "the trust store step")
+		}
 		if dnfStep != nil {
 			runs = append(runs, "the dnf step")
 		}
@@ -712,6 +856,22 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		if err != nil {
 			return err
 		}
+	}
+	// Ahead of every step that fetches from bodega: apt-get update against a
+	// certificate the store does not yet trust fails on the certificate.
+	if caStep != nil {
+		if err := doctorRun(caStep[0], caStep[1:]...); err != nil {
+			return fmt.Errorf("%s failed: %w.\n"+
+				"  The CA is written and the system trust store was not rebuilt, so clients reading it still refuse bodega's certificate.\n"+
+				"  It needs root. Re-run this command as root: it finds the store still without the CA and runs the step again", strings.Join(caStep, " "), err)
+		}
+		fmt.Printf("ran        %s\n", strings.Join(caStep, " "))
+	}
+	// Judged here, while the trust store is fresh, and returned once the
+	// remaining steps have run: they do not depend on it.
+	var unread error
+	if ca != nil {
+		unread = unreadCA(caOwed, caOSStore, planBase(records, client.BaseURL))
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -757,7 +917,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 	}
 	printRuntimeRestarts(changes)
-	return nil
+	return unread
 }
 
 // disableDistroAptSources runs the apt source edits once apt-get update
@@ -780,15 +940,227 @@ func disableDistroAptSources(bodegaSources string, steps []string) error {
 	return nil
 }
 
-// doctorLookPath is how doctor asks whether a container runtime is installed,
-// doctorOCIRoot the directory its /etc files are read under, and
-// doctorDockerdVersion how it reads dockerd's version, so a test can stand in
-// for each.
+// doctorLookPath is how doctor asks whether a container runtime is installed
+// and doctorOCIRoot the directory its /etc files are read under, so a test
+// can stand in for each.
+//
+// doctorDockerdVersion is on no report path: doctor runs no client to learn
+// where it connects. It names the one function here that would run dockerd,
+// so a test can install it and show the report still runs nothing.
 var (
 	doctorLookPath       = exec.LookPath
 	doctorOCIRoot        = ""
 	doctorDockerdVersion = host.RunDockerdVersion
 )
+
+// doctorCAGOOS is the operating system whose trust stores --ca-file installs
+// into and the report reads, so a test can plan each family's install from
+// one host. The install and the report share it: which files a client loads
+// depends on the platform, and the two have to agree on them.
+var doctorCAGOOS = runtime.GOOS
+
+// doctorTrustProbe is how the report reads the certificate bodega serves and
+// the trust stores on this host, so a test can stand in for both.
+var doctorTrustProbe = func() host.TrustProbe {
+	home, _ := os.UserHomeDir()
+	return host.TrustProbe{
+		Root: doctorOCIRoot, Home: home, GOOS: doctorCAGOOS, Getenv: os.Getenv, LookupEnv: os.LookupEnv, ConfigDir: doctorConfigDir,
+		Node: doctorNode, Pip: doctorPip,
+	}
+}
+
+// doctorConfigDir is the per-user configuration directory of the platform
+// doctorCAGOOS names, which is where that platform's go keeps its env file.
+// It is os.UserConfigDir except where a test plans another platform's
+// install from this one.
+func doctorConfigDir() (string, error) {
+	if doctorCAGOOS == runtime.GOOS {
+		return os.UserConfigDir()
+	}
+	home, err := os.UserHomeDir()
+	switch {
+	case err != nil:
+		return "", err
+	case doctorCAGOOS == clientconf.OSDarwin:
+		return filepath.Join(home, "Library", "Application Support"), nil
+	case os.Getenv("XDG_CONFIG_HOME") != "":
+		return os.Getenv("XDG_CONFIG_HOME"), nil
+	}
+	return filepath.Join(home, ".config"), nil
+}
+
+// doctorNode and doctorPip answer for what the host's Node and pip verify
+// against by default, which doctor does not run either to learn, so a test
+// can stand in for each.
+var (
+	doctorNode = host.AskNode
+	doctorPip  = host.AskPip
+)
+
+// owedTrustChecks lists the trust checks the plan's records owe a verdict
+// on after a CA install: every check of each system the plan writes for,
+// and for OCI only the runtimes it writes a file for, so a runtime this host
+// does not run owes nothing and one it does cannot pass on another's verdict.
+func owedTrustChecks(records []clientconf.PlanRecord) []string {
+	checks := host.TrustSystems()
+	var owed []string
+	for _, check := range slices.Sorted(maps.Keys(checks)) {
+		if slices.ContainsFunc(records, func(rec clientconf.PlanRecord) bool {
+			if rec.System != checks[check] {
+				return false
+			}
+			return rec.System != manifest.TypeOCI || check == "oci-"+clientconf.OCIRuntimeOf(rec.Path)
+		}) {
+			owed = append(owed, check)
+		}
+	}
+	return owed
+}
+
+// unreadCA is the error for each owed check whose client, after this run
+// installed the CA, was not shown to verify bodega's certificate. Every
+// check owes a verdict, and only a verified one passes:
+//
+//   - a client still reading a store without the CA (an environment variable
+//     or a setting in a file the plan does not edit, outranking what the plan
+//     wrote);
+//   - a client whose trust could not be determined, which is not a pass;
+//   - a client that reads nothing pointing it at bodega (a registry the
+//     environment names elsewhere, configuration loaded from where this
+//     command does not look), which the install therefore did not reach.
+//
+// A run that leaves any of them exits non-zero, because for that client no
+// install was established. A system with no trust check of its own owes
+// nothing here.
+//
+// osStore names the systems whose anchors the plan put in the operating
+// system's trust store. This process loaded that store before the rebuild,
+// so those systems are verified against the store's files as the rebuild
+// left them and never against the loaded copy. Either way the served
+// chain is verified in full for the plan's hostname: an install says which
+// roots exist, never that the certificate bodega serves is valid under them.
+// For every other system the plan left that store alone, so the client is
+// judged against what it reads today: the store as it stands and the files
+// the plan wrote for it.
+func unreadCA(owed, osStore []string, base string) error {
+	parts, err := judgeCA(owed, osStore, base, func() ([]*x509.Certificate, error) {
+		return clientconf.SystemRoots(doctorCAHost())
+	})
+	if err != nil {
+		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the CA is written, and %s", strings.Join(parts, "\nAlso, "))
+}
+
+// plannedCA judges the plan before anything is written: the same verdicts
+// unreadCA reads after the install, over the host's files as changes would
+// leave them and the system store as the rebuild would leave it, an anchor
+// the plan replaces taking its old certificates out with it. A
+// client the install would leave refusing, unchecked or unverified is
+// refused here instead, so a refusal never follows a write.
+func plannedCA(changes []clientconf.Change, owed, osStore []string, base string) error {
+	files := map[string][]byte{}
+	for _, c := range changes {
+		if !c.Unchanged() {
+			files[c.Target] = c.New
+		}
+	}
+	var parts []string
+	err := plannedfs.With(files, func() error {
+		var err error
+		parts, err = judgeCA(owed, osStore, base, func() ([]*x509.Certificate, error) {
+			return clientconf.ProposedSystemRoots(doctorCAHost(), changes)
+		})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("whether the clients this plan installs the CA for would verify bodega's certificate could not be checked: %w. Nothing was written. Re-run once bodega answers", err)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("with this plan applied, %s\nNothing was written", strings.Join(parts, "\nAlso, "))
+}
+
+// judgeCA is each owed check's verdict, as the lines of the error they make,
+// none when every client verifies bodega. rebuilt is the system store as a
+// client started now reads it once the rebuild for osStore has run.
+//
+// When the plan rebuilds the system store, every owed client is judged
+// against rebuilt, not only the ones the rebuild was for: Docker and
+// containerd read the system store beside their own certs.d file, and a
+// rebuild that replaces a managed anchor takes a root away from them too.
+// This process loaded the system store before the write and Go never
+// reloads it, so its pool would still hold that root.
+func judgeCA(owed, osStore []string, base string, rebuilt func() ([]*x509.Certificate, error)) ([]string, error) {
+	probe := doctorTrustProbe()
+	if len(osStore) > 0 {
+		probe.System = func(chain []*x509.Certificate, name string) error {
+			roots, err := rebuilt()
+			if err != nil {
+				return fmt.Errorf("the system trust store's files could not be read: %w", err)
+			}
+			if len(roots) == 0 {
+				return errors.New("the system trust store's files hold no certificate")
+			}
+			return host.VerifyServed(chain, name, roots)
+		}
+	}
+	verdicts, err := probe.Judge(owed, base)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(verdicts, func(a, b host.TrustVerdict) int { return strings.Compare(a.Check, b.Check) })
+	var refused, unchecked, absent []string
+	for _, v := range verdicts {
+		// One system with several clients names the client, not the system.
+		name := v.System
+		if v.System == manifest.TypeOCI {
+			name = v.Check
+		}
+		switch v.State {
+		case host.TrustFailed:
+			refused = append(refused, fmt.Sprintf("  %s: %s", name, clientconf.RedactLocations(v.Detail)))
+		case host.TrustUnchecked:
+			unchecked = append(unchecked, fmt.Sprintf("  %s: %s", name, clientconf.RedactLocations(v.Detail)))
+		case host.TrustAbsent:
+			absent = append(absent, fmt.Sprintf("  %s: nothing this command finds its client reading points it at %s", name, base))
+		}
+	}
+	var parts []string
+	if len(refused) > 0 {
+		parts = append(parts, fmt.Sprintf("%d client(s) still read a store without it, so they still refuse bodega's certificate:\n%s\n"+
+			"  Unset the variable or correct the setting that names that store, then re-run: this command edits the configuration files a client reads, not its environment",
+			len(refused), strings.Join(refused, "\n")))
+	}
+	if len(unchecked) > 0 {
+		parts = append(parts, fmt.Sprintf("%d client(s) could not be checked, which is not a pass:\n%s\n"+
+			"  Remove what keeps this command from reading that client's trust, then re-run",
+			len(unchecked), strings.Join(unchecked, "\n")))
+	}
+	if len(absent) > 0 {
+		parts = append(parts, fmt.Sprintf("%d client(s) are unverified, so whether each loads what was written is not established:\n%s\n"+
+			"  Unset the variable or correct the setting that sends the client elsewhere (a registry or index the environment names, a configuration file read in place of the one written), then re-run",
+			len(absent), strings.Join(absent, "\n")))
+	}
+	return parts, nil
+}
+
+// doctorRebuiltRoots reads the system trust store from the files its rebuild
+// command writes, nil on a host whose store doctor does not install into.
+var doctorRebuiltRoots = func() []*x509.Certificate {
+	roots, _ := clientconf.SystemRoots(doctorCAHost())
+	return roots
+}
+
+// doctorCAHost is the host whose system trust store doctor installs into.
+func doctorCAHost() clientconf.CAHost {
+	osRelease, _ := os.ReadFile(doctorOSRelease)
+	return clientconf.CAHost{Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease}
+}
 
 // doctorDnfConf and doctorYumReposDirs are where doctor reads dnf's
 // configuration, and doctorRun how it runs the dnf step, so a test can stand

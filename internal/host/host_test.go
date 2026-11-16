@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/oracletest"
 )
 
 // TestFirstHit covers the substring-scan logic that underlies every
@@ -134,8 +136,8 @@ func TestCheckGoproxyEnv(t *testing.T) {
 		{name: "indented line is not an assignment", env: map[string]string{"GOENV": indented}, want: StatusWarn},
 		{name: "file empties the value", env: map[string]string{"GOENV": emptied}, want: StatusWarn},
 		{name: "GOENV=off reads no file", env: map[string]string{"GOENV": "off"}, configDir: cfgDir, want: StatusWarn},
-		{name: "unreadable file is not a measurement", env: map[string]string{"GOENV": dir}, want: StatusSkip},
-		{name: "no config dir is not a measurement", dirErr: errors.New("$HOME is not defined"), want: StatusSkip},
+		{name: "a file that does not read sets nothing, as for go", env: map[string]string{"GOENV": dir}, want: StatusWarn},
+		{name: "no config dir is no user file, as for go", dirErr: errors.New("$HOME is not defined"), want: StatusWarn},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -168,14 +170,13 @@ func TestGoproxyCheckAcceptsTheRenderedEnvFile(t *testing.T) {
 	if got := CheckGoproxyEnv(); got.Status != StatusOK {
 		t.Errorf("rendered env file: got %v, want OK (detail=%q)", got.Status, got.Detail)
 	}
-	if goBin, err := exec.LookPath("go"); err == nil {
-		out, err := exec.Command(goBin, "env", "GOPROXY").Output()
-		if err != nil {
-			t.Fatalf("go env GOPROXY: %v", err)
-		}
-		if got := strings.TrimSpace(string(out)); got != clientconf.GoProxy(base) {
-			t.Errorf("go env GOPROXY = %q, want %q: the toolchain does not read the rendered file as doctor does", got, clientconf.GoProxy(base))
-		}
+	goBin := oracletest.Go(t)
+	out, err := exec.Command(goBin, "env", "GOPROXY").Output()
+	if err != nil {
+		t.Fatalf("go env GOPROXY: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != clientconf.GoProxy(base) {
+		t.Errorf("go env GOPROXY = %q, want %q: the toolchain does not read the rendered file as doctor does", got, clientconf.GoProxy(base))
 	}
 
 	for _, override := range []string{clientconf.GoProxy(base) + ",direct", clientconf.GoProxy(base) + "|direct", "direct"} {
@@ -183,6 +184,125 @@ func TestGoproxyCheckAcceptsTheRenderedEnvFile(t *testing.T) {
 		if got := CheckGoproxyEnv(); got.Status != StatusWarn {
 			t.Errorf("unsafe environment override %q: got %v, want WARN (detail=%q)", override, got.Status, got.Detail)
 		}
+	}
+}
+
+// TestGoEnvResolvesAsGo asks the go command running these tests, which is the
+// toolchain go.mod pins, what GOPROXY it resolves under each arrangement of
+// the environment, the user's go env file and GOROOT/go.env, and holds
+// effectiveGoproxy to the same answer. GOROOT points at a scratch tree so the
+// distribution's go.env is the test's to write.
+func TestGoEnvResolvesAsGo(t *testing.T) {
+	// go test puts the toolchain's own bin directory first on PATH.
+	goBin := oracletest.Go(t)
+	const dist = "GOPROXY=https://dist.example/go,direct\n"
+	for _, tc := range []struct {
+		name string
+		// user is the user's go env file, "" for none written.
+		user string
+		// goenv is GOENV: "file" for the user file, "dir" for a directory,
+		// "absent" for a path nothing is at, "" for unset, or "off".
+		goenv string
+		// goroot is GOROOT/go.env, and other a second GOROOT's, which the
+		// user file names when it holds %s.
+		goroot, other string
+		proxy         string
+		noHome        bool
+		// onPath leaves GOROOT unset and reaches go through a symlink.
+		onPath bool
+	}{
+		{name: "user file sets it", user: "GOPROXY=https://bodega.example/go,off\n", goenv: "file", goroot: dist},
+		{name: "user file is silent, the distribution sets it", user: "GOSUMDB=off\n", goenv: "file", goroot: dist},
+		{name: "an empty assignment hides the distribution", user: "GOPROXY=\n", goenv: "file", goroot: dist},
+		{name: "GOENV=off still reads the distribution", user: "GOPROXY=https://bodega.example/go\n", goenv: "off", goroot: dist},
+		{name: "a directory for GOENV sets nothing", goenv: "dir", goroot: dist},
+		{name: "an absent GOENV sets nothing", goenv: "absent", goroot: dist},
+		{name: "the environment outranks both", user: "GOPROXY=https://bodega.example/go\n", goenv: "file", goroot: dist, proxy: "https://env.example/go"},
+		{name: "GOROOT in the user file picks the distribution", user: "GOROOT=%s\n", goenv: "file", goroot: dist, other: "GOPROXY=https://other.example/go\n"},
+		{name: "a distribution without the key leaves it unset", goenv: "absent", goroot: "# no proxy\nGOSUMDB=sum.golang.org\n"},
+		{name: "lines go skips, and the last assignment", user: " GOPROXY=https://indented.example\ngoproxy=https://lower.example\n#GOPROXY=https://comment.example\nGOPROXY=https://first.example\nGOPROXY= https://last.example , direct\n", goenv: "file", goroot: dist},
+		{name: "no home directory still reads the distribution", goroot: dist, noHome: true},
+		{name: "the default user file", user: "GOPROXY=https://bodega.example/go,off\n", goroot: dist},
+		{name: "GOROOT found from the go on PATH", goenv: "absent", onPath: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			write := func(path, body string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			home := filepath.Join(dir, "home")
+			configDir := filepath.Join(home, ".config")
+			if runtime.GOOS == "darwin" {
+				configDir = filepath.Join(home, "Library", "Application Support")
+			}
+			oracletest.QuietGo(t, home)
+			env := map[string]string{"PATH": filepath.Dir(goBin), "GOTOOLCHAIN": "local", "HOME": home}
+			if tc.noHome {
+				delete(env, "HOME")
+			}
+			if tc.onPath {
+				bin := filepath.Join(dir, "bin")
+				if err := os.MkdirAll(bin, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(goBin, filepath.Join(bin, "go")); err != nil {
+					t.Fatal(err)
+				}
+				env["PATH"] = bin
+			} else {
+				env["GOROOT"] = filepath.Join(dir, "goroot")
+				write(filepath.Join(env["GOROOT"], "pkg", "tool", "keep"), "")
+				write(filepath.Join(env["GOROOT"], "go.env"), tc.goroot)
+			}
+			other := filepath.Join(dir, "other")
+			if tc.other != "" {
+				write(filepath.Join(other, "go.env"), tc.other)
+			}
+			userFile := filepath.Join(configDir, "go", "env")
+			switch tc.goenv {
+			case "file":
+				userFile = filepath.Join(dir, "user-env")
+				env["GOENV"] = userFile
+			case "dir":
+				env["GOENV"] = dir
+			case "absent":
+				env["GOENV"] = filepath.Join(dir, "absent")
+			case "off":
+				env["GOENV"] = "off"
+			}
+			if tc.user != "" {
+				write(userFile, strings.ReplaceAll(tc.user, "%s", other))
+			}
+			if tc.proxy != "" {
+				env["GOPROXY"] = tc.proxy
+			}
+
+			cmd := exec.Command(filepath.Join(env["PATH"], "go"), "env", "GOPROXY")
+			for k, v := range env {
+				cmd.Env = append(cmd.Env, k+"="+v)
+			}
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("go env GOPROXY: %v", err)
+			}
+			want := strings.TrimSuffix(string(out), "\n")
+
+			got := effectiveGoproxy(func(k string) string { return env[k] }, func() (string, error) {
+				if tc.noHome {
+					return "", errors.New("$HOME is not defined")
+				}
+				return configDir, nil
+			})
+			if got.val != want {
+				t.Errorf("GOPROXY = %q (from %s); go resolves %q", got.val, got.source, want)
+			}
+		})
 	}
 }
 
@@ -226,10 +346,17 @@ func TestAllChecksRunCleanly(t *testing.T) {
 	}
 }
 
-// rubyFixture stands in for a host's gem and bundle: which are on PATH, what
-// `gem sources --list` prints, and the home Bundler's user config sits in.
-func rubyFixture(t *testing.T, tools []string, sources string, env map[string]string) rubyTools {
+// rubyFixture stands in for a host's gem and bundle: which are on PATH, the
+// ~/.gemrc gem reads (none when gemrc is empty), and the home Bundler's user
+// config sits in. The system gemrc is a path that does not exist.
+func rubyFixture(t *testing.T, tools []string, gemrc string, env map[string]string) rubyTools {
 	t.Helper()
+	home := t.TempDir()
+	if gemrc != "" {
+		if err := os.WriteFile(filepath.Join(home, ".gemrc"), []byte(gemrc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return rubyTools{
 		lookPath: func(name string) (string, error) {
 			for _, tool := range tools {
@@ -239,13 +366,12 @@ func rubyFixture(t *testing.T, tools []string, sources string, env map[string]st
 			}
 			return "", exec.ErrNotFound
 		},
-		gemSources: func(string) (string, error) { return sources, nil },
-		getenv:     func(k string) string { return env[k] },
-		home:       t.TempDir(),
+		getenv:      func(k string) string { return env[k] },
+		lookupEnv:   func(k string) (string, bool) { v, ok := env[k]; return v, ok },
+		home:        home,
+		systemGemrc: filepath.Join(home, "etc/gemrc"),
 	}
 }
-
-const bodegaGemSources = "*** CURRENT SOURCES ***\n\nhttps://bodega.internal/rubygems/\n"
 
 func TestCheckRubygemsGivesNoRowWithoutGemOrBundle(t *testing.T) {
 	if f, ok := checkRubygems(rubyFixture(t, nil, "", nil)); ok {
@@ -256,12 +382,8 @@ func TestCheckRubygemsGivesNoRowWithoutGemOrBundle(t *testing.T) {
 func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	both := []string{"gem", "bundle"}
 	configured := func(t *testing.T) rubyTools {
-		r := rubyFixture(t, both, bodegaGemSources, nil)
-		r.home = t.TempDir()
+		r := rubyFixture(t, both, "", nil)
 		for _, c := range clientconf.Rubygems("https://bodega.internal") {
-			if c.Label != "Bundler mirror" {
-				continue
-			}
 			path := filepath.Join(r.home, strings.TrimPrefix(c.Path(clientconf.OSLinux), "~/"))
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)
@@ -279,10 +401,12 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	}
 
 	r := configured(t)
-	r.gemSources = func(string) (string, error) { return "*** CURRENT SOURCES ***\n\nhttps://rubygems.org/\n", nil }
+	if err := os.Remove(filepath.Join(r.home, ".gemrc")); err != nil {
+		t.Fatal(err)
+	}
 	f, _ = checkRubygems(r)
 	if f.Status != StatusWarn || !strings.Contains(f.Detail, "gem sources lists https://rubygems.org/") || !strings.Contains(f.Remediation, "--configure rubygems") {
-		t.Errorf("gem sources on rubygems.org = %+v, want a warning naming the source and --configure rubygems", f)
+		t.Errorf("gem with no gemrc = %+v, want a warning naming its default source and --configure rubygems", f)
 	}
 
 	f, _ = checkRubygems(rubyFixture(t, []string{"bundle"}, "", nil))
@@ -300,11 +424,122 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 		t.Errorf("BUNDLE_MIRROR__ALL on bodega = %+v, want OK", f)
 	}
 
-	r = rubyFixture(t, []string{"gem"}, "", nil)
-	r.gemSources = func(string) (string, error) { return "", errors.New("exit status 1") }
+	r = rubyFixture(t, []string{"gem"}, ":sources: [https://bodega.internal/rubygems/]\n", nil)
 	f, _ = checkRubygems(r)
-	if f.Status != StatusSkip || !strings.Contains(f.Detail, "exit status 1") {
-		t.Errorf("gem sources failing = %+v, want SKIPPED with the error", f)
+	if f.Status != StatusSkip || !strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Detail, filepath.Join(r.home, ".gemrc")) {
+		t.Errorf("a gemrc gem cannot build a source list from = %+v, want SKIPPED, unchecked and naming the file", f)
+	}
+}
+
+// TestGemSourcesLoadAsRubyGems holds gemSources to what RubyGems 3.5.22's
+// Gem::ConfigFile answered for each ~/.gemrc: the sources gem runs with. An
+// empty want is a file gem raises on, discards, or builds no list of URLs
+// from, and both-spellings is one doctor declines to decide.
+func TestGemSourcesLoadAsRubyGems(t *testing.T) {
+	const def = "https://rubygems.org/"
+	const a, b = "https://a.example/", "https://b.example/"
+	for _, tc := range []struct {
+		name, gemrc string
+		want        []string
+	}{
+		{"rendered by clientconf", "---\n:sources:\n- https://bodega.internal/rubygems/\n", []string{"https://bodega.internal/rubygems/"}},
+		{"no sources key", ":verbose: true\n", []string{def}},
+		{"quoted items", ":sources:\n- \"" + a + "\"\n- '" + b + "'\n", []string{a, b}},
+		{"string key", "sources:\n- " + a + "\n", []string{a}},
+		{"string key with a trailing slash", "sources/:\n- " + a + "\n", []string{a}},
+		{"both spellings", ":sources:\n- " + a + "\nsources:\n- " + b + "\n", nil},
+		{"empty list", ":sources: []\n", []string{def}},
+		{"key with nothing under it", ":sources:\n:verbose: true\n", []string{def}},
+		{"items after another key", ":sources:\n:verbose: true\n- " + a + "\n", []string{a}},
+		{"scalar", ":sources: " + a + "\n", nil},
+		{"item with a comment", ":sources:\n- " + a + " # mirror\n", []string{a}},
+		{"commented-out sources", "# :sources:\n# - https://x.example/\n:sources:\n- " + a + "\n", []string{a}},
+		{"indented items", ":sources:\n  - " + a + "\n", []string{a}},
+		{"flow list", ":sources: [" + a + "]\n", nil},
+		{"item under no key", "- " + a + "\n", nil},
+		{"key indented under nothing", "    :sources:\n- " + a + "\n", nil},
+		{"sources nested under another key", "gem:\n  :sources:\n  - " + a + "\n", []string{def}},
+		{"key holding a colon and a space", ":sources: " + a + ": x\n", nil},
+		{"CRLF", ":sources:\r\n- " + a + "\r\n", []string{a}},
+		{"quoted empty string", ":sources: \"\"\n", []string{def}},
+		{"set twice", ":sources:\n- " + a + "\n:sources:\n- " + b + "\n", []string{b}},
+		{"tab after the colon", ":sources:\t\n- " + a + "\n", nil},
+		{"item with a port", ":sources:\n- https://a.example:8443/rubygems/\n", []string{"https://a.example:8443/rubygems/"}},
+		{"item that reads as a key", ":sources:\n- " + a + " extra: thing\n", []string{def}},
+		{"document end marker", ":sources:\n- " + a + "\n...\n", []string{a}},
+		{"anchor", ":sources: &a\n- " + a + "\n", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := rubyFixture(t, nil, tc.gemrc, nil)
+			got, err := gemSources(gemrcEnv{lookupEnv: r.lookupEnv, home: r.home, system: r.systemGemrc})
+			if tc.want == nil {
+				if err == nil {
+					t.Fatalf("sources = %q; want the file left undecided", got)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got, tc.want) {
+				t.Errorf("sources = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestGemSourcesMergeTheFilesRubyGemsLoads holds the files gemSources reads
+// to the ones RubyGems 3.5.22 merges: the system gemrc, then ~/.gemrc or its
+// XDG location, then each file $GEMRC names, where a set $GEMRC, even an
+// empty one, means the user's file is not read at all.
+func TestGemSourcesMergeTheFilesRubyGemsLoads(t *testing.T) {
+	const def = "https://rubygems.org/"
+	list := func(u string) string { return ":sources:\n- " + u + "\n" }
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		env   map[string]string
+		want  []string
+	}{
+		{"the system gemrc alone", map[string]string{"etc/gemrc": list("https://system.example/")}, nil, []string{"https://system.example/"}},
+		{"~/.gemrc over the system gemrc", map[string]string{"etc/gemrc": list("https://system.example/"), ".gemrc": list("https://home.example/")}, nil, []string{"https://home.example/"}},
+		{"~/.gemrc over the XDG file", map[string]string{".gemrc": list("https://home.example/"), "xdg/gem/gemrc": list("https://xdg.example/")}, map[string]string{"XDG_CONFIG_HOME": "{home}/xdg"}, []string{"https://home.example/"}},
+		{"the XDG file", map[string]string{"xdg/gem/gemrc": list("https://xdg.example/")}, map[string]string{"XDG_CONFIG_HOME": "{home}/xdg"}, []string{"https://xdg.example/"}},
+		{"~/.config without XDG_CONFIG_HOME", map[string]string{".config/gem/gemrc": list("https://dotconfig.example/")}, nil, []string{"https://dotconfig.example/"}},
+		{"an empty XDG_CONFIG_HOME", map[string]string{".config/gem/gemrc": list("https://dotconfig.example/")}, map[string]string{"XDG_CONFIG_HOME": ""}, []string{def}},
+		{"GEMRC over ~/.gemrc", map[string]string{".gemrc": list("https://home.example/"), "env1": list("https://env.example/")}, map[string]string{"GEMRC": "{home}/env1"}, []string{"https://env.example/"}},
+		{"GEMRC without sources hides ~/.gemrc", map[string]string{".gemrc": list("https://home.example/"), "env2": ":verbose: true\n"}, map[string]string{"GEMRC": "{home}/env2"}, []string{def}},
+		{"an empty GEMRC hides ~/.gemrc", map[string]string{".gemrc": list("https://home.example/")}, map[string]string{"GEMRC": ""}, []string{def}},
+		{"GEMRC over the system gemrc", map[string]string{"etc/gemrc": list("https://system.example/"), "env2": ":verbose: true\n"}, map[string]string{"GEMRC": "{home}/env2"}, []string{"https://system.example/"}},
+		{"two GEMRC files", map[string]string{"env1": list("https://env.example/"), "env2": ":verbose: true\n"}, map[string]string{"GEMRC": "{home}/env1:{home}/env2"}, []string{"https://env.example/"}},
+		{"a later GEMRC file resets sources", map[string]string{"env1": list("https://env.example/"), "reset": ":sources:\n"}, map[string]string{"GEMRC": "{home}/env1:{home}/reset"}, []string{def}},
+		{"a missing GEMRC file", nil, map[string]string{"GEMRC": "{home}/missing"}, []string{def}},
+		{"a GEMRC that is a directory", map[string]string{"dir/x": ""}, map[string]string{"GEMRC": "{home}/dir"}, nil},
+		{"a relative GEMRC", nil, map[string]string{"GEMRC": "gemrc"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := rubyFixture(t, nil, "", nil)
+			for name, body := range tc.files {
+				path := filepath.Join(r.home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lookup := func(k string) (string, bool) {
+				v, ok := tc.env[k]
+				return strings.ReplaceAll(v, "{home}", r.home), ok
+			}
+			got, err := gemSources(gemrcEnv{lookupEnv: lookup, home: r.home, system: r.systemGemrc})
+			if tc.want == nil {
+				if err == nil {
+					t.Fatalf("sources = %q; want the list left undecided", got)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got, tc.want) {
+				t.Errorf("sources = %q, %v; want %q", got, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -867,78 +1102,37 @@ func TestRpmHostMalformedRepoFileShadowsNothing(t *testing.T) {
 	}
 }
 
-// B188 R1-R3: a dockerd older than 29.1.3 that mirrors through bodega keeps
-// its status and gains a note naming the docker.io lookup and both versions;
-// a later, unreadable or unparseable version adds nothing, and a daemon.json
-// with no bodega mirror warns as before.
+// A dockerd that mirrors through bodega keeps its status and carries the note
+// about the docker.io lookup, naming the version it stops at. doctor runs no
+// dockerd to learn the version, so the note names none as read, and a
+// daemon.json with no bodega mirror warns without it.
 func TestCheckDockerMirrorLookupNote(t *testing.T) {
-	const bodega = `{"registry-mirrors":["https://bodega.internal/"]}`
 	for _, c := range []struct {
-		name, daemon, version string
-		verErr                error
-		status                Status
-		note                  bool
+		name, daemon string
+		status       Status
 	}{
-		{name: "debian 13", daemon: bodega, version: "Docker version 26.1.5+dfsg1, build a72d7cd\n", status: StatusOK, note: true},
-		{name: "measured clean", daemon: bodega, version: "Docker version 29.1.3, build f52814d\n", status: StatusOK},
-		{name: "later", daemon: bodega, version: "Docker version 30.0.0, build abc\n", status: StatusOK},
-		{name: "unparseable", daemon: bodega, version: "dockerd: something else entirely\n", status: StatusOK},
-		{name: "unreadable", daemon: bodega, verErr: errors.New("exec format error"), status: StatusOK},
-		{name: "no bodega mirror", daemon: `{"registry-mirrors":["https://mirror.example"]}`, version: "Docker version 26.1.5+dfsg1, build a72d7cd\n", status: StatusWarn},
+		{name: "bodega mirror", daemon: `{"registry-mirrors":["https://bodega.internal/"]}`, status: StatusOK},
+		{name: "no bodega mirror", daemon: `{"registry-mirrors":["https://mirror.example"]}`, status: StatusWarn},
 	} {
 		root, write := ociFixture(t)
 		write(clientconf.DockerDaemonPath, c.daemon)
-		var asked string
-		h := OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), DockerdVersion: func(bin string) (string, error) {
-			asked = bin
-			return c.version, c.verErr
-		}}
-		f := ociCheck(t, h, "oci-docker")
+		f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd")}, "oci-docker")
 		if f.Status != c.status {
 			t.Errorf("%s: status = %s, want %s (%+v)", c.name, f.Status, c.status, f)
 		}
-		hasNote := strings.Contains(f.Detail, "resolves docker.io")
-		if hasNote != c.note {
-			t.Errorf("%s: note present = %v, want %v: %q", c.name, hasNote, c.note, f.Detail)
+		if hasNote := strings.Contains(f.Detail, "resolves docker.io"); hasNote != (c.status == StatusOK) {
+			t.Errorf("%s: note present = %v: %q", c.name, hasNote, f.Detail)
 		}
-		if c.note {
-			for _, want := range []string{"dockerd 26.1.5 ", "29.1.3", "no connection follows", "unresolvable without breaking pulls"} {
+		if c.status == StatusOK {
+			for _, want := range []string{"before 29.1.3", "no connection follows", "unresolvable without breaking pulls", "does not run dockerd"} {
 				if !strings.Contains(f.Detail, want) {
 					t.Errorf("%s: note %q does not name %q", c.name, f.Detail, want)
 				}
-			}
-			if asked != "/usr/bin/dockerd" {
-				t.Errorf("%s: version read from %q, want the dockerd on PATH", c.name, asked)
 			}
 		}
 		if c.status == StatusWarn && !strings.Contains(f.Detail, "none of them bodega") {
 			t.Errorf("%s: warning changed: %q", c.name, f.Detail)
 		}
-	}
-	root, write := ociFixture(t)
-	write(clientconf.DockerDaemonPath, bodega)
-	if f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd")}, "oci-docker"); f.Status != StatusOK || strings.Contains(f.Detail, "resolves docker.io") {
-		t.Errorf("no version reader = %+v, want OK with no note", f)
-	}
-}
-
-func TestCheckDockerMirrorRejectsMalformedVersionToken(t *testing.T) {
-	root, write := ociFixture(t)
-	write(clientconf.DockerDaemonPath, `{"registry-mirrors":["https://bodega.internal/"]}`)
-	baseline := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd")}, "oci-docker")
-	for _, version := range []string{
-		"Docker version 26.1.5.7, build a72d7cd",
-		"Docker version 26.1.5garbage, build a72d7cd",
-	} {
-		t.Run(version, func(t *testing.T) {
-			h := OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), DockerdVersion: func(string) (string, error) {
-				return version, nil
-			}}
-			got := ociCheck(t, h, "oci-docker")
-			if got != baseline {
-				t.Fatalf("invalid version %q changed finding: got %+v; want %+v", version, got, baseline)
-			}
-		})
 	}
 }
 
@@ -962,47 +1156,5 @@ func TestDockerLookupDocumentation(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// B188 R2: every well-formed suffix still parses, and a prerelease of the
-// measured floor is earlier than it.
-func TestDockerdLookupNoteVersionForms(t *testing.T) {
-	for version, named := range map[string]string{
-		"Docker version 26.1.5+dfsg1, build a72d7cd": "26.1.5",
-		"Docker version 18.09.1-ce, build 4c52b90":   "18.09.1-ce",
-		"Docker version 26.1.5":                      "26.1.5",
-		"Docker version 29.1.3-rc.1, build f52814d":  "29.1.3-rc.1",
-		"Docker version 29.1.3+dfsg1, build f52814d": "",
-		"Docker version 29.1.3, build f52814d":       "",
-		"Docker version 26.1.5+, build a72d7cd":      "",
-		"Docker version 26.1.5-, build a72d7cd":      "",
-		"Docker version 26.1, build a72d7cd":         "",
-	} {
-		note := dockerdLookupNote(func() (string, error) { return version + "\n", nil })
-		if named == "" {
-			if note != "" {
-				t.Errorf("%q: note = %q, want none", version, note)
-			}
-			continue
-		}
-		if !strings.Contains(note, "dockerd "+named+" resolves docker.io") {
-			t.Errorf("%q: note = %q, want it to name dockerd %s", version, note, named)
-		}
-	}
-}
-
-func TestCheckDockerMirrorLookupNoteNamesPrerelease(t *testing.T) {
-	root, write := ociFixture(t)
-	write(clientconf.DockerDaemonPath, `{"registry-mirrors":["https://bodega.internal/"]}`)
-	h := OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), DockerdVersion: func(string) (string, error) {
-		return "Docker version 29.1.3-rc.1, build f52814d", nil
-	}}
-	got := ociCheck(t, h, "oci-docker")
-	if got.Status != StatusOK {
-		t.Fatalf("status = %s, want OK: %+v", got.Status, got)
-	}
-	if !strings.Contains(got.Detail, "dockerd 29.1.3-rc.1 resolves docker.io") {
-		t.Fatalf("note must name the prerelease read from dockerd, not the measured clean release: %q", got.Detail)
 	}
 }

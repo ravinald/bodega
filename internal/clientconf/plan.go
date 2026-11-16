@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/plannedfs"
 )
 
 // Plan actions. install is a file to write; refuse is a system the host's
@@ -198,6 +199,9 @@ type Change struct {
 	// and containerd's config.toml, Old with the fetched file's settings
 	// merged in.
 	New []byte
+	// planned is the fetched file as the plan rendered it, which a merge
+	// other than the one New came from starts over from.
+	planned []byte
 }
 
 // Unchanged reports whether the host already holds what Apply would write.
@@ -222,8 +226,8 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	if err != nil {
 		return Change{}, fmt.Errorf("%s: %w", rec.System, err)
 	}
-	c := Change{Record: rec, Target: target, New: content}
-	info, err := os.Stat(target)
+	c := Change{Record: rec, Target: target, New: content, planned: content}
+	info, err := plannedfs.Stat(target)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return c, nil
@@ -232,7 +236,7 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	case !info.Mode().IsRegular():
 		return Change{}, fmt.Errorf("%s exists and is not a regular file; move it aside, then re-run. Nothing was written", target)
 	}
-	if c.Old, err = os.ReadFile(target); err != nil {
+	if c.Old, err = plannedfs.ReadFile(target); err != nil {
 		return Change{}, fmt.Errorf("read %s: %w", target, err)
 	}
 	c.Existed = true
@@ -279,7 +283,9 @@ func TargetPath(path, home string) (string, error) {
 // Diff is the unified diff from what the host holds to what Apply would
 // write, as diff(1) -u prints it: the setup script shells out to the same
 // tool, so both paths show an operator one format. Both sides pass through
-// Redact first, so a secret in either file never reaches the output.
+// Redact and RedactLocations first, so a secret in either file, a token in an
+// index URL's query included, never reaches the output. Only the diffed
+// copies are redacted; Apply writes the file as planned.
 func (c Change) Diff() (string, error) {
 	dir, err := os.MkdirTemp("", "bodega-plan-*")
 	if err != nil {
@@ -287,10 +293,10 @@ func (c Change) Diff() (string, error) {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	oldPath, newPath := filepath.Join(dir, "old"), filepath.Join(dir, "new")
-	if err := os.WriteFile(oldPath, []byte(Redact(string(c.Old))), 0o600); err != nil {
+	if err := os.WriteFile(oldPath, []byte(Redact(RedactLocations(string(c.Old)))), 0o600); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(newPath, []byte(Redact(string(c.New))), 0o600); err != nil {
+	if err := os.WriteFile(newPath, []byte(Redact(RedactLocations(string(c.New)))), 0o600); err != nil {
 		return "", err
 	}
 	if !c.Existed {
@@ -369,14 +375,14 @@ const wOK = 0x2
 // writable asks whether this process could write path, creating its parent
 // directories if they are missing.
 func writable(path string) error {
-	if _, err := os.Stat(path); err == nil {
+	if _, err := plannedfs.Stat(path); err == nil {
 		if err := syscall.Access(path, wOK); err != nil {
 			return err
 		}
 	}
 	dir := filepath.Dir(path)
 	for {
-		if _, err := os.Stat(dir); err == nil {
+		if _, err := plannedfs.Stat(dir); err == nil {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -390,11 +396,11 @@ func writable(path string) error {
 
 // copyFile copies src to dst with src's mode, refusing to overwrite dst.
 func copyFile(src, dst string) error {
-	info, err := os.Stat(src)
+	info, err := plannedfs.Stat(src)
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(src)
+	data, err := plannedfs.ReadFile(src)
 	if err != nil {
 		return err
 	}
