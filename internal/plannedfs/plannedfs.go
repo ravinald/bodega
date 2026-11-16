@@ -20,21 +20,34 @@ import (
 var (
 	mu      sync.RWMutex
 	planned map[string][]byte
+	// existing is each planned file already on disk, by identity: a plan
+	// writes such a file in place, so every other name for it (a symlink, a
+	// hard link) reads the planned bytes too.
+	existing []identified
 )
+
+type identified struct {
+	info fs.FileInfo
+	data []byte
+}
 
 // With runs fn while files, keyed by absolute path, read as their content
 // here. Calls do not nest.
 func With(files map[string][]byte, fn func() error) error {
 	clean := make(map[string][]byte, len(files))
+	var ids []identified
 	for name, data := range files {
 		clean[filepath.Clean(name)] = data
+		if info, err := os.Stat(name); err == nil && info.Mode().IsRegular() {
+			ids = append(ids, identified{info, data})
+		}
 	}
 	mu.Lock()
-	planned = clean
+	planned, existing = clean, ids
 	mu.Unlock()
 	defer func() {
 		mu.Lock()
-		planned = nil
+		planned, existing = nil, nil
 		mu.Unlock()
 	}()
 	return fn()
@@ -43,8 +56,22 @@ func With(files map[string][]byte, fn func() error) error {
 func lookup(name string) ([]byte, bool) {
 	mu.RLock()
 	defer mu.RUnlock()
-	data, ok := planned[filepath.Clean(name)]
-	return data, ok
+	if data, ok := planned[filepath.Clean(name)]; ok {
+		return data, true
+	}
+	if len(existing) == 0 {
+		return nil, false
+	}
+	info, err := os.Stat(name)
+	if err != nil {
+		return nil, false
+	}
+	for _, id := range existing {
+		if os.SameFile(info, id.info) {
+			return id.data, true
+		}
+	}
+	return nil, false
 }
 
 // plannedDir reports whether a planned file lies below dir, which then

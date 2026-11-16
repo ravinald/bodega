@@ -491,7 +491,7 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	for _, key := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
 		if v := t.env(key); v != "" {
-			return []trustStore{{name: fmt.Sprintf("%s, which the environment's %s names and requests reads ahead of pip's cert setting and in place of the system trust store,", v, key), files: []string{v}}}
+			return t.pipBundle(ask, v, fmt.Sprintf("the environment's %s, which requests reads ahead of pip's cert setting", key))
 		}
 	}
 	var global, install [2]string
@@ -525,31 +525,7 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 			return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's cert setting in %s names %s, which pip resolves against another account's home directory or the directory it is started in, neither of which doctor knows, so which bundle pip verifies bodega against is unchecked", cert[1], cert[0])}}
 		}
 		cert[0] = path
-		replaced := trustStore{name: fmt.Sprintf("%s, which pip's cert setting names in %s in place of the system trust store,", cert[0], cert[1]), files: []string{cert[0]}}
-		added := trustStore{name: fmt.Sprintf("%s, which pip's cert setting names in %s and pip reads alongside the system trust store,", cert[0], cert[1]), files: []string{cert[0]}, system: true}
-		// pip 24.2 and later verify through truststore, which keeps the
-		// system's roots and loads the cert bundle on top of them; only
-		// legacy-certs, or a pip without truststore, hands the bundle to
-		// requests in place of every default root.
-		if strings.Contains(t.env("PIP_USE_DEPRECATED"), "legacy-certs") {
-			return []trustStore{replaced}
-		}
-		return []trustStore{{name: added.name, resolve: func() trustStore {
-			reason := "pip is not asked on this host"
-			if ask != nil {
-				d, err := ask()
-				switch {
-				case err != nil:
-					reason = err.Error()
-				case !d.Truststore:
-					return replaced
-				default:
-					return added
-				}
-			}
-			added.unsure = fmt.Sprintf("whether pip reads %s alongside the system trust store or in place of it is not known (%s): pip 24.2 and later add it to the system's roots, an older pip or legacy-certs replaces them, so while the bundle alone does not verify bodega's certificate, whether pip does is unchecked", cert[0], reason)
-			return added
-		}}}
+		return t.pipBundle(ask, cert[0], "pip's cert setting in "+cert[1])
 	}
 	system := trustStore{name: systemStoreName + ", which pip reads while no cert setting names a bundle,", system: true}
 	return []trustStore{{name: system.name, resolve: func() trustStore {
@@ -568,6 +544,34 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		}
 		system.unsure = fmt.Sprintf("which bundle pip reads by default is not known (%s), and a pip before 24.2 reads certifi's, which the system trust store's answer says nothing about, so whether pip verifies bodega's certificate is unchecked while no cert setting names a bundle", reason)
 		return system
+	}}}
+}
+
+// pipBundle is the store pip verifies against when from names bundle: pip
+// 24.2 and later verify through truststore, which keeps the system's roots and
+// loads the bundle on top of them; only legacy-certs, or a pip without
+// truststore, hands the bundle to requests in place of every default root.
+func (t TrustProbe) pipBundle(ask func() (PipDefault, error), bundle, from string) []trustStore {
+	replaced := trustStore{name: fmt.Sprintf("%s, which %s names in place of the system trust store,", bundle, from), files: []string{bundle}}
+	added := trustStore{name: fmt.Sprintf("%s, which %s names and pip reads alongside the system trust store,", bundle, from), files: []string{bundle}, system: true}
+	if strings.Contains(t.env("PIP_USE_DEPRECATED"), "legacy-certs") {
+		return []trustStore{replaced}
+	}
+	return []trustStore{{name: added.name, resolve: func() trustStore {
+		reason := "pip is not asked on this host"
+		if ask != nil {
+			d, err := ask()
+			switch {
+			case err != nil:
+				reason = err.Error()
+			case !d.Truststore:
+				return replaced
+			default:
+				return added
+			}
+		}
+		added.unsure = fmt.Sprintf("whether pip reads %s alongside the system trust store or in place of it is not known (%s): pip 24.2 and later add it to the system's roots, an older pip or legacy-certs replaces them, so while the bundle alone does not verify bodega's certificate, whether pip does is unchecked", bundle, reason)
+		return added
 	}}}
 }
 
