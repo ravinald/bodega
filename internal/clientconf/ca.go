@@ -943,6 +943,12 @@ type systemStore struct {
 	dir, ext string
 	step     []string
 	live     []string
+	// anchors lists the files under dir the rebuild reads, by the
+	// platform's own selection rule. Nil where that rule is not modeled: a
+	// replaced anchor's roots then leave the proposed store even if another
+	// file still supplies them, which can refuse a plan but never passes one
+	// the rebuild would fail.
+	anchors func(dir string) []string
 }
 
 // systemStoreFor resolves the trust store of the host. certctl before FreeBSD
@@ -953,17 +959,17 @@ type systemStore struct {
 func systemStoreFor(h CAHost) (systemStore, error) {
 	if h.GOOS == OSFreeBSD {
 		return systemStore{"/usr/local/share/certs", ".pem", []string{"certctl", "rehash"},
-			[]string{"/etc/ssl/cert.pem", "/etc/ssl/certs/*.[0-9]*"}}, nil
+			[]string{"/etc/ssl/cert.pem", "/etc/ssl/certs/*.[0-9]*"}, nil}, nil
 	}
 	if h.GOOS == OSLinux {
 		for _, id := range osReleaseFamily(h.OSRelease) {
 			switch id {
 			case "debian", "ubuntu":
 				return systemStore{"/usr/local/share/ca-certificates", ".crt", []string{"update-ca-certificates"},
-					[]string{"/etc/ssl/certs/ca-certificates.crt"}}, nil
+					[]string{"/etc/ssl/certs/ca-certificates.crt"}, crtTree}, nil
 			case "rhel", "fedora", "centos":
 				return systemStore{"/etc/pki/ca-trust/source/anchors", ".pem", []string{"update-ca-trust", "extract"},
-					[]string{"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"}}, nil
+					[]string{"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"}, nil}, nil
 			}
 		}
 	}
@@ -1040,6 +1046,22 @@ func ProposedSystemRoots(h CAHost, changes []Change) ([]*x509.Certificate, error
 		}
 		added = append(added, pemCerts(c.New)...)
 	}
+	if len(gone) > 0 && store.anchors != nil {
+		changed := map[string]bool{}
+		for _, c := range changes {
+			changed[filepath.Clean(c.Target)] = true
+		}
+		for _, f := range store.anchors(dir) {
+			if changed[filepath.Clean(f)] {
+				continue
+			}
+			if data, err := plannedfs.ReadFile(f); err == nil {
+				for _, c := range pemCerts(data) {
+					delete(gone, sha256.Sum256(c.Raw))
+				}
+			}
+		}
+	}
 	var out []*x509.Certificate
 	for _, r := range store.roots(h.Root) {
 		if !gone[sha256.Sum256(r.Raw)] {
@@ -1047,6 +1069,38 @@ func ProposedSystemRoots(h CAHost, changes []Change) ([]*x509.Certificate, error
 		}
 	}
 	return append(out, added...), nil
+}
+
+// crtTree is update-ca-certificates' selection of local anchors: every
+// regular file named *.crt below dir, symlinks followed (find -L dir -type f
+// -name '*.crt').
+func crtTree(dir string) []string {
+	var out []string
+	var walk func(d string, depth int)
+	walk = func(d string, depth int) {
+		if depth > 32 {
+			return
+		}
+		entries, err := plannedfs.ReadDir(d)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			p := filepath.Join(d, e.Name())
+			info, err := plannedfs.Stat(p)
+			if err != nil {
+				continue
+			}
+			switch {
+			case info.IsDir():
+				walk(p, depth+1)
+			case info.Mode().IsRegular() && strings.HasSuffix(e.Name(), ".crt"):
+				out = append(out, p)
+			}
+		}
+	}
+	walk(dir, 0)
+	return out
 }
 
 func pemCerts(data []byte) []*x509.Certificate {
