@@ -127,7 +127,7 @@ Every command takes `--help`, with examples. [Usage](docs/usage.md#commands) cov
 
 ## Status
 
-Pre-1.0: the CLI, the manifest schema, and the config format still change between versions. All fifteen package types serve their native clients today. The end-to-end suite in `test/e2e` drives twelve of them against a running server on Linux and FreeBSD hosts; composer, oci, and rpm are covered by unit tests and have no suite there yet. That suite runs by hand, so the automated gate is unit tests and linters. Clone-mode git carries no upstream digest, because bodega builds the bundle locally; [Threat model](docs/threat-model.md) explains the boundary.
+Pre-1.0: the CLI, the manifest schema, and the config format still change between versions. All fifteen package types serve their native clients today. The end-to-end suite in `test/e2e` drives twelve of them against a running server on Linux and FreeBSD hosts. Composer, OCI and rpm are tested by real-application suites that are not in this repository yet. Both sets run nightly on the maintainer's hosts, and the Package support page on the project website reports each type's latest results. Neither runs in CI, so the automated gate on a pull request is unit tests and linters. Clone-mode git carries no upstream digest, because bodega builds the bundle locally; [Threat model](docs/threat-model.md) explains the boundary.
 
 ## License
 
