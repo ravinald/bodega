@@ -48,7 +48,9 @@ GOTMP="$GATED_ROOT/tmp"
 # pinned cores: internal/audit passed in 787s, internal/server passed 188
 # top-level tests summing 1791s and was still running at a 30m limit.
 # Only an unset variable takes the default: an explicitly empty one is a value
-# somebody set, and the check below blocks it by name.
+# somebody set, and the check below blocks it by name. "elsewhere" says another
+# job runs the two packages under -race and skips them here: the whole server
+# package on two cores outlasts any bound a pass sharing the night can afford.
 GATED_RACE_TIMEOUT="${E2E_GATED_RACE_TIMEOUT-60m}"
 
 e2e_on server "test -x $GO" || true
@@ -108,7 +110,14 @@ check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega ins
 # a day: past it the bound is no bound for a nightly run, and four digits keep
 # the arithmetic below inside bash's 64-bit integers, where a longer value
 # wraps and hands timeout(1) a negative bound.
-if [[ "$GATED_RACE_TIMEOUT" =~ ^[1-9][0-9]{0,3}m$ ]] && [ "${GATED_RACE_TIMEOUT%m}" -le 1440 ]; then
+if [ "$GATED_RACE_TIMEOUT" = elsewhere ]; then
+	E2E_HOST=local
+	for id in GAT-06 GAT-07; do
+		e2e_skip "$id" "a -race package run on two cores" \
+			"E2E_GATED_RACE_TIMEOUT=elsewhere: another job runs the -race packages"
+	done
+	E2E_HOST=server
+elif [[ "$GATED_RACE_TIMEOUT" =~ ^[1-9][0-9]{0,3}m$ ]] && [ "${GATED_RACE_TIMEOUT%m}" -le 1440 ]; then
 	# Each run's whole output stays on the guest and the first failure is
 	# printed ahead of the tail: a timeout's goroutine dump fills any tail and
 	# pushes the failing test, or the race report, out of it.
@@ -126,7 +135,7 @@ else
 	E2E_HOST=local
 	for id in GAT-06 GAT-07; do
 		e2e_block "$id" "a -race package run on two cores" \
-			"E2E_GATED_RACE_TIMEOUT=\"$GATED_RACE_TIMEOUT\" is not a whole number of minutes from 1m to 1440m (for example 60m); set it to one and rerun suite 85"
+			"E2E_GATED_RACE_TIMEOUT=\"$GATED_RACE_TIMEOUT\" is neither \"elsewhere\" nor a whole number of minutes from 1m to 1440m (for example 60m); set it to one and rerun suite 85"
 	done
 	E2E_HOST=server
 fi
