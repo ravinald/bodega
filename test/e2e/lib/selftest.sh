@@ -985,7 +985,7 @@ gated_race() {
 		# shellcheck disable=SC2329
 		check_eq() { :; }
 		# shellcheck disable=SC2329
-		e2e_skip() { :; }
+		e2e_skip() { printf 'SKIP %s\n' "$1" >>"$work/gated.blocks"; }
 		# shellcheck disable=SC2329
 		e2e_block() {
 			printf 'BLOCK %s\n' "$1" >>"$work/gated.blocks"
@@ -1003,6 +1003,7 @@ gated_race() {
 t_ok "suite 85: unset override runs both -race calls at 60m inside 4200s" "4200 60m 4200 60m" "$(gated_race -)"
 t_ok "suite 85: 45m runs both -race calls inside 3300s" "3300 45m 3300 45m" "$(gated_race 45m)"
 t_ok "suite 85: 1440m is the ceiling and runs" "87000 1440m 87000 1440m" "$(gated_race 1440m)"
+t_ok "suite 85: elsewhere skips GAT-06 and GAT-07 and runs no -race call" "SKIP GAT-06 SKIP GAT-07" "$(gated_race elsewhere)"
 for v in '' 0m 1441m 10000m 153722867280912930m 060m 1h 60 '60m;x' ' 60m'; do
 	t_ok "suite 85: override <$v> blocks GAT-06 and GAT-07 and runs no -race call" \
 		"BLOCK GAT-06 BLOCK GAT-07" "$(gated_race "$v")"
