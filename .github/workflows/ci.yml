@@ -225,7 +225,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+      - uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
         with:
           release: "15.1"
           copyback: false
@@ -233,6 +233,14 @@ jobs:
             pkg install -y go126 git node
             pw useradd -n bodega-ci -m -s /bin/sh
             install -d -o bodega-ci -g bodega-ci -m 0700 /home/bodega-ci/tmp
+            # bodega refuses a storage root on a filesystem that keeps no
+            # ACLs, and the tests' storage roots are under this TMPDIR. The
+            # image's UFS is mounted without them.
+            tmpfs="$(df -T /home/bodega-ci/tmp | awk 'NR == 2 { print $2 }')"
+            tmpmnt="$(df /home/bodega-ci/tmp | awk 'NR == 2 { print $NF }')"
+            echo "TMPDIR is on $tmpfs at $tmpmnt"
+            if [ "$tmpfs" = ufs ]; then mount -u -o acls "$tmpmnt"; fi
+            mount -p | awk -v m="$tmpmnt" '$2 == m'
             chown -R bodega-ci "$GITHUB_WORKSPACE"
           # Unprivileged, as the Linux jobs run: as root, a 0444 audit.db
           # stays writable, a test binary in root's 0700 build dir cannot be
