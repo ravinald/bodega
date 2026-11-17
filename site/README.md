@@ -73,7 +73,7 @@ Deployment settings live in `docs-internal/site-deploy.json`, which is not commi
   "site_url": "https://packages.example.com",
   "ssh_host": "web-production",
   "remote_root": "/srv/www/project",
-  "coverage_report": "reports/packages.html"
+  "coverage_report": "reports/coverage.json"
 }
 ```
 
@@ -83,7 +83,7 @@ These are example values. `coverage_report` resolves relative to the config file
 
 ```sh
 cd site
-python3 scripts/coverage.py ~/path/to/report.html /tmp/coverage.json
+python3 scripts/coverage.py ~/path/to/feed.json /tmp/coverage.json
 go build -o /tmp/sitegen .
 /tmp/sitegen -repo .. -tmpl . -out /tmp/bodega-site -base / \
   -coverage /tmp/coverage.json -version "$(git describe --tags --always)" -commit "$(git rev-parse HEAD)"
@@ -123,7 +123,7 @@ A failed build or upload changes nothing on the server, and the next pass tries 
 
 ## Coverage feed and page
 
-`scripts/coverage.py` extracts feature evidence and test results from the report into `coverage.json`. It does not import the report's layout, publish private backlog rows or recalculate readiness. Publication uploads the feed under a temporary name and renames it into `<remote_root>/data/coverage.json`.
+`coverage_report` names the public feed the status report writes as JSON, not the report's HTML page: that page carries maintainer notes in its tooltips (work-item ids, source paths, test identifiers), and reading it published them. `scripts/coverage.py` copies the feed into `coverage.json` and recalculates nothing. It keeps only the fields the site renders, so a field added to the feed is not published until the script lists it, and it refuses a feed whose text reads like one of those notes, or an HTML file, naming what it found. Publication uploads the feed under a temporary name and renames it into `<remote_root>/data/coverage.json`.
 
 It then renders `/coverage.html` again from the new feed. The page is built from the commit the active release names in its `deployment.json`, not from this checkout, so its layout and contents links match the pages around it; a checkout that lacks that commit refuses with a message to `git fetch`. The page lands in `<remote_root>/data/coverage.html`. A scheduler can run this command after each report; website releases and rollbacks do not touch either file.
 
@@ -156,4 +156,4 @@ python3 -m unittest discover -s site/scripts -p 'test_*.py'
 
 The last one needs Chrome or Chromium on the host, under a name `chromedp` looks for, and the test fails with that instruction when it finds none. Chrome resolves no host name during the run, so a request the test reports was attempted and never sent. Nothing clicks through the reference: what Scalar fetches only after a reader opens a section is covered by the document reader for the document's own content, and by the pinned bundle and its configuration for the rest.
 
-`test_reference_privacy.py` plants an image on another origin in a copy of the document's introduction and passes only when the Go check refuses that copy. `test_deploy.py` checks the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, that the coverage page renders from the deployed commit, and that `sync` deploys only a trunk ahead of the live release with no hold in place.
+`test_reference_privacy.py` plants an image on another origin in a copy of the document's introduction and passes only when the Go check refuses that copy. `test_coverage.py` checks that the feed export drops fields the site does not render and refuses the HTML report and text that reads like a maintainer note. `test_deploy.py` checks the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, that the coverage page renders from the deployed commit, and that `sync` deploys only a trunk ahead of the live release with no hold in place.
