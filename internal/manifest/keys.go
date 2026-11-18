@@ -681,6 +681,34 @@ func AptKey(poolPath string) string {
 	return AptPrefix + poolPath
 }
 
+// AptArchiveKey returns the key for rel inside a named archive, and AptKey(rel)
+// for the default archive, whose name is "". rel is "pool/..." or "dists/...".
+func AptArchiveKey(archive, rel string) string {
+	if archive == "" {
+		return AptKey(rel)
+	}
+	return AptPrefix + archive + "/" + rel
+}
+
+// SplitAptKey is the inverse of AptArchiveKey: the archive a key belongs to,
+// "" for the default, and the path inside it. ok is false for a key outside
+// the apt tree.
+//
+// The first segment decides. The default archive's own trees are pool/ and
+// dists/, and config.Load refuses both as archive names, so a key opening
+// with anything else names an archive.
+func SplitAptKey(key string) (archive, rel string, ok bool) {
+	rel, ok = strings.CutPrefix(key, AptPrefix)
+	if !ok {
+		return "", "", false
+	}
+	first, rest, found := strings.Cut(rel, "/")
+	if !found || first == "pool" || first == "dists" {
+		return "", rel, true
+	}
+	return first, rest, true
+}
+
 // GomodFileKey returns the key for one file under a module's @v/ directory.
 // module is the go.mod spelling and is stored escaped, as the proxy protocol
 // carries it, so the key is the request path a client sends and an upstream
@@ -1121,8 +1149,9 @@ func lastSegment(s string) string {
 func ParseKey(key string) (typ, name, version string) {
 	switch {
 	case strings.HasPrefix(key, AptPrefix):
-		// dists/ is generated per request; only pool/ holds uploaded bytes.
-		if !strings.HasPrefix(key, AptPoolPrefix) {
+		// dists/ is generated per request; only pool/ holds uploaded bytes,
+		// in the default archive and in each named one.
+		if _, rel, _ := SplitAptKey(key); !strings.HasPrefix(rel, "pool/") {
 			return TypeApt, "", ""
 		}
 		n, v := AptDebIdentity(lastSegment(key))

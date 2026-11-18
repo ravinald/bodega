@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -523,7 +524,7 @@ func TestPoolFallsBackToTheSecondArchive(t *testing.T) {
 	if code, _ := mirrorGet(t, s, "/apt/"+missing); code != http.StatusNotFound {
 		t.Fatalf("missing pool path = %d, want 404", code)
 	}
-	if url, fresh := s.aptRoutes.get(missing); !fresh || url != "" {
+	if url, fresh := s.aptRoutes.get(manifest.AptKey(missing)); !fresh || url != "" {
 		t.Errorf("route cache holds %q/%v for a path no archive has; the next retry re-probes everything", url, fresh)
 	}
 }
@@ -2862,5 +2863,297 @@ func TestReviewF112SignedCRLFReleaseRetainsInitialSnapshot(t *testing.T) {
 				t.Errorf("admission = %+v; want block", c)
 			}
 		})
+	}
+}
+
+// archiveServer mirrors two distributions that publish different bytes at one
+// pool path, each in a named archive, beside a third codename left in the
+// default archive.
+func archiveServer(t *testing.T) (s *Server, ubuntu, debian, plain *fixtureArchive) {
+	t.Helper()
+	ubuntu = newFixtureArchive(t, map[string]string{
+		fixtureDeb:                 "\x21<arch>\nnginx as Ubuntu rebuilt it",
+		"dists/resolute/InRelease": "ubuntu InRelease",
+	})
+	debian = newFixtureArchive(t, map[string]string{
+		fixtureDeb:               "\x21<arch>\nnginx as Debian built it",
+		"dists/trixie/InRelease": "debian InRelease",
+	})
+	plain = newFixtureArchive(t, map[string]string{
+		fallbackDeb:               fallbackDebBody,
+		"dists/fixture/InRelease": "default InRelease",
+	})
+	s = mirrorServer(t)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"resolute":       {{URL: ubuntu.URL()}},
+		"trixie":         {{URL: debian.URL()}},
+		mirroredCodename: {{URL: plain.URL()}},
+	}
+	s.cfg.AptArchives = map[string][]string{"ubuntu": {"resolute"}, "debian": {"trixie"}}
+	return s, ubuntu, debian, plain
+}
+
+// TestTwoArchivesKeepOnePoolPathApart is issue #336: Ubuntu rebuilds what it
+// syncs from Debian under the same version and filename, so one pool path is
+// two files. Each archive's URL has to return its own bytes, on the fetch and
+// from the cache, and a pin taken on one must not refuse the other.
+func TestTwoArchivesKeepOnePoolPathApart(t *testing.T) {
+	s, ubuntu, debian, plain := archiveServer(t)
+	want := map[string]*fixtureArchive{"ubuntu": ubuntu, "debian": debian}
+
+	for _, pass := range []string{"first fetch", "from cache"} {
+		for _, archive := range []string{"ubuntu", "debian"} {
+			wantBody, _ := want[archive].object(fixtureDeb)
+			code, body := mirrorGet(t, s, "/apt/"+archive+"/"+fixtureDeb)
+			if code != http.StatusOK || string(body) != wantBody {
+				t.Fatalf("%s: GET /apt/%s/%s = %d %q, want 200 and that archive's own bytes %q", pass, archive, fixtureDeb, code, body, wantBody)
+			}
+		}
+	}
+	for archive, a := range want {
+		if got := a.count(fixtureDeb); got != 1 {
+			t.Errorf("%s upstream served the .deb %d times, want 1: the second request is a cache hit", archive, got)
+		}
+	}
+
+	ctx := t.Context()
+	keys, err := s.typeStore(manifest.TypeApt).List(ctx, manifest.AptPrefix)
+	if err != nil {
+		t.Fatalf("list the apt tree: %v", err)
+	}
+	wantKeys := map[string]bool{
+		manifest.AptArchiveKey("ubuntu", fixtureDeb): true,
+		manifest.AptArchiveKey("debian", fixtureDeb): true,
+	}
+	if len(keys) != 2 || !wantKeys[keys[0]] || !wantKeys[keys[1]] || keys[0] == keys[1] {
+		t.Errorf("stored objects = %v, want one per archive: %v", keys, wantKeys)
+	}
+
+	pins, err := s.auditDB.ListChecksums(ctx, manifest.TypeApt, "nginx")
+	if err != nil {
+		t.Fatalf("list apt checksums: %v", err)
+	}
+	if len(pins) != 2 {
+		t.Fatalf("pins for apt/nginx = %d, want 2: one pool path in two archives is two objects (%+v)", len(pins), pins)
+	}
+	digests := map[string]string{}
+	for _, pin := range pins {
+		if !wantKeys[pin.ObjectKey] {
+			t.Errorf("pin on %q, want one of %v", pin.ObjectKey, wantKeys)
+		}
+		if pin.PkgName != "nginx" || pin.PkgVersion != "1.24.0-2ubuntu7.1" {
+			t.Errorf("pin on %q is filed under %q/%q, want nginx/1.24.0-2ubuntu7.1", pin.ObjectKey, pin.PkgName, pin.PkgVersion)
+		}
+		digests[pin.ObjectKey] = pin.Value
+	}
+	for archive, a := range want {
+		body, _ := a.object(fixtureDeb)
+		sum := sha256.Sum256([]byte(body))
+		key := manifest.AptArchiveKey(archive, fixtureDeb)
+		if digests[key] != hex.EncodeToString(sum[:]) {
+			t.Errorf("pin on %q = %q, want the digest of the %s bytes", key, digests[key], archive)
+		}
+	}
+
+	// The cache-origin row is per object as well: each names its own archive.
+	for archive, a := range want {
+		key := manifest.AptArchiveKey(archive, fixtureDeb)
+		req := httptest.NewRequest(http.MethodGet, "/apt/"+archive+"/"+fixtureDeb, nil)
+		store := s.typeStore(manifest.TypeApt)
+		id, _, err := identifyObject(ctx, store, key)
+		if err != nil {
+			t.Fatalf("%q is not cached: %v", key, err)
+		}
+		if got, wantOrigin := s.cachedOrigin(req, key, cachedObject{store: store, id: id}), a.URL()+"/"+fixtureDeb; got != wantOrigin {
+			t.Errorf("cache origin of %q = %q, want %q", key, got, wantOrigin)
+		}
+		if base, fresh := s.aptRoutes.get(key); !fresh || base != a.URL() {
+			t.Errorf("route cache for %q = %q/%v, want %q", key, base, fresh, a.URL())
+		}
+	}
+
+	// The default pool asks the roots of codenames in no archive, and no
+	// named archive answers for it.
+	if code, body := mirrorGet(t, s, "/apt/"+fallbackDeb); code != http.StatusOK || string(body) != fallbackDebBody {
+		t.Errorf("default pool GET = %d %q, want 200 from the codename in no archive", code, body)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusNotFound {
+		t.Errorf("GET /apt/%s = %d, want 404: only named archives publish it", fixtureDeb, code)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/ubuntu/"+fallbackDeb); code != http.StatusNotFound {
+		t.Errorf("GET /apt/ubuntu/%s = %d, want 404: the ubuntu archive does not publish it", fallbackDeb, code)
+	}
+	if got := plain.count(fixtureDeb) + ubuntu.count(fallbackDeb) + debian.count(fallbackDeb); got != 0 {
+		t.Errorf("%d fetches crossed an archive boundary, want 0", got)
+	}
+}
+
+// TestArchiveDistsAnswerUnderTheirOwnRoot covers the dists/ half and the two
+// 404 bodies an operator reads after moving a codename into an archive.
+func TestArchiveDistsAnswerUnderTheirOwnRoot(t *testing.T) {
+	s, _, _, _ := archiveServer(t)
+
+	for path, want := range map[string]string{
+		"/apt/ubuntu/dists/resolute/InRelease": "ubuntu InRelease",
+		"/apt/debian/dists/trixie/InRelease":   "debian InRelease",
+		"/apt/dists/fixture/InRelease":         "default InRelease",
+	} {
+		if code, body := mirrorGet(t, s, path); code != http.StatusOK || string(body) != want {
+			t.Errorf("GET %s = %d %q, want 200 %q", path, code, body, want)
+		}
+	}
+	keys, err := s.typeStore(manifest.TypeApt).List(t.Context(), manifest.AptPrefix)
+	if err != nil {
+		t.Fatalf("list the apt tree: %v", err)
+	}
+	stored := strings.Join(keys, " ")
+	for _, want := range []string{
+		"packages/apt/ubuntu/dists/resolute/InRelease",
+		"packages/apt/debian/dists/trixie/InRelease",
+		"packages/apt/dists/fixture/InRelease",
+	} {
+		if !strings.Contains(" "+stored+" ", " "+want+" ") {
+			t.Errorf("store holds %q, want %q among them", stored, want)
+		}
+	}
+
+	for path, wantIn := range map[string][]string{
+		// A codename in a named archive, asked for at the default root.
+		"/apt/dists/resolute/InRelease": {`"resolute"`, `archive "ubuntu"`, "/apt/ubuntu/dists/resolute/"},
+		// An archive the config does not declare.
+		"/apt/fedora/dists/resolute/InRelease": {`apt archive "fedora" is not declared`, "debian, ubuntu"},
+		"/apt/fedora/" + fixtureDeb:            {`apt archive "fedora" is not declared`, "debian, ubuntu"},
+		// A codename asked for under an archive it is not in.
+		"/apt/debian/dists/resolute/InRelease": {`archive "ubuntu"`, "/apt/ubuntu/dists/resolute/"},
+		"/apt/ubuntu/dists/fixture/InRelease":  {"/apt/dists/fixture/"},
+	} {
+		code, body := mirrorGet(t, s, path)
+		if code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", path, code)
+		}
+		for _, want := range wantIn {
+			if !strings.Contains(string(body), want) {
+				t.Errorf("GET %s body = %q, want it to contain %q", path, body, want)
+			}
+		}
+	}
+}
+
+// TestNoArchivesKeepsTheDefaultKeys pins the install that mirrors one
+// distribution: with apt_archives unset the object, the pin and the route are
+// keyed as they were before the key existed, and /apt/<name>/ is still a 404.
+func TestNoArchivesKeepsTheDefaultKeys(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("pool fetch = %d, want 200", code)
+	}
+	const key = "packages/apt/" + fixtureDeb
+	keys, err := s.typeStore(manifest.TypeApt).List(t.Context(), manifest.AptPrefix)
+	if err != nil || len(keys) != 1 || keys[0] != key {
+		t.Errorf("stored objects = %v (%v), want [%q]", keys, err, key)
+	}
+	pins, err := s.auditDB.ListChecksums(t.Context(), manifest.TypeApt, "")
+	if err != nil || len(pins) != 1 || pins[0].ObjectKey != key {
+		t.Errorf("pins = %+v (%v), want one on %q", pins, err, key)
+	}
+	if base, fresh := s.aptRoutes.get(key); !fresh || base != archive.URL() {
+		t.Errorf("route cache for %q = %q/%v, want %q", key, base, fresh, archive.URL())
+	}
+	code, body := mirrorGet(t, s, "/apt/ubuntu/"+fixtureDeb)
+	if code != http.StatusNotFound || !strings.Contains(string(body), "apt_archives is not set") {
+		t.Errorf("GET /apt/ubuntu/... = %d %q, want 404 saying apt_archives is not set", code, body)
+	}
+}
+
+// TestNamedArchiveDiscoveryRowNamesTheSource checks the discovery row of a
+// named archive's .deb against the default archive's: the source package, off
+// a key that carries one more segment.
+func TestNamedArchiveDiscoveryRowNamesTheSource(t *testing.T) {
+	s, serving := debianMirrorServer(t, debianSSLDevDeb, false)
+	s.cfg.AptArchives = map[string][]string{"debian": {"trixie", "trixie-security"}}
+
+	if code, body := mirrorGet(t, s, "/apt/debian/"+debianSSLDevDeb); code != http.StatusOK || string(body) != debianSSLDevBody {
+		t.Fatalf("pool miss = %d body %q, want 200 and the archive's bytes", code, body)
+	}
+	row := waitForPoolRow(t, s, "openssl", 1)
+	if row.PkgVersion != "3.5.7-1~deb13u3" {
+		t.Errorf("pkg_version = %q, want the .deb's own", row.PkgVersion)
+	}
+	if row.UpstreamURL != serving.URL()+"/"+debianSSLDevDeb {
+		t.Errorf("upstream_url = %q, want the archive that served it", row.UpstreamURL)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/debian/"+debianSSLDevDeb); code != http.StatusOK {
+		t.Fatalf("pool hit = %d, want 200", code)
+	}
+	waitForPoolRow(t, s, "openssl", 2)
+	requireNoPoolRow(t, s, "libssl-dev")
+}
+
+// TestUsageDocumentsAptArchives holds docs/usage.md to what the server does:
+// the two 404 bodies an operator pastes into a search are the handler's own,
+// the per-archive URL and key are shown, and neither the page nor the route
+// cache's comment still says two real archives never disagree on a pool path.
+func TestUsageDocumentsAptArchives(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read usage.md: %v", err)
+	}
+	doc := string(raw)
+
+	s, _, _, _ := archiveServer(t)
+	for _, path := range []string{"/apt/dists/resolute/InRelease", "/apt/fedora/dists/resolute/InRelease"} {
+		code, body := mirrorGet(t, s, path)
+		if code != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404", path, code)
+		}
+		if msg := strings.TrimSpace(string(body)); !strings.Contains(doc, msg) {
+			t.Errorf("usage.md does not carry the refusal %s answers with: %q", path, msg)
+		}
+	}
+
+	section := func(heading, next string) string {
+		_, after, ok := strings.Cut(doc, "\n"+heading+"\n")
+		if !ok {
+			t.Fatalf("usage.md has no %q heading", heading)
+		}
+		body, _, _ := strings.Cut(after, "\n"+next)
+		return body
+	}
+	for _, sec := range []struct {
+		heading, next string
+		wants         []string
+	}{
+		{"### Mirroring an upstream archive", "### ", []string{
+			`"apt_archives": {`,
+			`"ubuntu": ["resolute", "resolute-updates", "resolute-security"]`,
+			`"debian": ["trixie", "trixie-updates", "trixie-security"]`,
+			"/apt/<archive>/pool/",
+		}},
+		{"#### Resolving a pool path", "#### ", []string{"/apt/debian/pool/", "packages/apt/debian/pool/"}},
+		{"## Storage Layout", "## ", []string{"packages/apt/debian/pool/", "/apt/<archive>/"}},
+	} {
+		body := section(sec.heading, sec.next)
+		for _, want := range sec.wants {
+			if !strings.Contains(body, want) {
+				t.Errorf("usage.md %q does not show %q", sec.heading, want)
+			}
+		}
+	}
+	if !strings.Contains(doc, "### `bodega pkg checksum clear <type> <name> [--version VER] [--archive NAME]`") {
+		t.Error("usage.md's pkg checksum clear heading does not document --archive")
+	}
+
+	src, err := os.ReadFile("apt_mirror.go")
+	if err != nil {
+		t.Fatalf("read apt_mirror.go: %v", err)
+	}
+	for name, text := range map[string]string{"docs/usage.md": doc, "apt_mirror.go": string(src)} {
+		for _, stale := range []string{"Real Debian and Ubuntu archives do not do", "Debian and Ubuntu archives do not do that"} {
+			if strings.Contains(strings.Join(strings.Fields(strings.ReplaceAll(text, "//", "")), " "), stale) {
+				t.Errorf("%s still says %q: Ubuntu rebuilds what it syncs from Debian under one filename", name, stale)
+			}
+		}
 	}
 }

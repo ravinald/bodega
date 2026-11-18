@@ -351,6 +351,17 @@ type Config struct {
 	// file has no way to say which of them a later pool request came from.
 	AptUpstreams map[string][]AptUpstream `json:"apt_upstreams,omitempty"`
 
+	// AptArchives groups mirrored codenames into named archives, each with a
+	// pool/ of its own: served under /apt/<archive>/ and stored under
+	// packages/apt/<archive>/. Two distributions publish different bytes at
+	// one pool path (Ubuntu rebuilds what it syncs from Debian under the same
+	// version and filename), and a pool request carries no codename, so the
+	// archive has to be in the URL for the two to stay apart.
+	//
+	// A mirrored codename in no archive stays at /apt/dists/ and /apt/pool/,
+	// which is every install that mirrors one distribution.
+	AptArchives map[string][]string `json:"apt_archives,omitempty"`
+
 	// InventorySources maps an inventory source instance name to its
 	// settings: "type", "enabled" and whatever keys that type takes. Several
 	// instances of one type are allowed, two Falcon tenants for example, so
@@ -1399,6 +1410,93 @@ func (c *Config) MirroredAptCodenames() []string {
 	return out
 }
 
+// validateAptArchives refuses an apt_archives block that names something the
+// URL or the storage tree already uses, or a codename it cannot place in
+// exactly one archive. It runs after apt_upstreams and apt_suites are settled,
+// since both are what a codename is checked against.
+func (c *Config) validateAptArchives() error {
+	names := c.AptArchiveNames()
+	owner := map[string]string{}
+	for _, name := range names {
+		if !upstreamNamespacePattern.MatchString(name) {
+			return fmt.Errorf("invalid apt_archives key %q: must match %s — the key is a URL segment under /apt/ and a directory under packages/apt/", name, upstreamNamespacePattern)
+		}
+		reason, reserved := reservedPathElements[name]
+		if name == "keys" {
+			reason, reserved = "served route (/apt/keys/ serves the vendor signing keys)", true
+		}
+		if reserved {
+			return fmt.Errorf("invalid apt_archives key %q: reserved (%s) — rename the archive", name, reason)
+		}
+		for _, codename := range c.AptArchives[name] {
+			switch {
+			case c.ServesAptSuite(codename):
+				return fmt.Errorf("apt_archives[%q]: %q is a generated suite from apt_suites: bodega builds and signs it under /apt/dists/, and an archive groups only codenames apt_upstreams mirrors — remove it from the archive", name, codename)
+			case !c.MirrorsAptCodename(codename):
+				return fmt.Errorf("apt_archives[%q]: codename %q is not mirrored: an archive groups apt_upstreams keys (%s) — add %q to apt_upstreams or remove it from the archive",
+					name, codename, orNoneList(c.MirroredAptCodenames()), codename)
+			case owner[codename] != "":
+				return fmt.Errorf("apt_archives[%q]: codename %q is already in archive %q: a codename is served under one root and its pool is one namespace — list it in one archive",
+					name, codename, owner[codename])
+			}
+			owner[codename] = name
+		}
+	}
+	return nil
+}
+
+func orNoneList(items []string) string {
+	if len(items) == 0 {
+		return "none configured"
+	}
+	return strings.Join(items, ", ")
+}
+
+// AptArchiveNames returns the declared archive names, sorted.
+func (c *Config) AptArchiveNames() []string {
+	out := make([]string, 0, len(c.AptArchives))
+	for name := range c.AptArchives {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AptArchiveOf returns the named archive a mirrored codename belongs to, and
+// "" for the default archive: a codename in no archive, and every generated
+// suite.
+func (c *Config) AptArchiveOf(codename string) string {
+	for name, codenames := range c.AptArchives {
+		if slices.Contains(codenames, codename) {
+			return name
+		}
+	}
+	return ""
+}
+
+// AptPoolUpstreamsIn returns the archive roots of one archive's codenames,
+// each once, sorted. "" is the default archive. A pool request under an
+// archive's root asks these and no others, which is what keeps one
+// distribution's build from answering for another's pool path.
+func (c *Config) AptPoolUpstreamsIn(archive string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for codename, list := range c.AptUpstreams {
+		if c.AptArchiveOf(codename) != archive {
+			continue
+		}
+		for _, up := range list {
+			if up.URL == "" || seen[up.URL] {
+				continue
+			}
+			seen[up.URL] = true
+			out = append(out, up.URL)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // AptPoolUpstreams returns every configured archive root once, sorted.
 //
 // A pool path carries no codename, so the archive a client's apt update
@@ -1900,6 +1998,9 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 			return nil, fmt.Errorf("apt codename %q is in both apt_suites and apt_upstreams: bodega generates and signs one, mirrors the other, and one URL can serve only one of them. "+
 				"Drop it from apt_suites to mirror it, or from apt_upstreams to keep serving your own .debs under that name — a mirrored codename needs a name of its own", suite)
 		}
+	}
+	if err := cfg.validateAptArchives(); err != nil {
+		return nil, err
 	}
 
 	if err := cfg.validateStorage(); err != nil {
@@ -2903,6 +3004,9 @@ func defaultConfigContent() []byte {
   "_comment_apt_upstreams_disjoint": "A codename may not appear in both apt_suites and apt_upstreams — bodega signs one and forwards the other's signature, and a shared name would serve an index whose digests do not cover the packages beside it. A mirrored codename needs a name of its own.",
   "_comment_apt_upstreams_pool": "/apt/pool/ carries no codename, so a .deb is resolved by probing every configured archive in sorted order and remembering which one answered. There is no per-package allow-list for apt: constrain it with 'bodega policy add apt <host>'.",
   "apt_upstreams": {},
+
+  "_comment_apt_archives": "apt_archives: names groups of mirrored codenames whose pool/ is one namespace, e.g. {\"ubuntu\": [\"resolute\", \"resolute-updates\"], \"debian\": [\"trixie\", \"trixie-updates\"]}. A named archive is served at /apt/<archive>/dists/ and /apt/<archive>/pool/ and stored under packages/apt/<archive>/. Needed only when one server mirrors two distributions: Debian and Ubuntu publish different bytes at one pool path. A mirrored codename in no archive stays at /apt/dists/ and /apt/pool/.",
+  "apt_archives": {},
 
   "_comment_apt_signing": "apt_signing_name / apt_signing_email: the UID stamped on a key made by 'bodega apt key generate'. They name the key, nothing more — the server loads whatever key it finds and never generates one.",
   "apt_signing_name": "",

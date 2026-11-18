@@ -249,6 +249,9 @@ func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, hidden a
 		suite:    release["Suite"],
 		codename: release["Codename"],
 		version:  release["Version"],
+
+		notAutomatic:         release["NotAutomatic"],
+		butAutomaticUpgrades: release["ButAutomaticUpgrades"],
 	}
 	if header.suite == "" {
 		header.suite = codename

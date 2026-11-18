@@ -270,3 +270,139 @@ func TestAptUpstreamSigningKeyAccepted(t *testing.T) {
 		t.Errorf("AptKeyedCodenames = %v, want [stable]", got)
 	}
 }
+
+// aptTwoDistros is the apt_upstreams block the archive tests group: two
+// distributions, each with a pocket.
+func aptTwoDistros() map[string]any {
+	up := func(u string) []any { return []any{map[string]string{"url": u}} }
+	return map[string]any{
+		"resolute":         up("https://archive.ubuntu.com/ubuntu"),
+		"resolute-updates": up("https://archive.ubuntu.com/ubuntu"),
+		"trixie":           up("https://deb.debian.org/debian"),
+		"trixie-security":  up("https://security.debian.org/debian-security"),
+	}
+}
+
+// TestAptArchivesRejected walks each refusal. Every message has to name the
+// key, the offending value and the reason, because the operator reads it on a
+// server that would not start.
+func TestAptArchivesRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		archives map[string][]string
+		wantIn   []string
+	}{
+		{
+			name:     "name with a dot is not a URL segment and a directory",
+			archives: map[string][]string{"ubuntu.com": {"resolute"}},
+			wantIn:   []string{`invalid apt_archives key "ubuntu.com"`, "must match"},
+		},
+		{
+			name:     "reserved path element",
+			archives: map[string][]string{"pool": {"resolute"}},
+			wantIn:   []string{`invalid apt_archives key "pool"`, "reserved", "apt pool storage element"},
+		},
+		{
+			name:     "dists would shadow the default route",
+			archives: map[string][]string{"dists": {"resolute"}},
+			wantIn:   []string{`invalid apt_archives key "dists"`, "reserved"},
+		},
+		{
+			name:     "keys is the vendor key route",
+			archives: map[string][]string{"keys": {"resolute"}},
+			wantIn:   []string{`invalid apt_archives key "keys"`, "reserved", "/apt/keys/"},
+		},
+		{
+			name:     "codename apt_upstreams does not mirror",
+			archives: map[string][]string{"ubuntu": {"resolute", "noble"}},
+			wantIn:   []string{`apt_archives["ubuntu"]`, `"noble"`, "not mirrored"},
+		},
+		{
+			name:     "codename in two archives",
+			archives: map[string][]string{"debian": {"trixie"}, "ubuntu": {"resolute", "trixie"}},
+			wantIn:   []string{`apt_archives["ubuntu"]`, `"trixie"`, `already in archive "debian"`},
+		},
+		{
+			name:     "generated suite",
+			archives: map[string][]string{"ubuntu": {"resolute", "local"}},
+			wantIn:   []string{`apt_archives["ubuntu"]`, `"local"`, "generated suite from apt_suites"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeAptConfig(t, map[string]any{
+				"apt_codename":  "local",
+				"apt_upstreams": aptTwoDistros(),
+				"apt_archives":  tc.archives,
+			})
+			_, err := loadApt(t)
+			if err == nil {
+				t.Fatal("Load accepted the block")
+			}
+			for _, want := range tc.wantIn {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAptArchivesAccepted loads the two-distribution form and checks the
+// three questions the server asks of it: which archive a codename is in,
+// which roots an archive's pool asks, and what is left in the default.
+func TestAptArchivesAccepted(t *testing.T) {
+	writeAptConfig(t, map[string]any{
+		"apt_codename":  "local",
+		"apt_upstreams": aptTwoDistros(),
+		"apt_archives": map[string][]string{
+			"ubuntu": {"resolute", "resolute-updates"},
+			"debian": {"trixie"},
+		},
+	})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := strings.Join(cfg.AptArchiveNames(), ","); got != "debian,ubuntu" {
+		t.Errorf("AptArchiveNames() = %q, want them sorted", got)
+	}
+	for codename, want := range map[string]string{
+		"resolute": "ubuntu", "resolute-updates": "ubuntu", "trixie": "debian",
+		"trixie-security": "", "local": "", "unknown": "",
+	} {
+		if got := cfg.AptArchiveOf(codename); got != want {
+			t.Errorf("AptArchiveOf(%q) = %q, want %q", codename, got, want)
+		}
+	}
+	for archive, want := range map[string]string{
+		"ubuntu": "https://archive.ubuntu.com/ubuntu",
+		"debian": "https://deb.debian.org/debian",
+		"":       "https://security.debian.org/debian-security",
+	} {
+		if got := strings.Join(cfg.AptPoolUpstreamsIn(archive), ","); got != want {
+			t.Errorf("AptPoolUpstreamsIn(%q) = %q, want %q", archive, got, want)
+		}
+	}
+}
+
+// TestNoAptArchivesIsUnchanged pins the absent key: every mirrored codename is
+// in the default archive, whose pool asks every configured root as it did
+// before the key existed.
+func TestNoAptArchivesIsUnchanged(t *testing.T) {
+	writeAptConfig(t, map[string]any{"apt_codename": "local", "apt_upstreams": aptTwoDistros()})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AptArchives) != 0 || len(cfg.AptArchiveNames()) != 0 {
+		t.Errorf("AptArchives = %v, want none", cfg.AptArchives)
+	}
+	for _, codename := range cfg.MirroredAptCodenames() {
+		if got := cfg.AptArchiveOf(codename); got != "" {
+			t.Errorf("AptArchiveOf(%q) = %q, want the default archive", codename, got)
+		}
+	}
+	if got, want := strings.Join(cfg.AptPoolUpstreamsIn(""), ","), strings.Join(cfg.AptPoolUpstreams(), ","); got != want {
+		t.Errorf("AptPoolUpstreamsIn(\"\") = %q, want every configured root %q", got, want)
+	}
+}

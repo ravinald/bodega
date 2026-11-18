@@ -629,7 +629,7 @@ func TestAptPoolCacheHitWithNoRouteAndSeveralArchives(t *testing.T) {
 	}
 	// An empty route is what an expired one decays to: fresh, and naming no
 	// archive. aptPoolHitUpstream then has two candidates and no way to pick.
-	s.aptRoutes.put(fixtureDeb, "")
+	s.aptRoutes.put(manifest.AptKey(fixtureDeb), "")
 
 	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
 		t.Fatalf("second pool GET = %d body %q, want 200 and the archive's bytes", code, body)

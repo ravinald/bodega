@@ -857,6 +857,11 @@ func (s *Server) aptScopedAnywhere() bool {
 // pool/updates/<component>/..., matching the updates/main components its
 // Release declares, so that segment is dropped before segment four is read.
 func aptPoolSourceName(poolPath string) string {
+	// A path cut from a named archive's key or URL still opens with the
+	// archive, which says nothing about the source package.
+	if _, rel, ok := manifest.SplitAptKey(manifest.AptKey(poolPath)); ok {
+		poolPath = rel
+	}
 	parts := strings.Split(poolPath, "/")
 	if len(parts) == 6 && parts[1] == "updates" {
 		parts = append(parts[:1], parts[2:]...)
@@ -1012,7 +1017,7 @@ func (s *Server) aptAdmitCachedDeb(w http.ResponseWriter, r *http.Request, p *en
 		}
 	}
 
-	base, ok := s.aptResolvePoolUpstream(w, r, poolPath)
+	base, ok := s.aptResolvePoolUpstream(w, r, key)
 	if !ok {
 		return false
 	}

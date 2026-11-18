@@ -918,6 +918,10 @@ func TestAptPoolSourceName(t *testing.T) {
 		"pool/extra/main/o/openssl/libssl3_1_all.deb":     "",
 		"pool/main/n/nginx":                               "",
 		"nginx_1.0_amd64.deb":                             "",
+		// A named archive's path gives what the default path gives.
+		"ubuntu/" + profileNginxCommonDeb:                    "nginx",
+		"debian/" + debianSecuritySSLDevDeb:                  "openssl",
+		"debian/pool/extra/main/o/openssl/libssl3_1_all.deb": "",
 	}
 	for in, want := range cases {
 		if got := aptPoolSourceName(in); got != want {

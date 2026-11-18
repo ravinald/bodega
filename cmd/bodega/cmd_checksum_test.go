@@ -107,3 +107,151 @@ func TestChecksumClearReportsWhatItDeleted(t *testing.T) {
 		t.Errorf("a name nothing recorded reads the same as one already cleared:\n%s", out)
 	}
 }
+
+// archivePins stores one digest for apt/nginx in the default archive and one
+// in each of two named archives, at one pool path, and returns the three keys.
+func archivePins(t *testing.T, dbPath string) (def, ubuntu, debian string) {
+	t.Helper()
+	const rel = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb"
+	def, ubuntu, debian = manifest.AptKey(rel), manifest.AptArchiveKey("ubuntu", rel), manifest.AptArchiveKey("debian", rel)
+	db, err := audit.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	for key, digest := range map[string]string{def: "d0", ubuntu: "d1", debian: "d2"} {
+		typ, name, version := manifest.ParseKey(key)
+		if err := db.StoreChecksum(context.Background(), key, typ, name, version, "sha256", digest, "computed"); err != nil {
+			t.Fatalf("store checksum for %s: %v", key, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close audit db: %v", err)
+	}
+	return def, ubuntu, debian
+}
+
+// pinValues reads back the digest each key holds.
+func pinValues(t *testing.T, dbPath string) map[string]string {
+	t.Helper()
+	db, err := audit.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.ListChecksums(context.Background(), manifest.TypeApt, "nginx")
+	if err != nil {
+		t.Fatalf("list checksums: %v", err)
+	}
+	out := map[string]string{}
+	for _, cs := range rows {
+		out[cs.ObjectKey] = cs.Value
+	}
+	return out
+}
+
+// TestChecksumClearArchive: one pool path in two archives is two pins, and an
+// operator whose Debian archive republished must be able to drop that pin
+// without unpinning Ubuntu's build of the same filename.
+func TestChecksumClearArchive(t *testing.T) {
+	dbPath := checksumEnv(t)
+	def, ubuntu, debian := archivePins(t, dbPath)
+
+	out, err := runChecksum(t, "list", "--type", "apt", "--name", "nginx")
+	if err != nil {
+		t.Fatalf("checksum list: %v", err)
+	}
+	if !strings.Contains(out, "ARCHIVE") {
+		t.Errorf("list has no ARCHIVE column:\n%s", out)
+	}
+	for digest, archive := range map[string]string{"d0": "-", "d1": "ubuntu", "d2": "debian"} {
+		found := false
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(line)
+			if strings.Contains(line, " "+digest+" ") && len(f) > 0 && f[len(f)-1] == archive {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("list does not show digest %s under archive %q:\n%s", digest, archive, out)
+		}
+	}
+
+	out, err = runChecksum(t, "clear", "apt", "nginx", "--archive", "debian")
+	if err != nil {
+		t.Fatalf("clear --archive debian: %v", err)
+	}
+	if !strings.Contains(out, "Cleared 1 checksum(s) for apt/nginx in archive debian") {
+		t.Errorf("output does not name the archive and the count:\n%s", out)
+	}
+	if got := pinValues(t, dbPath); got[debian] != "" || got[ubuntu] != "d1" || got[def] != "d0" {
+		t.Errorf("after clear --archive debian the pins are %v, want only the debian one blank", got)
+	}
+
+	// Asked again, and asked of an archive that holds no pin: neither may
+	// read as a clear.
+	if out, err = runChecksum(t, "clear", "apt", "nginx", "--archive", "debian"); err != nil || !strings.Contains(out, "nothing was cleared") {
+		t.Errorf("second clear --archive debian = %v:\n%s\nwant it to say nothing was cleared", err, out)
+	}
+	_, err = runChecksum(t, "clear", "apt", "nginx", "--archive", "fedora")
+	if err == nil || !strings.Contains(err.Error(), `in archive "fedora"`) || !strings.Contains(err.Error(), "ubuntu") {
+		t.Errorf("clear --archive fedora = %v, want a refusal naming the archives that do hold one", err)
+	}
+	if _, err = runChecksum(t, "clear", "npm", "lodash", "--archive", "debian"); err == nil || !strings.Contains(err.Error(), "apt only") {
+		t.Errorf("clear npm --archive = %v, want a refusal: only apt has archives", err)
+	}
+	if got := pinValues(t, dbPath); got[ubuntu] != "d1" || got[def] != "d0" {
+		t.Errorf("the refused clears changed the pins: %v", got)
+	}
+}
+
+// TestChecksumClearEveryArchive: without --archive the package's pins go in
+// every archive, as they did before archives existed, and the output says how
+// many went from each.
+func TestChecksumClearEveryArchive(t *testing.T) {
+	dbPath := checksumEnv(t)
+	archivePins(t, dbPath)
+
+	out, err := runChecksum(t, "clear", "apt", "nginx")
+	if err != nil {
+		t.Fatalf("checksum clear apt nginx: %v", err)
+	}
+	for _, want := range []string{
+		"Cleared 3 checksum(s) for apt/nginx",
+		"default archive: 1",
+		"archive debian: 1",
+		"archive ubuntu: 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for key, value := range pinValues(t, dbPath) {
+		if value != "" {
+			t.Errorf("pin on %s = %q after a clear with no --archive, want blank", key, value)
+		}
+	}
+}
+
+func TestReviewF119ChecksumVersionCountsEveryArchive(t *testing.T) {
+	dbPath := checksumEnv(t)
+	archivePins(t, dbPath)
+
+	out, err := runChecksum(t, "clear", "apt", "nginx", "--version", "1.24.0-2ubuntu7.1")
+	if err != nil {
+		t.Fatalf("checksum clear --version: %v", err)
+	}
+	for _, want := range []string{
+		"default archive: 1",
+		"archive debian: 1",
+		"archive ubuntu: 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("version-scoped clear lacks %q:\n%s", want, out)
+		}
+	}
+	for key, value := range pinValues(t, dbPath) {
+		if value != "" {
+			t.Errorf("pin on %s = %q after clear, want blank", key, value)
+		}
+	}
+}

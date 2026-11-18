@@ -204,6 +204,9 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"apt_upstreams": map[string][]config.AptUpstream{
 			"mirrored-noble": {{URL: "https://archive.ubuntu.com/ubuntu"}},
 		},
+		// Load refuses an archive naming a codename apt_upstreams does not
+		// mirror, so this one names the codename above.
+		"apt_archives": map[string][]string{"ubuntu": {"mirrored-noble"}},
 		// Explicit rather than left to the numeric filler: Load refuses a
 		// per-artifact ceiling above the shared budget, so two values assigned
 		// by field position would pass or fail on the order of the struct.

@@ -465,7 +465,7 @@ With the hide in place:
 - A version with an epoch is hidden as `Packages` spells it (`2:9.1.0016-1ubuntu7`, what `apt-cache madison` prints), and the pool refusal still finds it: the pool filename omits the epoch (`vim_9.1.0016-1ubuntu7_amd64.deb`), so a pool request matches a hide on the version with its epoch removed, and the audit row names the version as hidden, epoch included. Two builds differing only in epoch share that pool filename, so hiding one refuses the file for both. A filename that spells its epoch (`%3a`) is matched with it.
 - `bodega pkg list apt` and `bodega pkg show apt <name>` list the hide with who set it and when. `--json` carries the same fields under `mirror_hidden`.
 
-**A hidden mirrored codename becomes bodega-signed.** A mirrored index is the archive's own signed document, so dropping a stanza from it means bodega rewrites `Packages`, generates the `Release`, and signs it with bodega's apt key. The rewrite covers the base and every pocket of it this server mirrors (`resolute`, `resolute-updates`, `resolute-security`), because a host reads them through one stanza and `Signed-By:` applies to all of it. The `Release` keeps the archive's `Origin`, `Label`, `Suite`, `Codename` and `Version`, so `apt update` does not stop on a changed origin and pin preferences on `o=Ubuntu` keep matching. What changes on the host:
+**A hidden mirrored codename becomes bodega-signed.** A mirrored index is the archive's own signed document, so dropping a stanza from it means bodega rewrites `Packages`, generates the `Release`, and signs it with bodega's apt key. The rewrite covers the base and every pocket of it this server mirrors (`resolute`, `resolute-updates`, `resolute-security`), because a host reads them through one stanza and `Signed-By:` applies to all of it. The `Release` keeps the archive's `Origin`, `Label`, `Suite`, `Codename`, `Version`, `NotAutomatic` and `ButAutomaticUpgrades`, so `apt update` does not stop on a changed origin or a changed default priority (a backports pocket stays at 100), and pin preferences on `o=Ubuntu` keep matching. What changes on the host:
 
 - The stanza for that codename names bodega's keyring (`Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg`) in place of the distro keyring. `bodega doctor --write-apt-sources` installs the new stanza and the keyring together. A host still carrying the old stanza fails `apt update` with a signature error on that codename until it is rewritten.
 - The rewritten `Release` lists `Packages` alone, so `Translation-*`, `Contents-*` and the `by-hash` tree are not served for that codename. A filtered codename has the same limit.
@@ -1279,11 +1279,26 @@ A path an override puts outside `build_root` is listed on its own under "Outside
 
 ### `bodega pkg checksum list [--type TYPE] [--name NAME]`
 
-Lists cached SHA-256 checksums stored in the audit database.
+Lists cached SHA-256 checksums stored in the audit database. The `ARCHIVE` column names the [`apt_archives`](#apt_archives) archive an apt checksum belongs to, and shows `-` for the default archive and for every other type. One apt package and version can hold a row per archive, because two distributions publish different bytes at one pool path.
 
-### `bodega pkg checksum clear <type> <name> [--version VER]`
+### `bodega pkg checksum clear <type> <name> [--version VER] [--archive NAME]`
 
 Clears cached checksums for a package. The next fetch recomputes and stores a fresh checksum. Use `--version` to clear only a specific version.
+
+`--archive NAME` clears the checksum that archive holds and leaves the same package's checksums in every other archive alone, which is the remedy when one distribution republished a `.deb` and the other did not. It applies to apt only. Without it the package's checksums go in every archive, and when a named archive held one the output counts them per archive:
+
+```console
+$ bodega pkg checksum clear apt nginx --archive debian
+apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.
+Cleared 1 checksum(s) for apt/nginx in archive debian; the next fetch recomputes them.
+$ bodega pkg checksum clear apt nginx
+apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.
+Cleared 2 checksum(s) for apt/nginx; the next fetch recomputes them.
+  default archive: 1
+  archive ubuntu: 1
+```
+
+An archive holding no checksum for the package is refused with the archives that do hold one, and nothing is cleared.
 
 **The digest goes; the row stays.** For apt that row is also the record that tells a `.deb` the mirror cached from one bodega built, and the cached artifact sits in `pool/` long after its digest is cleared. Deleting the row would drop the artifact out of the mirrored-pool exclusion set while it is still there to be matched by filename, and the next rebuild would publish upstream bytes with no `SHA256` under bodega's own archive key. So a clear blanks the value and leaves the row where the index can still read it; the command says so before it acts.
 
@@ -4262,6 +4277,8 @@ The copy happens once rather than the file being read as a fallback on every sta
 
 Each entry takes an optional `components` list, the components that archive publishes for the codename. They go on the `Components:` line of the sources stanza a client is handed, and each must match `^[a-z][a-z0-9-]*$`, since apt requests it as a path segment under `/apt/dists/<codename>/`. An entry without the list takes `main restricted universe multiverse`, which is Ubuntu's set, so a Debian upstream names its own. bodega reads no upstream `Release` file to learn them: a server that will not start until an upstream answers makes every client depend on a host it only proxies.
 
+`apt_archives` maps an archive name onto a list of mirrored codenames whose `pool/` is one namespace, served at `/apt/<archive>/` and stored under `packages/apt/<archive>/`. It is needed only when one server mirrors two distributions; see [`apt_archives`](#apt_archives) for the example and what the load refuses. An empty map is what an install without the key runs, and changes nothing.
+
 **A codename may not appear in both `apt_suites` and `apt_upstreams`, and the load fails naming it.** bodega signs an index it generated and forwards the signature of one it mirrors; one URL serves one `Packages` per component and architecture, so a shared codename would hand a client an `InRelease` whose digests do not describe the index it gets next. Mirror under the upstream's real codename and name the generated suite something local:
 
 ```json
@@ -6606,6 +6623,53 @@ Several upstreams for one codename contribute a union, in config order, each com
 
 Set it whenever the upstream is not Ubuntu, and check the printed line against the archive before pasting it. The two ways to be wrong are not symmetric. A component the upstream does not publish fails at `apt update`, loudly, naming the component and the URL that 404d. A component left off the line fails much later, at `apt-get install`, after `apt update` reported success, as a package apt cannot locate: `redis-server` is in `universe`, and a stanza naming only `main` installs everything up to the moment it does not.
 
+#### `apt_archives`
+
+One distribution needs nothing in this section. Two do, because a pool path is not one file across distributions: Ubuntu rebuilds the packages it syncs from Debian without changing the version or the filename, so `archive.ubuntu.com` and `deb.debian.org` publish different bytes at the same `pool/main/...` path. Under one URL root bodega could keep only one of the two builds, with one checksum, and every client got whichever archive answered first.
+
+`apt_archives` names groups of mirrored codenames whose `pool/` is one namespace:
+
+```json
+"apt_upstreams": {
+  "resolute":          [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "resolute-updates":  [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "resolute-security": [{"url": "https://security.ubuntu.com/ubuntu"}],
+  "trixie":            [{"url": "https://deb.debian.org/debian", "components": ["main", "contrib", "non-free", "non-free-firmware"]}],
+  "trixie-updates":    [{"url": "https://deb.debian.org/debian", "components": ["main", "contrib", "non-free", "non-free-firmware"]}],
+  "trixie-security":   [{"url": "https://security.debian.org/debian-security", "components": ["main", "contrib", "non-free", "non-free-firmware"]}]
+},
+"apt_archives": {
+  "ubuntu": ["resolute", "resolute-updates", "resolute-security"],
+  "debian": ["trixie", "trixie-updates", "trixie-security"]
+}
+```
+
+A named archive is served under a root of its own, `/apt/<archive>/dists/<codename>/` and `/apt/<archive>/pool/`, and that root is what a sources entry names:
+
+```text
+Types: deb
+URIs: https://bodega-host:8080/apt/debian/
+Suites: trixie trixie-updates trixie-security
+Components: main contrib non-free non-free-firmware
+```
+
+A pool request under `/apt/debian/pool/` asks only the upstreams of the `debian` codenames, the object is stored under `packages/apt/debian/`, and its checksum is held against that key. The same pool path under `/apt/ubuntu/pool/` is a second object with a second checksum.
+
+Generated suites and every mirrored codename in no archive stay at `/apt/dists/` and `/apt/pool/`, stored under `packages/apt/` as before. A server without the key behaves as it did before the key existed: no config change, no client change and no storage migration.
+
+A codename answers under its own archive's root and nowhere else. Moving one into an archive moves its URL, and a host still configured with the old one reads why in the `404`:
+
+```console
+$ curl https://bodega-host:8080/apt/dists/resolute/InRelease
+apt codename "resolute" is in archive "ubuntu": it is served at /apt/ubuntu/dists/resolute/
+$ curl https://bodega-host:8080/apt/fedora/dists/resolute/InRelease
+apt archive "fedora" is not declared in apt_archives (declared: debian, ubuntu)
+```
+
+Objects cached under `packages/apt/` before a codename moved into an archive stay there and are not served from the archive's root; the first request under the new root fetches from upstream again.
+
+Config load refuses, naming the key and the value: an archive name that does not match `^[a-zA-Z][a-zA-Z0-9_-]*$`; a name bodega already uses as a route or a storage directory (`pool`, `dists`, `keys`, `packages` and the other names `git_upstreams` and `binary_upstreams` refuse as a namespace); a codename `apt_upstreams` does not mirror; a codename listed in two archives; and a generated suite from `apt_suites`, which bodega signs and serves at `/apt/dists/` only.
+
 #### `[trusted=yes]` is not needed, and is wrong here
 
 The upstream `InRelease` is forwarded byte-for-byte, signature intact, and apt verifies it against the distro keyring already installed on the host (`ubuntu-keyring`, `debian-archive-keyring`). Neither `[trusted=yes]` nor `Signed-By:` belongs on a source line naming a mirrored distribution codename: the first discards a signature that is right there and valid, and the second points apt at bodega's key, which signed nothing in that tree. A vendor archive is the exception to the second half, because no stock keyring carries its key: its stanza names the vendor's own key, which bodega serves (see [Vendor archives](#vendor-archives)). The startup banner, the TUI, the web UI and `GET /api/v1/status` all render a mirrored codename with neither option, and say why beside the line.
@@ -6673,9 +6737,11 @@ With any apt rule present, an archive not on the list is never contacted: the ch
 
 A pool request carries no codename. apt chose which archive to trust when it read a `Packages` file during `apt update`, and that decision is not recoverable from `GET /apt/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` — the request looks identical whichever suite produced it.
 
-So bodega probes. Every configured archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the answer is remembered for an hour keyed on the pool path. A path no archive has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
+So bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the answer is remembered for an hour keyed on the object key. A path none of them has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
 
-The consequence to know: **if two configured archives publish different bytes at one pool path, bodega serves whichever answered the probe first.** Real Debian and Ubuntu archives do not do this — a pool path names one version of one package, and security and updates hosts share the namespace deliberately — but a private mirror rebuilt from source can. Do not point `apt_upstreams` at two archives that disagree.
+The request's archive is the URL root it arrived under. `GET /apt/debian/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` asks the upstreams of the codenames [`apt_archives`](#apt_archives) lists under `debian` and stores the object at `packages/apt/debian/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb`. `GET /apt/pool/...` asks the upstreams of the codenames in no archive and stores under `packages/apt/pool/...`.
+
+The consequence to know: **if two upstreams of one archive publish different bytes at one pool path, bodega serves whichever answered the probe first.** Inside one distribution that does not happen, since its security and updates hosts share the pool namespace deliberately. Across distributions it does: Ubuntu rebuilds packages it syncs from Debian under the same version and filename. Mirror two distributions as two archives in `apt_archives`, never as codenames sharing the default one.
 
 #### Versions in the discovery log lose the epoch
 
@@ -9461,6 +9527,8 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 | index     | `index.json`      | Fast startup without loading every manifest                                               |
 | graph     | `graph.json`      | Dependency graph with typed edges                                                         |
 | metrics   | `metrics.json`    | Dashboard metrics                                                                         |
+
+An apt key opening `packages/apt/pool/` or `packages/apt/dists/` is the default archive: every `.deb` bodega built, and what it cached for a mirrored codename in no archive. Any other first segment is an archive named in [`apt_archives`](#apt_archives), holding that archive's own `pool/` and `dists/`, served at `/apt/<archive>/`: `packages/apt/debian/pool/main/h/hello/hello_2.10-4_amd64.deb` is the `debian` archive's build of that path.
 
 Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 

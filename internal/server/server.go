@@ -1054,6 +1054,11 @@ func (s *Server) registerRoutes() {
 	// a client needs no gpg binary to consume it.
 	m.HandleFunc("GET /apt/dists/{distpath...}", s.handleAptDists)
 	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptPool)
+	// A named archive's dists/ and pool/. One pattern for both, because
+	// "/apt/{archive}/dists/{distpath...}" overlaps "/apt/dists/{distpath...}"
+	// on /apt/dists/dists/x with neither the more specific, and ServeMux
+	// refuses to register that pair.
+	m.HandleFunc("GET /apt/{archive}/{rest...}", s.handleAptArchive)
 	m.HandleFunc("GET /apt/bodega-archive-keyring.gpg", s.handleAptKeyring)
 	m.HandleFunc("GET /apt/bodega-archive-keyring.asc", s.handleAptPublicKey)
 	m.HandleFunc("GET /apt/keys/{file}", s.handleAptVendorKey)
