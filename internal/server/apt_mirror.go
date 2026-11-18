@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"slices"
@@ -210,22 +211,17 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 		f.write(w, r)
 		return
 	}
-	if want != nil {
-		s.aptDropDisagreeingPin(r.Context(), store, key, want)
-	}
 
-	// A cached .deb needs no archive resolved for it, which is the common case
-	// once a fleet is warm: the probe is per pool path and the cache read is
-	// not. The exception is a host whose profile refuses a vendor archive,
-	// where the archive the object came from is the whole question and
-	// aptAdmitCachedDeb answers it.
-	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
-		// The audit row is unconditional. This shortcut is the only path a
-		// cached .deb is served by, and it used to write through
-		// recordAptPoolHit, whose first line returns on discovery being off —
-		// so on a default install every mirrored .deb after the first was
-		// served with nothing in the trail saying the cache answered it.
+	// The audit row is unconditional. This is the only path a cached .deb is
+	// served by, and it used to write through recordAptPoolHit, whose first
+	// line returns on discovery being off — so on a default install every
+	// mirrored .deb after the first was served with nothing in the trail
+	// saying the cache answered it.
+	serveHit := func(admit func() bool) {
 		s.serveCacheHitIf(w, r, store, key, true, func(obj cachedObject) bool {
+			if admit != nil && !admit() {
+				return false
+			}
 			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
 				return false
 			}
@@ -234,14 +230,23 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
 			s.recordAptPoolHit(r, poolPath, key, obj)
 		})
+	}
+
+	if want != nil {
+		s.serveAptPoolListed(w, r, store, key, poolPath, name, *want, serveHit, refuse)
 		return
 	}
 
-	candidates := s.cfg.AptPoolUpstreamsIn(archive)
-	if want != nil {
-		candidates = s.aptCodenameRoots(want.codename)
+	// A cached .deb needs no archive resolved for it, which is the common case
+	// once a fleet is warm: the probe is per pool path and the cache read is
+	// not. The exception is a host whose profile refuses a vendor archive,
+	// where the archive the object came from is the whole question and
+	// aptAdmitCachedDeb answers it.
+	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
+		serveHit(nil)
+		return
 	}
-	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, candidates)
+	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, s.cfg.AptPoolUpstreamsIn(archive))
 	if !ok {
 		return
 	}
@@ -252,15 +257,161 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 	if refuse(base) {
 		return
 	}
-
 	// The resolver answers with the archive root, which is what the route
 	// cache keys on: the pool path is already in hand and re-deriving it from
 	// a stored full URL would be a second parse of the same string.
-	if want == nil {
-		s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
+	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
+}
+
+// serveAptPoolListed serves a pool object a Packages paragraph names, and
+// only ever the build that paragraph lists.
+//
+// A cached copy is served without the fill lock while its pin is the
+// paragraph's SHA256, read after the object is opened so the verdict covers
+// the handle supplying the bytes. Anything else (no copy, no pin, another
+// pin) is settled under the lock every fill of this key takes, so a request
+// that waited behind a fill judges what that fill left against its own
+// paragraph rather than serving it, and a repair never races a fill.
+func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza, serveHit func(admit func() bool), refuse func(base string) bool) {
+	if s.aptCached(r.Context(), store, key, true) != nil {
+		unpinned := false
+		serveHit(func() bool {
+			if s.aptPinned(r.Context(), key) == want.sha256 {
+				return true
+			}
+			unpinned = true
+			return false
+		})
+		if !unpinned {
+			return
+		}
+	}
+
+	release := s.aptMirror.lock(key)
+	defer release()
+	cached, f := s.aptSettleListedCache(r.Context(), store, key, poolPath, name, want)
+	if f != nil {
+		f.write(w, r)
 		return
 	}
-	s.serveAptMirrorIndexed(w, r, store, key, base, poolPath, name, *want)
+	if cached {
+		serveHit(nil)
+		return
+	}
+	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, s.aptCodenameRoots(want.codename))
+	if !ok {
+		return
+	}
+	if base == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if refuse(base) {
+		return
+	}
+	s.serveAptMirrorIndexed(w, r, store, key, base, poolPath, name, want)
+}
+
+// aptPinned is the SHA256 pinned for key, or "" when none is pinned or the
+// pin cannot be read; either sends the caller to aptSettleListedCache, which
+// reads it again and refuses on an error.
+func (s *Server) aptPinned(ctx context.Context, key string) string {
+	if s.auditDB == nil {
+		return ""
+	}
+	pin, err := s.auditDB.GetChecksum(ctx, key)
+	if err != nil || pin == nil {
+		return ""
+	}
+	return pin.Value
+}
+
+// aptSettleListedCache brings a listed pool object's cache entry into line
+// with the paragraph naming it, under the key's fill lock. It reports true
+// when the cached copy is the paragraph's build and pinned as such, and false
+// when there is no copy and no disagreeing pin, so a fetch may run.
+//
+// A copy with no pin is hashed rather than trusted: a blank pin is what an
+// operator's checksum clear leaves, and it says nothing about the bytes. A
+// copy that disagrees is deleted before its pin is cleared, and a failed
+// delete refuses the request and keeps the pin, because the pin is what makes
+// the next request try the repair again.
+func (s *Server) aptSettleListedCache(ctx context.Context, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza) (bool, *refusal) {
+	if s.auditDB == nil || store == nil {
+		return s.aptCached(ctx, store, key, true) != nil, nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	_, version := manifest.AptDebIdentity(path.Base(poolPath))
+	fail := func(what string, err error) *refusal {
+		f := newRefusal(checkChecksum, manifest.TypeApt, name, version, http.StatusBadGateway)
+		f.reason = fmt.Sprintf("bodega could not %s for %s, whose Packages paragraph in %s lists sha256 %s, so it serves nothing for it: %v.",
+			what, poolPath, want.codename, want.sha256, err)
+		f.next = fmt.Sprintf("retry; if it persists, give an operator incident %s, whose ERROR line in the server log names the step that failed.", f.incident)
+		s.logger.Error("bodega could not repair a cached .deb its Packages paragraph disagrees with, so it refused the request",
+			"key", key, "step", what, "listed", want.sha256, "error", err, "incident", f.incident)
+		return f
+	}
+	pin, err := s.auditDB.GetChecksum(ctx, key)
+	if err != nil {
+		return false, fail("read the pinned checksum", err)
+	}
+	pinned := ""
+	if pin != nil {
+		pinned = pin.Value
+	}
+	info, err := store.Head(ctx, key)
+	if err != nil {
+		return false, fail("read the cached object", err)
+	}
+	if info != nil && info.Exists {
+		if pinned == want.sha256 {
+			return true, nil
+		}
+		stored := pinned
+		if pinned == "" {
+			sum, size, err := aptStoredDigest(ctx, store, key)
+			if err != nil {
+				return false, fail("hash the unpinned cached object", err)
+			}
+			if sum == want.sha256 && (want.size < 0 || size == want.size) {
+				pkgType, pkgName, pkgVersion := manifest.ParseKey(key)
+				if err := s.auditDB.StoreChecksum(ctx, key, pkgType, pkgName, pkgVersion, "sha256", sum, "computed"); err != nil {
+					return false, fail("pin the unpinned cached object", err)
+				}
+				return true, nil
+			}
+			stored = sum
+		}
+		s.logger.Warn("a cached .deb is not the build the Packages paragraph naming its path lists, so bodega drops the object and its pin and fetches it again",
+			"key", key, "cached", stored, "pinned", pinned, "listed", want.sha256, "codename", want.codename)
+		if err := store.Delete(ctx, key); err != nil {
+			return false, fail("remove the cached build the paragraph disagrees with", err)
+		}
+	}
+	if pinned != "" && pinned != want.sha256 {
+		if err := s.auditDB.ClearChecksum(ctx, key); err != nil {
+			return false, fail("clear the pin the paragraph disagrees with", err)
+		}
+	}
+	return false, nil
+}
+
+// aptStoredDigest is the SHA256 and size of the object stored at key.
+func aptStoredDigest(ctx context.Context, store storage.ObjectStore, key string) (string, int64, error) {
+	res, err := store.GetStream(ctx, key)
+	if err != nil {
+		return "", 0, err
+	}
+	if res == nil {
+		return "", 0, fmt.Errorf("%s vanished while being read", key)
+	}
+	defer func() { _ = res.Body.Close() }()
+	h := sha256.New()
+	n, err := io.Copy(h, res.Body)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
 // aptCodenameRoots is the roots one mirrored codename is configured with, in
@@ -275,40 +426,11 @@ func (s *Server) aptCodenameRoots(codename string) []string {
 	return out
 }
 
-// aptDropDisagreeingPin removes a cached .deb and its pin when the pin is not
-// the SHA256 the paragraph naming its path lists. Both were taken on first
-// fetch, before the index was consulted, so they hold whatever build the
-// probe reached first; left in place, the pin refuses every honest fetch
-// after it with a 502 nobody but an operator can clear.
-func (s *Server) aptDropDisagreeingPin(ctx context.Context, store storage.ObjectStore, key string, want *aptPoolStanza) {
-	if s.auditDB == nil {
-		return
-	}
-	pin, err := s.auditDB.GetChecksum(ctx, key)
-	if err != nil || pin == nil || pin.Value == "" || pin.Value == want.sha256 {
-		return
-	}
-	ctx = context.WithoutCancel(ctx)
-	s.logger.Warn("a cached .deb's pin disagrees with the Packages paragraph that names its path, so bodega drops the object and the pin and fetches it again",
-		"key", key, "pinned", pin.Value, "listed", want.sha256, "codename", want.codename)
-	if store != nil {
-		if err := store.Delete(ctx, key); err != nil {
-			s.logger.Warn("could not remove the cached .deb whose pin disagrees with its paragraph", "key", key, "error", err)
-		}
-	}
-	if err := s.auditDB.ClearChecksum(ctx, key); err != nil {
-		s.logger.Warn("could not clear the pin that disagrees with its paragraph", "key", key, "error", err)
-	}
-}
-
 // serveAptMirrorIndexed is serveAptMirror for a .deb a Packages paragraph
 // names: the fetched bytes are held to the paragraph's size and SHA256 before
-// anything is pinned, cached or served.
+// anything is pinned, cached or served. The caller holds the key's fill lock
+// and has settled the cache, so the proxy finds no copy to serve.
 func (s *Server) serveAptMirrorIndexed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, root, poolPath, name string, want aptPoolStanza) {
-	if s.aptCached(r.Context(), store, key, true) == nil {
-		release := s.aptMirror.lock(key)
-		defer release()
-	}
 	upstream := root + "/" + poolPath
 	resolve := func(context.Context) (resolvedUpstream, error) {
 		return resolvedUpstream{url: upstream, check: func(ctx context.Context, sum string, size int64) *refusal {
@@ -484,7 +606,7 @@ func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Resu
 
 // aptPoolIndexRetry is how soon a pool index that could not read every
 // mirrored codename is rebuilt. Short, because each path the failure hides is
-// served unchecked until then; not zero, because the build refetches every
+// judged by an older read, or by none, until then; not zero, because the build refetches every
 // Packages behind it and apt fetches .debs in bursts.
 const aptPoolIndexRetry = time.Minute
 
@@ -515,13 +637,54 @@ type aptPoolConflict struct {
 // Keyed by object key rather than pool path because two archives publish
 // different builds at one path (issue #336), and each archive's paragraph is
 // the authority for its own.
+//
+// shadow holds the paragraphs of later codenames at a key byKey already
+// holds, and archives the archive each codename was indexed under, so a
+// rebuild that cannot read a codename carries forward every paragraph it last
+// read for it rather than only those that came first.
 type aptPoolIndex struct {
 	ident     string
 	byKey     map[string]aptPoolStanza
+	shadow    map[string][]aptPoolStanza
 	conflicts map[string]aptPoolConflict
+	archives  map[string]string
 	failed    []string
 	at        time.Time
 	ttl       time.Duration
+}
+
+// add records one codename's paragraph for key. A path two codenames of one
+// archive both publish keeps the first in byKey: the pool is one namespace, so
+// agreeing paragraphs describe one file, and disagreeing ones are recorded as
+// a conflict.
+func (idx *aptPoolIndex) add(key string, st aptPoolStanza) {
+	prev, seen := idx.byKey[key]
+	if !seen {
+		idx.byKey[key] = st
+		return
+	}
+	if prev.codename == st.codename || slices.ContainsFunc(idx.shadow[key], func(o aptPoolStanza) bool { return o.codename == st.codename }) {
+		return
+	}
+	idx.shadow[key] = append(idx.shadow[key], st)
+	if _, already := idx.conflicts[key]; !already && prev.sha256 != "" && st.sha256 != "" && prev.sha256 != st.sha256 {
+		idx.conflicts[key] = aptPoolConflict{codenames: [2]string{prev.codename, st.codename}, digests: [2]string{prev.sha256, st.sha256}}
+	}
+}
+
+// carry adds every paragraph prev read for codename, when prev indexed it
+// under the archive it belongs to now.
+func (idx *aptPoolIndex) carry(prev *aptPoolIndex, codename string) {
+	if prev == nil || prev.archives[codename] != idx.archives[codename] {
+		return
+	}
+	for k, first := range prev.byKey {
+		for _, st := range append([]aptPoolStanza{first}, prev.shadow[k]...) {
+			if st.codename == codename {
+				idx.add(k, st)
+			}
+		}
+	}
 }
 
 // aptPoolIndexCache holds the one pool index. Its builder runs under the lock
@@ -553,7 +716,7 @@ func (s *Server) aptPoolIndexNow(ctx context.Context) *aptPoolIndex {
 	if idx == nil || idx.ident != ident || time.Since(idx.at) >= idx.ttl {
 		// Detached from the request: a client hanging up mid-build would
 		// otherwise leave a failed index every other fetch is answered from.
-		idx = s.buildAptPoolIndex(context.WithoutCancel(ctx), codenames)
+		idx = s.buildAptPoolIndexFrom(context.WithoutCancel(ctx), codenames, idx)
 		s.aptPoolIdx.idx = idx
 	}
 	return idx
@@ -609,20 +772,31 @@ func (s *Server) aptPoolParagraph(ctx context.Context, key string) (*aptPoolStan
 // cached fetch the filtered codenames use, so it shares their metadata_ttl and
 // their allow-list check.
 func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *aptPoolIndex {
+	return s.buildAptPoolIndexFrom(ctx, codenames, nil)
+}
+
+// buildAptPoolIndexFrom is buildAptPoolIndex with the index it replaces. A
+// codename this build cannot read keeps the paragraphs prev read for it: a
+// failed read does not make a path unnamed, and treating it as unnamed would
+// pin whatever build the probe reached first.
+func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, prev *aptPoolIndex) *aptPoolIndex {
 	idx := &aptPoolIndex{ident: s.aptPoolIndexIdent(codenames), byKey: map[string]aptPoolStanza{},
-		conflicts: map[string]aptPoolConflict{}, at: time.Now(), ttl: s.cache.MetadataTTL}
+		shadow: map[string][]aptPoolStanza{}, conflicts: map[string]aptPoolConflict{}, archives: map[string]string{},
+		at: time.Now(), ttl: s.cache.MetadataTTL}
 	if idx.ttl <= 0 {
 		idx.ttl = aptRouteTTL
 	}
 	reads := map[string]aptIndexRead{}
 	for _, c := range codenames {
+		idx.archives[c] = s.cfg.AptArchiveOf(c)
 		if err := s.indexAptPool(ctx, c, idx, reads); err != nil {
 			idx.failed = append(idx.failed, err.Error())
+			idx.carry(prev, c)
 		}
 	}
 	if len(idx.failed) > 0 {
 		idx.ttl = min(idx.ttl, aptPoolIndexRetry)
-		s.logger.Warn("bodega could not read every mirrored apt index, so the .debs only those indexes name are served unchecked by the OSV gate and pinned on first fetch until it reads them",
+		s.logger.Warn("bodega could not read every mirrored apt index, so the .debs those indexes name are judged by the last read of them that succeeded, or probed and pinned on first fetch where none has, until it reads them",
 			"failed", strings.Join(idx.failed, "; "), "retry", idx.ttl)
 	}
 	s.logAptPoolConflicts(idx)
@@ -658,10 +832,7 @@ func aptArchiveLabel(archive string) string {
 	return "archive " + archive
 }
 
-// indexAptPool adds one codename's paragraphs to idx. A path two codenames of
-// one archive both publish keeps the first: the pool is one namespace, so
-// agreeing paragraphs describe one file, and disagreeing ones are recorded as
-// a conflict. A parse break keeps what came before it, since each entry is a
+// indexAptPool adds one codename's paragraphs to idx. A parse break keeps what came before it, since each entry is a
 // paragraph that did parse and a path missing past the break goes unchecked
 // rather than misjudged.
 func (s *Server) indexAptPool(ctx context.Context, codename string, idx *aptPoolIndex, reads map[string]aptIndexRead) error {
@@ -688,22 +859,12 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx *aptPool
 				if filename == "" {
 					return nil
 				}
-				key := manifest.AptArchiveKey(archive, filename)
-				sum := strings.ToLower(strings.TrimSpace(fields["SHA256"]))
-				prev, seen := idx.byKey[key]
-				if !seen {
-					size, perr := strconv.ParseInt(strings.TrimSpace(fields["Size"]), 10, 64)
-					if perr != nil {
-						size = -1
-					}
-					idx.byKey[key] = aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields),
-						sha256: sum, size: size, codename: codename}
-					return nil
+				size, perr := strconv.ParseInt(strings.TrimSpace(fields["Size"]), 10, 64)
+				if perr != nil {
+					size = -1
 				}
-				if _, already := idx.conflicts[key]; !already && prev.codename != codename &&
-					prev.sha256 != "" && sum != "" && prev.sha256 != sum {
-					idx.conflicts[key] = aptPoolConflict{codenames: [2]string{prev.codename, codename}, digests: [2]string{prev.sha256, sum}}
-				}
+				idx.add(manifest.AptArchiveKey(archive, filename), aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields),
+					sha256: strings.ToLower(strings.TrimSpace(fields["SHA256"])), size: size, codename: codename})
 				return nil
 			})
 			if err != nil {

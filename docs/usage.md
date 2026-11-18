@@ -6741,11 +6741,22 @@ So bodega reads the archive's own indexes first. It keeps an index of every `Pac
 
 1. **Two codenames disagree.** When paragraphs of two codenames in the request's archive list the path with different `SHA256` values, the request is refused with `502` before any upstream is asked. The default archive counts as an archive here. Each index build that finds such paths logs one `ERROR` line per pair of codenames, with how many paths they disagree on.
 2. **A paragraph names the path.** bodega fetches it from the upstream roots of that paragraph's codename, in the order `apt_upstreams` lists them, and no other. The bytes are cached, pinned and served only when their size and `SHA256` equal the paragraph's. A mismatch is refused with `502`, recorded as a `checksum_mismatch` audit row under the incident the body names, and nothing is stored or pinned, so the next request asks upstream again.
-3. **No paragraph names the path.** bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the bytes are pinned on first fetch. A path whose codename's index bodega could not read lands here too, until a rebuild reads it.
+3. **No paragraph names the path.** bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the bytes are pinned on first fetch.
+
+A rebuild that cannot read a codename's `Release` or `Packages` keeps every paragraph the last successful read of that codename found, logs a `WARN` naming what it could not read, and retries within a minute. A path that read named is still judged by it, so an archive outage never turns a known mismatch into a first-fetch pin. Only a codename bodega has not read once since it started lands its paths in the probe.
 
 Either way the root that answered is remembered for an hour, keyed on the object key. A path none of them has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
 
-A cached `.deb` is held to the same index. When its pin disagrees with the paragraph naming its path, bodega removes the object and the pin, logs a `WARN` naming both digests, and fetches it again under the rules above. A server that cached the wrong distribution's build before it read the index corrects itself on the next request for each path, with no `bodega pkg checksum clear` needed.
+A cached `.deb` is held to the same index. It is served only while its pin is the `SHA256` of the paragraph naming its path. A copy with no pin, which is what `bodega pkg checksum clear` leaves, is hashed and pinned when it matches. Any other copy is removed with its pin, a `WARN` names both digests, and the path is fetched again under the rules above. A request that waited behind another request's fetch of the same path checks what that fetch stored against its own paragraph before serving it. A server that cached the wrong distribution's build before it read the index corrects itself on the next request for each path, with no `bodega pkg checksum clear` needed.
+
+When bodega cannot finish that repair (the object store refuses the delete, or the audit database cannot be read), it serves nothing for the path and keeps the pin, so the next request tries the repair again:
+
+```text
+bodega refused apt/pkgconf@2.5.1-4 (checksum, incident 3f2a9c1e7b04): bodega could not remove the cached build the paragraph disagrees with for pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb, whose Packages paragraph in resolute lists sha256 dd63b86146a24e96a9a76e6ccf29f10805309cb39db91ef12dce3128ad3afe39, so it serves nothing for it: object store delete unavailable.
+Next step: retry; if it persists, give an operator incident 3f2a9c1e7b04, whose ERROR line in the server log names the step that failed.
+```
+
+The server log carries the same incident on an `ERROR` line naming the step that failed. Fix the store or database it names; the next request finishes the repair.
 
 A paragraph that does not match what its upstream serves answers:
 
