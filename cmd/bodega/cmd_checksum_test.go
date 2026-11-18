@@ -231,3 +231,27 @@ func TestChecksumClearEveryArchive(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewF119ChecksumVersionCountsEveryArchive(t *testing.T) {
+	dbPath := checksumEnv(t)
+	archivePins(t, dbPath)
+
+	out, err := runChecksum(t, "clear", "apt", "nginx", "--version", "1.24.0-2ubuntu7.1")
+	if err != nil {
+		t.Fatalf("checksum clear --version: %v", err)
+	}
+	for _, want := range []string{
+		"default archive: 1",
+		"archive debian: 1",
+		"archive ubuntu: 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("version-scoped clear lacks %q:\n%s", want, out)
+		}
+	}
+	for key, value := range pinValues(t, dbPath) {
+		if value != "" {
+			t.Errorf("pin on %s = %q after clear, want blank", key, value)
+		}
+	}
+}

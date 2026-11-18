@@ -145,31 +145,19 @@ output counts them per archive.`,
 			}
 
 			if version != "" {
-				// Clear specific version — need to find the S3 key.
-				checksums, err := db.ListChecksums(ctx, pkgType, pkgName)
-				if err != nil {
-					return err
-				}
-				found := false
-				for _, cs := range checksums {
-					if cs.PkgVersion == version {
-						if err := db.ClearChecksum(ctx, cs.ObjectKey); err != nil {
-							return err
-						}
-						fmt.Fprintf(cmd.OutOrStdout(), "Cleared checksum for %s/%s@%s%s; the next fetch recomputes it.\n", pkgType, pkgName, version, inArchive(cs.ObjectKey))
-						found = true
-					}
-				}
-				if !found {
-					return fmt.Errorf("no checksum found for %s/%s@%s: nothing was cleared, and the 502 you are chasing is not a stale digest for this version; run `bodega pkg checksum list --type %s --name %s` for the versions that do have one",
-						pkgType, pkgName, version, pkgType, pkgName)
-				}
+				return clearVersionChecksums(ctx, cmd, db, pkgType, pkgName, version)
 			} else {
 				// Clear all versions. The per-archive count is read first,
 				// off the rows the clear is about to blank.
-				perArchive, err := pinnedPerArchive(ctx, db, pkgType, pkgName)
+				rows, err := db.ListChecksums(ctx, pkgType, pkgName)
 				if err != nil {
 					return err
+				}
+				perArchive := map[string]int{}
+				for _, cs := range rows {
+					if cs.Value != "" {
+						perArchive[checksumArchive(cs.ObjectKey)]++
+					}
 				}
 				cleared, matched, err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName)
 				if err != nil {
@@ -182,12 +170,10 @@ output counts them per archive.`,
 					fmt.Fprintf(cmd.OutOrStdout(), "%d row(s) for %s/%s already carry no digest; nothing was cleared. A 502 that survives this is not a stale checksum.\n", matched, pkgType, pkgName)
 				default:
 					fmt.Fprintf(cmd.OutOrStdout(), "Cleared %d checksum(s) for %s/%s; the next fetch recomputes them.\n", cleared, pkgType, pkgName)
-					fmt.Fprint(cmd.OutOrStdout(), perArchive)
+					fmt.Fprint(cmd.OutOrStdout(), renderPerArchive(pkgType, perArchive))
 				}
 				return nil
 			}
-
-			return nil
 		},
 	}
 
@@ -205,36 +191,19 @@ func checksumArchive(objectKey string) string {
 	return "-"
 }
 
-func inArchive(objectKey string) string {
-	if archive := checksumArchive(objectKey); archive != "-" {
-		return " in archive " + archive
-	}
-	return ""
-}
-
-// pinnedPerArchive renders how many digests a package holds in each archive,
-// one line per archive, and nothing unless a named archive holds one: a
+// renderPerArchive renders how many digests a clear blanked in each archive,
+// one line per archive, and nothing unless a named archive is among them: a
 // server with no apt_archives has one archive and the total already says it.
-func pinnedPerArchive(ctx context.Context, db *audit.DB, pkgType, pkgName string) (string, error) {
+func renderPerArchive(pkgType string, counts map[string]int) string {
 	if pkgType != manifest.TypeApt {
-		return "", nil
+		return ""
 	}
-	rows, err := db.ListChecksums(ctx, pkgType, pkgName)
-	if err != nil {
-		return "", err
-	}
-	counts := map[string]int{}
 	named := false
-	for _, cs := range rows {
-		if cs.Value == "" {
-			continue
-		}
-		archive := checksumArchive(cs.ObjectKey)
-		counts[archive]++
+	for archive := range counts {
 		named = named || archive != "-"
 	}
 	if !named {
-		return "", nil
+		return ""
 	}
 	names := make([]string, 0, len(counts))
 	for name := range counts {
@@ -249,7 +218,46 @@ func pinnedPerArchive(ctx context.Context, db *audit.DB, pkgType, pkgName string
 		}
 		fmt.Fprintf(&b, "  %s: %d\n", label, counts[name])
 	}
-	return b.String(), nil
+	return b.String()
+}
+
+// clearVersionChecksums blanks one version's digests in every archive and
+// reports them per archive, the way a clear of every version does. A row
+// that already carries no digest is matched but not counted as cleared.
+func clearVersionChecksums(ctx context.Context, cmd *cobra.Command, db *audit.DB, pkgType, pkgName, version string) error {
+	rows, err := db.ListChecksums(ctx, pkgType, pkgName)
+	if err != nil {
+		return err
+	}
+	what := pkgType + "/" + pkgName + "@" + version
+	perArchive := map[string]int{}
+	var cleared, matched int
+	for _, cs := range rows {
+		if cs.PkgVersion != version {
+			continue
+		}
+		matched++
+		if cs.Value == "" {
+			continue
+		}
+		if err := db.ClearChecksum(ctx, cs.ObjectKey); err != nil {
+			return fmt.Errorf("clear checksum for %s: %w; %d digest(s) cleared before it stay cleared", cs.ObjectKey, err, cleared)
+		}
+		perArchive[checksumArchive(cs.ObjectKey)]++
+		cleared++
+	}
+	out := cmd.OutOrStdout()
+	switch {
+	case matched == 0:
+		return fmt.Errorf("no checksum found for %s: nothing was cleared, and the 502 you are chasing is not a stale digest for this version; run `bodega pkg checksum list --type %s --name %s` for the versions that do have one",
+			what, pkgType, pkgName)
+	case cleared == 0:
+		fmt.Fprintf(out, "%d row(s) for %s already carry no digest; nothing was cleared. A 502 that survives this is not a stale checksum.\n", matched, what)
+	default:
+		fmt.Fprintf(out, "Cleared %d checksum(s) for %s; the next fetch recomputes them.\n", cleared, what)
+		fmt.Fprint(out, renderPerArchive(pkgType, perArchive))
+	}
+	return nil
 }
 
 // clearArchiveChecksums blanks the digests one named archive holds for a
