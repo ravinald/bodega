@@ -404,3 +404,55 @@ func TestComposerNormalizeVersionFollowsVersionParser(t *testing.T) {
 		}
 	}
 }
+
+// TestAptArchiveKeysReadLikeTheirDefaultForm pairs each default apt key with
+// its named-archive form. The archive changes where the object lives and
+// nothing about what it is, so every reader has to give the pair one identity:
+// a pin, a discovery row and an attestation keyed by a named archive would
+// otherwise carry an empty name.
+func TestAptArchiveKeysReadLikeTheirDefaultForm(t *testing.T) {
+	for _, rel := range []string{
+		"pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb",
+		"pool/main/o/openssl/libssl3t64_3.5.0-1_arm64.deb",
+		"pool/updates/main/c/curl/curl_8.14.1-2+deb13u1_amd64.deb",
+		"pool/main/b/bash/not-a-deb.txt",
+		"dists/trixie/InRelease",
+		"dists/trixie/main/binary-amd64/Packages.xz",
+	} {
+		def, named := AptKey(rel), AptArchiveKey("debian", rel)
+		if want := "packages/apt/debian/" + rel; named != want {
+			t.Errorf("AptArchiveKey(debian, %q) = %q, want %q", rel, named, want)
+		}
+		if got := AptArchiveKey("", rel); got != def {
+			t.Errorf("AptArchiveKey(\"\", %q) = %q, want the default key %q byte for byte", rel, got, def)
+		}
+
+		dt, dn, dv := ParseKey(def)
+		nt, nn, nv := ParseKey(named)
+		if dt != nt || dn != nn || dv != nv {
+			t.Errorf("ParseKey(%q) = (%q, %q, %q), want what the default key gives: (%q, %q, %q)", named, nt, nn, nv, dt, dn, dv)
+		}
+
+		for key, wantArchive := range map[string]string{def: "", named: "debian"} {
+			archive, gotRel, ok := SplitAptKey(key)
+			if !ok || archive != wantArchive || gotRel != rel {
+				t.Errorf("SplitAptKey(%q) = (%q, %q, %v), want (%q, %q, true)", key, archive, gotRel, ok, wantArchive, rel)
+			}
+		}
+
+		// The ArtifactKeys case composes the key from the entry's recorded
+		// path, so a path recorded under an archive resolves to that
+		// archive's object and one recorded without resolves to the default.
+		pm := &PackageManifest{Type: TypeApt, Name: "nginx"}
+		for path, want := range map[string]string{rel: def, "debian/" + rel: named} {
+			keys, err := ArtifactKeys(pm, VersionEntry{Metadata: map[string]string{"_pool_path": path}})
+			if err != nil || len(keys) != 1 || keys[0] != want {
+				t.Errorf("ArtifactKeys(_pool_path=%q) = %v, %v, want [%q]", path, keys, err, want)
+			}
+		}
+	}
+
+	if _, _, ok := SplitAptKey("pypi/wheels/x.whl"); ok {
+		t.Error("SplitAptKey accepted a key outside the apt tree")
+	}
+}

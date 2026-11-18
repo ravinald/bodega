@@ -763,3 +763,18 @@ func TestGomodBackfillComparesBytesUnderARowAlreadyNamingThem(t *testing.T) {
 		})
 	}
 }
+
+// TestServedPathAptArchive: a named archive's key maps to the route under that
+// archive's root, where the default key maps under /apt/.
+func TestServedPathAptArchive(t *testing.T) {
+	const rel = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb"
+	for key, want := range map[string]string{
+		manifest.AptKey(rel):                  "/apt/" + rel,
+		manifest.AptArchiveKey("debian", rel): "/apt/debian/" + rel,
+	} {
+		got, err := servedPath(manifest.TypeApt, "nginx", "1.24.0-2ubuntu7.1", key)
+		if err != nil || got != want {
+			t.Errorf("servedPath(%q) = %q, %v; want %q", key, got, err, want)
+		}
+	}
+}

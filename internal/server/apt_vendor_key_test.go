@@ -424,7 +424,7 @@ func TestScopedProfileVendorRefusalSurvivesAnArchiveThatDoesNotAnswer(t *testing
 		}
 	}
 
-	s.aptRoutes.put(vendorGrafanaDeb, "")
+	s.aptRoutes.put(manifest.AptKey(vendorGrafanaDeb), "")
 	code, body := clientGet(t, s, scoped.token, grafana)
 	assertArchiveRefusal(t, "scoped "+grafana+" behind a negative route", code, body)
 

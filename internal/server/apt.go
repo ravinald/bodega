@@ -36,7 +36,39 @@ import (
 // never fetched — see that function for what caching over one would do to the
 // SHA256 the entry already published.
 func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
-	p := r.PathValue("path")
+	s.serveAptPool(w, r, "", r.PathValue("path"))
+}
+
+// handleAptArchive routes /apt/{archive}/dists/... and /apt/{archive}/pool/...
+// for an archive apt_archives declares.
+//
+// An undeclared name is answered with the declared ones rather than a bare
+// 404: the request is a sources entry with a typo in it, or one written for a
+// config that has since changed, and apt prints the body's first line.
+func (s *Server) handleAptArchive(w http.ResponseWriter, r *http.Request) {
+	archive := r.PathValue("archive")
+	if _, ok := s.cfg.AptArchives[archive]; !ok {
+		declared := "none; apt_archives is not set, so every codename is under /apt/dists/"
+		if names := s.cfg.AptArchiveNames(); len(names) > 0 {
+			declared = strings.Join(names, ", ")
+		}
+		http.Error(w, fmt.Sprintf("apt archive %q is not declared in apt_archives (declared: %s)", archive, declared), http.StatusNotFound)
+		return
+	}
+	tree, rest, _ := strings.Cut(r.PathValue("rest"), "/")
+	switch tree {
+	case "dists":
+		s.serveAptDists(w, r, archive, rest)
+	case "pool":
+		s.serveAptPool(w, r, archive, rest)
+	default:
+		http.Error(w, fmt.Sprintf("apt archive %q serves /apt/%s/dists/ and /apt/%s/pool/", archive, archive, archive), http.StatusNotFound)
+	}
+}
+
+// serveAptPool serves one pool path of an archive; "" is the default archive,
+// the only one that holds a .deb bodega built.
+func (s *Server) serveAptPool(w http.ResponseWriter, r *http.Request, archive, p string) {
 	if !isSafePath(p) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
@@ -74,6 +106,10 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w = cacheSharedImmutableOn200(w, path.Base(p))
 	}
+	if archive != "" {
+		s.handleAptMirrorPool(w, r, archive, poolPath, s.typeStore(manifest.TypeApt))
+		return
+	}
 	store, err := s.aptPoolStore(poolPath)
 	if err != nil {
 		s.logger.Error("storage backend recorded for pooled .deb is not configured",
@@ -85,7 +121,7 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		s.serveArtifact(w, r, store, manifest.AptKey(poolPath), "")
 		return
 	}
-	s.handleAptMirrorPool(w, r, poolPath, store)
+	s.handleAptMirrorPool(w, r, "", poolPath, store)
 }
 
 // aptPoolStore resolves a pooled .deb to the backend recorded for its version.
@@ -110,12 +146,33 @@ func (s *Server) aptPoolStore(poolPath string) (storage.ObjectStore, error) {
 // based on the path structure. Go's ServeMux doesn't support mid-segment
 // wildcards like "binary-{arch}", so we parse the path here.
 func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
-	distpath := r.PathValue("distpath")
+	s.serveAptDists(w, r, "", r.PathValue("distpath"))
+}
+
+// serveAptDists serves one path under an archive's dists/; "" is the default
+// archive, which holds the generated suites and every mirrored codename in no
+// named archive.
+func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, distpath string) {
 	if !isSafePath(distpath) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
 	parts := strings.Split(distpath, "/")
+
+	// A codename answers under its own archive's root and nowhere else. The
+	// body names where it is, because the request is a sources entry written
+	// before the codename moved into an archive, and the fix is one URI.
+	if home := s.cfg.AptArchiveOf(parts[0]); home != archive {
+		switch {
+		case home != "":
+			http.Error(w, fmt.Sprintf("apt codename %q is in archive %q: it is served at /apt/%s/dists/%s/", parts[0], home, home, parts[0]), http.StatusNotFound)
+		case s.cfg.MirrorsAptCodename(parts[0]) || s.cfg.ServesAptSuite(parts[0]):
+			http.Error(w, fmt.Sprintf("apt codename %q is not in archive %q: it is served at /apt/dists/%s/", parts[0], archive, parts[0]), http.StatusNotFound)
+		default:
+			http.Error(w, fmt.Sprintf("apt archive %q has no codename %q (it has: %s)", archive, parts[0], strings.Join(s.cfg.AptArchives[archive], ", ")), http.StatusNotFound)
+		}
+		return
+	}
 
 	// Before the rewritten-or-proxied choice below: a vendor codename the
 	// host's profile does not list is refused whichever of the two serves it.

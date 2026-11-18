@@ -73,16 +73,20 @@ type aptRoute struct {
 	at  time.Time
 }
 
-// aptRouteCache maps a pool path to the archive that answered for it.
+// aptRouteCache maps a pool object's key to the upstream root that answered
+// for it.
 //
 // It exists because a pool request carries no codename. apt decided which
-// archive to trust when it read a Packages file during `apt update`, and that
+// suite to trust when it read a Packages file during `apt update`, and that
 // decision is not recoverable from `GET /apt/pool/main/n/nginx/nginx_...deb`:
 // the request looks identical whichever suite produced it. So bodega probes
-// and remembers, and an operator serving two archives that publish different
-// bytes at one pool path is served whichever probe answered first. Real
-// Debian and Ubuntu archives do not do that — a pool path names one version of
-// one package — but a private mirror rebuilt from source can.
+// the roots of the request's archive and remembers.
+//
+// Keyed by object key, which carries the archive, because one pool path is
+// not one package across distributions: Ubuntu rebuilds what it syncs from
+// Debian under the same version and filename, so the two publish different
+// bytes at one path. Inside one archive the roots (archive, updates,
+// security) are one pool, and whichever answers first has the same file.
 type aptRouteCache struct {
 	mu     sync.Mutex
 	routes map[string]aptRoute
@@ -90,23 +94,23 @@ type aptRouteCache struct {
 
 // get returns the remembered archive for a pool path, and whether the answer
 // is still fresh. A fresh answer with an empty URL means "no archive has it".
-func (c *aptRouteCache) get(poolPath string) (string, bool) {
+func (c *aptRouteCache) get(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	rt, ok := c.routes[poolPath]
+	rt, ok := c.routes[key]
 	if !ok || time.Since(rt.at) > aptRouteTTL {
 		return "", false
 	}
 	return rt.url, true
 }
 
-func (c *aptRouteCache) put(poolPath, upstreamURL string) {
+func (c *aptRouteCache) put(key, upstreamURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.routes == nil || len(c.routes) >= aptRouteCacheMax {
 		c.routes = make(map[string]aptRoute, aptRouteCacheMax/8)
 	}
-	c.routes[poolPath] = aptRoute{url: upstreamURL, at: time.Now()}
+	c.routes[key] = aptRoute{url: upstreamURL, at: time.Now()}
 }
 
 // handleAptMirrorDists proxies one path under a mirrored codename's dists/
@@ -141,7 +145,7 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	// serve a Release from one host and a Packages from another, which is the
 	// hash mismatch the whole disjoint-namespace rule exists to prevent.
 	upstream := upstreams[0].URL + "/dists/" + codename + "/" + rest
-	key := manifest.AptKey("dists/" + codename + "/" + rest)
+	key := manifest.AptArchiveKey(s.cfg.AptArchiveOf(codename), "dists/"+codename+"/"+rest)
 	immutable := aptDistsImmutable(rest)
 	markIndexResponse(r)
 
@@ -170,10 +174,10 @@ func aptMirrorPkgName(codename, rest string) string {
 	return codename + "/" + rest
 }
 
-// handleAptMirrorPool proxies one pool artifact, resolving which archive has
-// it first.
-func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poolPath string, store storage.ObjectStore) {
-	key := manifest.AptKey(poolPath)
+// handleAptMirrorPool proxies one pool artifact of an archive, resolving which
+// of that archive's upstream roots has it first.
+func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, archive, poolPath string, store storage.ObjectStore) {
+	key := manifest.AptArchiveKey(archive, poolPath)
 	p := s.profileFor(r)
 	refused := s.aptRefusedArchiveRoots(p)
 	refuse := func(base string) bool {
@@ -210,7 +214,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 		return
 	}
 
-	base, ok := s.aptResolvePoolUpstream(w, r, poolPath)
+	base, ok := s.aptResolvePoolUpstream(w, r, key)
 	if !ok {
 		return
 	}
@@ -861,10 +865,11 @@ func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string, obj cac
 // when nothing short of a network probe can say. A recorded origin under no
 // configured root says nothing about today's archives and is not used.
 func (s *Server) aptPoolHitUpstream(r *http.Request, poolPath, key string, obj cachedObject) string {
-	if base, fresh := s.aptRoutes.get(poolPath); fresh && base != "" {
+	if base, fresh := s.aptRoutes.get(key); fresh && base != "" {
 		return base + "/" + poolPath
 	}
-	candidates := s.cfg.AptPoolUpstreams()
+	archive, _, _ := manifest.SplitAptKey(key)
+	candidates := s.cfg.AptPoolUpstreamsIn(archive)
 	if len(candidates) == 1 {
 		return candidates[0] + "/" + poolPath
 	}
@@ -904,10 +909,13 @@ func (s *Server) serveAptMirror(w http.ResponseWriter, r *http.Request, store st
 	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeApt, upstream, pkgName, immutable, true)
 }
 
-// aptResolvePoolUpstream returns the archive that has poolPath, an empty
-// string when none does, and ok=false when it has already written the response.
+// aptResolvePoolUpstream returns the upstream root that has the pool object
+// key names, an empty string when none does, and ok=false when it has already
+// written the response.
 //
-// Candidates are probed in sorted order and the winner is remembered, so a
+// The candidates are the roots of the key's own archive, so a path one
+// distribution publishes is never answered by another's build of it. They are
+// probed in sorted order and the winner is remembered, so a
 // second request for the same .deb goes straight to it. Each candidate clears
 // the allow-list before it is contacted: "bodega policy add apt <host>" means
 // bodega does not talk to anything else, and a probe that asks first and
@@ -923,10 +931,11 @@ func (s *Server) serveAptMirror(w http.ResponseWriter, r *http.Request, store st
 // The probe writes no discovery row. proxyOrCache writes one for the fetch
 // that follows, and recording here as well would count one client download as
 // one row per configured archive.
-func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, poolPath string) (string, bool) {
-	if cached, fresh := s.aptRoutes.get(poolPath); fresh {
+func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, key string) (string, bool) {
+	if cached, fresh := s.aptRoutes.get(key); fresh {
 		return cached, true
 	}
+	archive, poolPath, _ := manifest.SplitAptKey(key)
 
 	ctx := r.Context()
 	// The verdict alone runs detached, for the reason
@@ -937,7 +946,7 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 	verdictCtx, cancel := auditContext(r)
 	defer cancel()
 	name, version := manifest.AptDebIdentity(path.Base(poolPath))
-	candidates := s.cfg.AptPoolUpstreams()
+	candidates := s.cfg.AptPoolUpstreamsIn(archive)
 	var refused []string
 	// One refusal, and so one incident, across every candidate row: the
 	// client made one request and gets one answer.
@@ -958,7 +967,7 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 				// table answers what the fleet reached for and the audit table
 				// answers who was turned away — the same pair
 				// enforceUpstreamPolicyRecording writes on the proxy path.
-				s.recordDiscovery(ctx, r, manifest.TypeApt, candidate, candidate, name, manifest.AptKey(poolPath), decision)
+				s.recordDiscovery(ctx, r, manifest.TypeApt, candidate, candidate, name, key, decision)
 				s.recordPolicyViolation(r, manifest.TypeApt, candidate, candidate, f.incident)
 				refused = append(refused, base)
 				continue
@@ -971,7 +980,7 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 			continue
 		}
 		if found {
-			s.aptRoutes.put(poolPath, base)
+			s.aptRoutes.put(key, base)
 			s.logger.Debug("apt pool path resolved", "pool_path", poolPath, "upstream", base)
 			return base, true
 		}
@@ -994,7 +1003,7 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 
 	// Negative result, remembered. apt retries a failed download, and without
 	// this every retry would fan back out across every configured archive.
-	s.aptRoutes.put(poolPath, "")
+	s.aptRoutes.put(key, "")
 	s.logger.Info("apt pool path is in no configured archive",
 		"pool_path", poolPath, "package", name, "version", version,
 		"archives", strings.Join(candidates, " "))
