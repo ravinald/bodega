@@ -265,8 +265,9 @@ type Server struct {
 	// unable to answer for a mirrored .deb, so a fleet's installs log the gap
 	// once rather than once per artifact.
 	aptOSVUnchecked sync.Map
-	// aptPoolIdx maps each mirrored pool path to its Packages paragraph, which
-	// is where the OSV gate reads the epoch the pool filename drops.
+	// aptPoolIdx maps each mirrored pool object to its Packages paragraph,
+	// which is where the OSV gate reads the epoch the pool filename drops and
+	// where a pool fetch learns the root, size and SHA256 it must have.
 	aptPoolIdx aptPoolIndexCache
 
 	// reloadSignals, when set, is a SIGHUP channel the caller registered

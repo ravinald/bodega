@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1852,7 +1854,8 @@ func TestAptMirrorAgeBlockRefusesTheNewVersionAndServesTheOld(t *testing.T) {
 }
 
 // TestAptMirrorAgeCachedDebTakesItsFillsVerdict is F112 requirement 3: the
-// hit neither re-judges the version nor reads the index to do it.
+// hit does not re-judge the version. It does read the index, for B196: a
+// cached .deb is served only while its pin agrees with the paragraph naming it.
 func TestAptMirrorAgeCachedDebTakesItsFillsVerdict(t *testing.T) {
 	s, archive := ageMirrorServer(t)
 	setAptAge(t, s, policy.ActionWarn)
@@ -1872,14 +1875,10 @@ func TestAptMirrorAgeCachedDebTakesItsFillsVerdict(t *testing.T) {
 	s.aptPoolIdx.mu.Lock()
 	s.aptPoolIdx.idx = nil
 	s.aptPoolIdx.mu.Unlock()
-	release := "dists/" + mirroredCodename + "/Release"
-	reads, checks := archive.count(release), len(ageChecksFor(t, s, "8.5.4-0ubuntu2"))
+	checks := len(ageChecksFor(t, s, "8.5.4-0ubuntu2"))
 
 	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK || body != "deb 8.5.4-0ubuntu2" {
 		t.Fatalf("the cached .deb = %d %q, want 200: its fill admitted it", code, body)
-	}
-	if got := archive.count(release); got != reads {
-		t.Errorf("Release reads = %d after the hit, want %d: a hit read the index", got, reads)
 	}
 	if got := len(ageChecksFor(t, s, "8.5.4-0ubuntu2")); got != checks {
 		t.Errorf("age checks = %d after the hit, want %d: the hit re-judged the version", got, checks)
@@ -3154,6 +3153,250 @@ func TestUsageDocumentsAptArchives(t *testing.T) {
 			if strings.Contains(strings.Join(strings.Fields(strings.ReplaceAll(text, "//", "")), " "), stale) {
 				t.Errorf("%s still says %q: Ubuntu rebuilds what it syncs from Debian under one filename", name, stale)
 			}
+		}
+	}
+}
+
+// indexedArchive serves codename's dists/ tree with a Packages listing each
+// pool path at the bytes listed, and serves the bytes in served from its pool.
+func indexedArchive(t *testing.T, codename string, listed, served map[string]string) *fixtureArchive {
+	t.Helper()
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate fixture key: %v", err)
+	}
+	var packages strings.Builder
+	for _, poolPath := range sortedKeys(listed) {
+		packages.WriteString(fixturePackages(poolPath, listed[poolPath]))
+	}
+	objects := fixtureDistsFor(t, kr, codename, packages.String(), "amd64")
+	maps.Copy(objects, served)
+	return newFixtureArchive(t, objects)
+}
+
+func sortedKeys(m map[string]string) []string {
+	return slices.Sorted(maps.Keys(m))
+}
+
+func sha256Of(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
+// B196 requirement 1: bytes the paragraph naming their path does not list are
+// refused, recorded, and neither stored nor pinned, and the next request asks
+// upstream again.
+func TestPoolRefusesBytesTheParagraphDoesNotList(t *testing.T) {
+	const served = "\x21<arch>\nnginx from another build"
+	archive := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: fixtureDebBody}, map[string]string{fixtureDeb: served})
+	s := mirrorServer(t, archive)
+
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusBadGateway {
+		t.Fatalf("GET a .deb its paragraph does not describe = %d %q, want 502", code, body)
+	}
+	for _, want := range []string{fixtureDeb, archive.URL(), sha256Of(fixtureDebBody), sha256Of(served)} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("refusal does not name %q:\n%s", want, body)
+		}
+	}
+	inc := bodyIncident(t, string(body), checkChecksum)
+	rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	matched := false
+	for _, row := range rows {
+		matched = matched || (row.Status == audit.CacheChecksumMismatch && strings.Contains(row.Details, `"incident":"`+inc+`"`))
+	}
+	if !matched {
+		t.Errorf("no checksum_mismatch row carries the refusal's incident %s: %+v", inc, rows)
+	}
+
+	key := manifest.AptKey(fixtureDeb)
+	if info, err := s.typeStore(manifest.TypeApt).Head(t.Context(), key); err != nil || (info != nil && info.Exists) {
+		t.Errorf("the refused bytes were stored: %+v %v", info, err)
+	}
+	if pin, err := s.auditDB.GetChecksum(t.Context(), key); err != nil || (pin != nil && pin.Value != "") {
+		t.Errorf("the refused bytes were pinned: %+v %v", pin, err)
+	}
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusBadGateway {
+		t.Errorf("second GET = %d, want 502 again", code)
+	}
+	if got := archive.count(fixtureDeb); got != 2 {
+		t.Errorf("upstream GETs = %d, want 2: the second request asks upstream again", got)
+	}
+
+	archive.setObject(fixtureDeb, fixtureDebBody)
+	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Errorf("GET once the pool serves the listed build = %d %q, want 200", code, body)
+	}
+}
+
+// B196 requirement 2: a path one codename's paragraph names is fetched from
+// that codename's roots, even when another root of the archive sorts first and
+// holds a different file at the path. That other root is issue #336's Debian.
+func TestPoolFetchesANamedPathFromItsCodenamesRoot(t *testing.T) {
+	a := indexedArchive(t, "named", nil, nil)
+	b := indexedArchive(t, "named", nil, nil)
+	if a.URL() > b.URL() {
+		a, b = b, a
+	}
+	decoy, home := a, b
+	const decoyBody = "\x21<arch>\nnginx as the other distribution built it"
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate fixture key: %v", err)
+	}
+	for rel, body := range fixtureDistsFor(t, kr, "named", fixturePackages(fixtureDeb, fixtureDebBody), "amd64") {
+		home.setObject(rel, body)
+	}
+	home.setObject(fixtureDeb, fixtureDebBody)
+	for rel, body := range fixtureDistsFor(t, kr, "other", fixturePackages(fallbackDeb, fallbackDebBody), "amd64") {
+		decoy.setObject(rel, body)
+	}
+	decoy.setObject(fixtureDeb, decoyBody)
+
+	s := mirrorServer(t)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"named": {{URL: home.URL()}},
+		"other": {{URL: decoy.URL()}},
+	}
+	if got := s.cfg.AptPoolUpstreamsIn(""); len(got) != 2 || got[0] != decoy.URL() {
+		t.Fatalf("pool roots = %v, want the decoy %s sorted first", got, decoy.URL())
+	}
+
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("GET %s = %d %q, want 200 and the named codename's build", fixtureDeb, code, body)
+	}
+	if got := decoy.count(fixtureDeb); got != 0 {
+		t.Errorf("the root no paragraph points at served the .deb %d times, want 0", got)
+	}
+}
+
+// B196 requirement 3: two codenames of one archive listing one pool path with
+// different digests is refused before any upstream is asked, the body names
+// both and apt_archives, and the build logs it once at ERROR.
+func TestPoolRefusesAPathTwoCodenamesListDifferently(t *testing.T) {
+	const debianBody = "\x21<arch>\nnginx as Debian built it"
+	ubuntu := indexedArchive(t, "resolute", map[string]string{fixtureDeb: fixtureDebBody}, map[string]string{fixtureDeb: fixtureDebBody})
+	debian := indexedArchive(t, "trixie", map[string]string{fixtureDeb: debianBody}, map[string]string{fixtureDeb: debianBody})
+	s := mirrorServer(t)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"resolute": {{URL: ubuntu.URL()}},
+		"trixie":   {{URL: debian.URL()}},
+	}
+	var logged syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	for range 2 {
+		code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+		if code != http.StatusBadGateway {
+			t.Fatalf("GET a path two codenames list differently = %d %q, want 502", code, body)
+		}
+		for _, want := range []string{fixtureDeb, "resolute", "trixie", sha256Of(fixtureDebBody), sha256Of(debianBody), "apt_archives"} {
+			if !strings.Contains(string(body), want) {
+				t.Errorf("refusal does not name %q:\n%s", want, body)
+			}
+		}
+	}
+	if got := ubuntu.count(fixtureDeb) + debian.count(fixtureDeb); got != 0 {
+		t.Errorf("upstream GETs of the conflicting path = %d, want 0", got)
+	}
+	var conflictLines []string
+	for line := range strings.Lines(logged.String()) {
+		if strings.Contains(line, "level=ERROR") && strings.Contains(line, "apt_archives") {
+			conflictLines = append(conflictLines, line)
+		}
+	}
+	if len(conflictLines) != 1 || !strings.Contains(conflictLines[0], `codenames="resolute trixie"`) || !strings.Contains(conflictLines[0], "paths=1") {
+		t.Errorf("ERROR lines naming the conflict = %q, want one with both codenames and the count", conflictLines)
+	}
+
+	// The remedy the body names: each distribution in an archive of its own.
+	s.cfg.AptArchives = map[string][]string{"ubuntu": {"resolute"}, "debian": {"trixie"}}
+	if code, body := mirrorGet(t, s, "/apt/debian/"+fixtureDeb); code != http.StatusOK || string(body) != debianBody {
+		t.Errorf("GET /apt/debian/%s after apt_archives = %d %q, want Debian's build", fixtureDeb, code, body)
+	}
+}
+
+// B196 requirement 4: a cached build whose pin disagrees with the paragraph
+// naming its path is dropped with its pin and fetched again, which is how a
+// server that pinned the wrong distribution's build corrects itself.
+func TestPoolReplacesACachedBuildItsParagraphDisagreesWith(t *testing.T) {
+	const stale = "\x21<arch>\nnginx as Debian built it"
+	archive := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: fixtureDebBody}, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	var logged syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	ctx := t.Context()
+	key := manifest.AptKey(fixtureDeb)
+	if err := s.typeStore(manifest.TypeApt).Put(ctx, key, []byte(stale)); err != nil {
+		t.Fatalf("seed the stale build: %v", err)
+	}
+	if err := s.auditDB.StoreChecksum(ctx, key, manifest.TypeApt, "nginx", "1.24.0-2ubuntu7.1", "sha256", sha256Of(stale), "computed"); err != nil {
+		t.Fatalf("seed the stale pin: %v", err)
+	}
+
+	for range 2 {
+		if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+			t.Fatalf("GET = %d %q, want 200 and the listed build", code, body)
+		}
+	}
+	if got := archive.count(fixtureDeb); got != 1 {
+		t.Errorf("upstream GETs = %d, want 1: refetched once, then served from the cache", got)
+	}
+	if pin, err := s.auditDB.GetChecksum(ctx, key); err != nil || pin == nil || pin.Value != sha256Of(fixtureDebBody) {
+		t.Errorf("pin = %+v %v, want the listed digest", pin, err)
+	}
+	var warned bool
+	for line := range strings.Lines(logged.String()) {
+		warned = warned || (strings.Contains(line, "level=WARN") && strings.Contains(line, sha256Of(stale)) && strings.Contains(line, sha256Of(fixtureDebBody)))
+	}
+	if !warned {
+		t.Errorf("no WARN names both digests:\n%s", logged.String())
+	}
+}
+
+// b196DocRefusals renders the two refusals "Resolving a pool path" quotes, at
+// the example values the section uses, under a pinned incident.
+func b196DocRefusals(t *testing.T) []string {
+	t.Helper()
+	saved := newIncident
+	newIncident = func() string { return "3f2a9c1e7b04" }
+	t.Cleanup(func() { newIncident = saved })
+	const poolPath = "pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb"
+	ubuntu, debian := sha256Of("pkgconf as Ubuntu built it"), sha256Of("pkgconf as Debian built it")
+	s := mirrorServer(t)
+	mismatch := s.aptParagraphMismatch(t.Context(), manifest.AptKey(poolPath), "http://archive.ubuntu.com/ubuntu", poolPath, "pkgconf",
+		aptPoolStanza{sha256: ubuntu, size: 63542, codename: "resolute"}, debian, 64410)
+	conflict := aptPoolConflictRefusal("", poolPath, "pkgconf", aptPoolConflict{codenames: [2]string{"resolute", "trixie"}, digests: [2]string{ubuntu, debian}})
+	return []string{mismatch.text(), conflict.text()}
+}
+
+// TestUsageDocumentsPoolResolution is B196 requirement 6: the section says the
+// index decides before the probe and quotes each refusal as a client gets it.
+func TestUsageDocumentsPoolResolution(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read usage.md: %v", err)
+	}
+	_, after, ok := strings.Cut(string(raw), "\n#### Resolving a pool path\n")
+	if !ok {
+		t.Fatal("usage.md has no Resolving a pool path heading")
+	}
+	section, _, _ := strings.Cut(after, "\n#### ")
+	for _, body := range b196DocRefusals(t) {
+		if !strings.Contains(section, body) {
+			t.Errorf("Resolving a pool path does not quote the refusal a client gets:\n%s", body)
+		}
+	}
+	for _, want := range []string{"`Packages` paragraph", "`HEAD`", "apt_archives", "bodega pkg checksum clear"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("Resolving a pool path does not mention %q", want)
 		}
 	}
 }

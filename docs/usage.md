@@ -6737,11 +6737,37 @@ With any apt rule present, an archive not on the list is never contacted: the ch
 
 A pool request carries no codename. apt chose which archive to trust when it read a `Packages` file during `apt update`, and that decision is not recoverable from `GET /apt/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` — the request looks identical whichever suite produced it.
 
-So bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the answer is remembered for an hour keyed on the object key. A path none of them has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
+So bodega reads the archive's own indexes first. It keeps an index of every `Packages` paragraph the archive's mirrored codenames publish, rebuilt every `metadata_ttl`, and resolves a pool path in this order:
+
+1. **Two codenames disagree.** When paragraphs of two codenames in the request's archive list the path with different `SHA256` values, the request is refused with `502` before any upstream is asked. The default archive counts as an archive here. Each index build that finds such paths logs one `ERROR` line per pair of codenames, with how many paths they disagree on.
+2. **A paragraph names the path.** bodega fetches it from the upstream roots of that paragraph's codename, in the order `apt_upstreams` lists them, and no other. The bytes are cached, pinned and served only when their size and `SHA256` equal the paragraph's. A mismatch is refused with `502`, recorded as a `checksum_mismatch` audit row under the incident the body names, and nothing is stored or pinned, so the next request asks upstream again.
+3. **No paragraph names the path.** bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the bytes are pinned on first fetch. A path whose codename's index bodega could not read lands here too, until a rebuild reads it.
+
+Either way the root that answered is remembered for an hour, keyed on the object key. A path none of them has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
+
+A cached `.deb` is held to the same index. When its pin disagrees with the paragraph naming its path, bodega removes the object and the pin, logs a `WARN` naming both digests, and fetches it again under the rules above. A server that cached the wrong distribution's build before it read the index corrects itself on the next request for each path, with no `bodega pkg checksum clear` needed.
+
+A paragraph that does not match what its upstream serves answers:
+
+```text
+bodega refused apt/pkgconf@2.5.1-4 (checksum, incident 3f2a9c1e7b04): pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb from http://archive.ubuntu.com/ubuntu is 64410 bytes with sha256 ed8886ef4a8229928e8da31f4be3087ed235172a6bef5ee9ed3a3e1223f0a164, but the Packages paragraph of resolute that names it lists 63542 bytes with sha256 dd63b86146a24e96a9a76e6ccf29f10805309cb39db91ef12dce3128ad3afe39; nothing was cached or pinned.
+Next step: retry once the archive's pool and index agree again, since the next request asks upstream again; if it persists, give an operator incident 3f2a9c1e7b04, whose audit row holds both digests.
+```
+
+Inside one distribution this is a mirror caught between syncs, and the retry is the fix. When it persists, check the path against the archive by hand (`curl -sI` on the URL the body names) and read the audit row for the incident: a `Size` that differs as well as the digest usually means a proxy or mirror between bodega and the archive is serving another file at that path.
+
+Two codenames disagreeing answers:
+
+```text
+bodega refused apt/pkgconf@2.5.1-4 (checksum, incident 3f2a9c1e7b04): pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb is listed by mirrored codename resolute with sha256 dd63b86146a24e96a9a76e6ccf29f10805309cb39db91ef12dce3128ad3afe39 and by trixie with sha256 ed8886ef4a8229928e8da31f4be3087ed235172a6bef5ee9ed3a3e1223f0a164, and both are in the default archive, which shares one pool between them, so bodega cannot tell which build this client expects and fetches neither.
+Next step: an operator separates the two distributions with apt_archives, which gives each its own /apt/{archive}/ root, and points each host's sources at its own; incident 3f2a9c1e7b04.
+```
+
+The operator's step is the one the body names: declare [`apt_archives`](#apt_archives) so each distribution gets its own root and pool, then point each host's `sources.list` entries at `/apt/{archive}/`. Until then, neither distribution's hosts can fetch that path through bodega.
 
 The request's archive is the URL root it arrived under. `GET /apt/debian/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` asks the upstreams of the codenames [`apt_archives`](#apt_archives) lists under `debian` and stores the object at `packages/apt/debian/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb`. `GET /apt/pool/...` asks the upstreams of the codenames in no archive and stores under `packages/apt/pool/...`.
 
-The consequence to know: **if two upstreams of one archive publish different bytes at one pool path, bodega serves whichever answered the probe first.** Inside one distribution that does not happen, since its security and updates hosts share the pool namespace deliberately. Across distributions it does: Ubuntu rebuilds packages it syncs from Debian under the same version and filename. Mirror two distributions as two archives in `apt_archives`, never as codenames sharing the default one.
+The consequence to know: **two distributions in one archive share one pool, and every path they both publish differently is refused.** Inside one distribution that does not happen, since its security and updates hosts share the pool namespace deliberately. Across distributions it does: Ubuntu rebuilds packages it syncs from Debian under the same version and filename. Mirror two distributions as two archives in `apt_archives`, never as codenames sharing the default one.
 
 #### Versions in the discovery log lose the epoch
 

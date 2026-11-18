@@ -129,6 +129,10 @@ type resolvedUpstream struct {
 	// indexURL is the document that listed the digest, for the refusal.
 	indexURL string
 	filename string
+	// check, when set, holds the spooled bytes to what the resolver's index
+	// lists by their digest and size, and returns the refusal, already
+	// recorded, when they differ.
+	check func(ctx context.Context, sha256 string, size int64) *refusal
 }
 
 // indexedResolver is an upstreamResolver whose answer comes from an index that
@@ -481,6 +485,12 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 			"url", redactedURL(up.url), "index", redactedURL(resolved.indexURL), "listed", want, "served", spool.sha256, "incident", f.incident)
 		f.write(w, r)
 		return
+	}
+	if resolved.check != nil {
+		if f := resolved.check(ctx, spool.sha256, spool.size); f != nil {
+			f.write(w, r)
+			return
+		}
 	}
 	pinDigest, err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable)
 	if err != nil {
