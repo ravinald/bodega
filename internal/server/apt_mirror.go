@@ -266,18 +266,30 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 // serveAptPoolListed serves a pool object a Packages paragraph names, and
 // only ever the build that paragraph lists.
 //
-// A cached copy is served without the fill lock while its pin is the
-// paragraph's SHA256, read after the object is opened so the verdict covers
-// the handle supplying the bytes. Anything else (no copy, no pin, another
-// pin) is settled under the lock every fill of this key takes, so a request
-// that waited behind a fill judges what that fill left against its own
-// paragraph rather than serving it, and a repair never races a fill.
+// The object is opened and its pin read under the lock every repair and fill
+// of this key takes, and the lock is released only once the handle is open,
+// before any byte is streamed. A pin read outside it can belong to a
+// replacement that landed after the open, so a handle on the rejected build
+// would be served under the listed build's pin. Holding it for the open alone
+// keeps concurrent hits on one cached .deb from queueing behind each other's
+// transfers. Anything but a matching pin (no copy, no pin, another pin) is
+// settled under the same lock, so a request that waited behind a fill judges
+// what that fill left against its own paragraph.
 func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza, serveHit func(admit func() bool), refuse func(base string) bool) {
+	var once sync.Once
+	locked := s.aptMirror.lock(key)
+	release := func() { once.Do(locked) }
+	defer release()
+	admitOpened := func() bool {
+		release()
+		return true
+	}
+
 	if s.aptCached(r.Context(), store, key, true) != nil {
 		unpinned := false
 		serveHit(func() bool {
 			if s.aptPinned(r.Context(), key) == want.sha256 {
-				return true
+				return admitOpened()
 			}
 			unpinned = true
 			return false
@@ -287,15 +299,13 @@ func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, stor
 		}
 	}
 
-	release := s.aptMirror.lock(key)
-	defer release()
 	cached, f := s.aptSettleListedCache(r.Context(), store, key, poolPath, name, want)
 	if f != nil {
 		f.write(w, r)
 		return
 	}
 	if cached {
-		serveHit(nil)
+		serveHit(admitOpened)
 		return
 	}
 	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, s.aptCodenameRoots(want.codename))
@@ -648,9 +658,13 @@ type aptPoolIndex struct {
 	shadow    map[string][]aptPoolStanza
 	conflicts map[string]aptPoolConflict
 	archives  map[string]string
-	failed    []string
-	at        time.Time
-	ttl       time.Duration
+	// indexed holds each codename/component/arch whose Packages this index,
+	// or one it carried from, read a body for. A 404 for one of them is a
+	// failed read rather than an architecture the root does not serve.
+	indexed map[string]bool
+	failed  []string
+	at      time.Time
+	ttl     time.Duration
 }
 
 // add records one codename's paragraph for key. A path two codenames of one
@@ -677,6 +691,11 @@ func (idx *aptPoolIndex) add(key string, st aptPoolStanza) {
 func (idx *aptPoolIndex) carry(prev *aptPoolIndex, codename string) {
 	if prev == nil || prev.archives[codename] != idx.archives[codename] {
 		return
+	}
+	for k := range prev.indexed {
+		if strings.HasPrefix(k, codename+"/") {
+			idx.indexed[k] = true
+		}
 	}
 	for k, first := range prev.byKey {
 		for _, st := range append([]aptPoolStanza{first}, prev.shadow[k]...) {
@@ -782,14 +801,14 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, prev *aptPoolIndex) *aptPoolIndex {
 	idx := &aptPoolIndex{ident: s.aptPoolIndexIdent(codenames), byKey: map[string]aptPoolStanza{},
 		shadow: map[string][]aptPoolStanza{}, conflicts: map[string]aptPoolConflict{}, archives: map[string]string{},
-		at: time.Now(), ttl: s.cache.MetadataTTL}
+		indexed: map[string]bool{}, at: time.Now(), ttl: s.cache.MetadataTTL}
 	if idx.ttl <= 0 {
 		idx.ttl = aptRouteTTL
 	}
 	reads := map[string]aptIndexRead{}
 	for _, c := range codenames {
 		idx.archives[c] = s.cfg.AptArchiveOf(c)
-		if err := s.indexAptPool(ctx, c, idx, reads); err != nil {
+		if err := s.indexAptPool(ctx, c, idx, prev, reads); err != nil {
 			idx.failed = append(idx.failed, err.Error())
 			idx.carry(prev, c)
 		}
@@ -835,7 +854,12 @@ func aptArchiveLabel(archive string) string {
 // indexAptPool adds one codename's paragraphs to idx. A parse break keeps what came before it, since each entry is a
 // paragraph that did parse and a path missing past the break goes unchecked
 // rather than misjudged.
-func (s *Server) indexAptPool(ctx context.Context, codename string, idx *aptPoolIndex, reads map[string]aptIndexRead) error {
+//
+// A 404 for a Packages prev read a body for is returned as an error once the
+// rest are read, so the caller carries prev's paragraphs: the Release still
+// lists that document, and a mirror mid-sync answering 404 for it says
+// nothing about whether the paths it named are still published.
+func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *aptPoolIndex, reads map[string]aptIndexRead) error {
 	release, err := s.aptUpstreamRelease(ctx, codename)
 	if err != nil {
 		return fmt.Errorf("read the Release for %s: %w", codename, err)
@@ -845,15 +869,21 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx *aptPool
 		return err
 	}
 	archive := s.cfg.AptArchiveOf(codename)
+	var vanished []string
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
 			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, reads)
 			if err != nil {
 				return err
 			}
+			triple := codename + "/" + comp.name + "/" + arch
 			if read.notPublished {
+				if prev != nil && prev.indexed[triple] {
+					vanished = append(vanished, triple)
+				}
 				continue
 			}
+			idx.indexed[triple] = true
 			err = deb822.ParseStreamRaw(bytes.NewReader(read.body), func(_ []byte, fields map[string]string) error {
 				filename := strings.TrimSpace(fields["Filename"])
 				if filename == "" {
@@ -871,6 +901,9 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx *aptPool
 				return fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
 			}
 		}
+	}
+	if len(vanished) > 0 {
+		return fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
 	}
 	return nil
 }
