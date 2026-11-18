@@ -237,3 +237,39 @@ func TestAptStripEpoch(t *testing.T) {
 		}
 	}
 }
+
+// A backports pocket publishes NotAutomatic and ButAutomaticUpgrades, which
+// set its default pin to 100. apt update fails on a host whose cached pin for
+// the archive differs from the one it just fetched, so a rewrite that dropped
+// the two fields broke apt on every host the moment a hide landed.
+func TestMirroredHideKeepsTheArchiveDefaultPin(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	rel := "dists/" + mirroredCodename + "/Release"
+	upstream, ok := archive.object(rel)
+	if !ok {
+		t.Fatalf("the fixture archive publishes no %s", rel)
+	}
+	archive.setObject(rel, strings.Replace(upstream, "Components:", "NotAutomatic: yes\nButAutomaticUpgrades: yes\nComponents:", 1))
+	hideMirrored(t, s, "htop", hiddenHtopVersion)
+
+	release := verifyBodegaInRelease(t, s, mirroredCodename)
+	for _, field := range []string{"NotAutomatic", "ButAutomaticUpgrades"} {
+		if release[field] != "yes" {
+			t.Errorf("rewritten Release %s = %q, want the archive's %q", field, release[field], "yes")
+		}
+	}
+}
+
+// A pocket that publishes neither field keeps the default pin of 500, so the
+// rewrite must not invent one.
+func TestMirroredHideAddsNoDefaultPinTheArchiveLacks(t *testing.T) {
+	s, _ := aptProfileServer(t)
+	hideMirrored(t, s, "htop", hiddenHtopVersion)
+
+	release := verifyBodegaInRelease(t, s, mirroredCodename)
+	for _, field := range []string{"NotAutomatic", "ButAutomaticUpgrades"} {
+		if v, ok := release[field]; ok {
+			t.Errorf("rewritten Release carries %s: %q, which the archive does not publish", field, v)
+		}
+	}
+}

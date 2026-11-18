@@ -932,8 +932,14 @@ func (s *Server) aptIndexFrom(suite string, components []string, packages map[st
 // aptReleaseHeader is the identity half of a generated Release. bodega's own
 // suites and the filtered codenames are bodega's and say so; a rewritten
 // mirrored codename keeps the archive's, for the reason apt_hide.go gives.
+//
+// notAutomatic and butAutomaticUpgrades set the archive's default pin (100
+// for a backports pocket rather than 500). apt compares that pin across
+// updates like the identity fields and fails apt update when it changes, so
+// a rewrite that dropped them would break every host the moment a hide lands.
 type aptReleaseHeader struct {
 	origin, label, suite, codename, version string
+	notAutomatic, butAutomaticUpgrades      string
 }
 
 // aptIndexWithHeader is aptIndexFrom with the Release's identity fields named
@@ -990,6 +996,12 @@ func (s *Server) aptIndexWithHeader(header aptReleaseHeader, components []string
 		fmt.Fprintf(&buf, "Version: %s\n", header.version)
 	}
 	fmt.Fprintf(&buf, "Codename: %s\n", header.codename)
+	if header.notAutomatic != "" {
+		fmt.Fprintf(&buf, "NotAutomatic: %s\n", header.notAutomatic)
+	}
+	if header.butAutomaticUpgrades != "" {
+		fmt.Fprintf(&buf, "ButAutomaticUpgrades: %s\n", header.butAutomaticUpgrades)
+	}
 	fmt.Fprintf(&buf, "Components: %s\n", strings.Join(components, " "))
 	fmt.Fprintf(&buf, "Architectures: %s\n", strings.Join(arches, " "))
 	fmt.Fprintf(&buf, "Date: %s\n", date.Format(time.RFC1123Z))
