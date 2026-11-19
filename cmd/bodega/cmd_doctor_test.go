@@ -5036,3 +5036,33 @@ func TestDoctorAptRootStatusRefusalComposesWithTLSFinding(t *testing.T) {
 		t.Errorf("a refused status lookup on a TLS warning: row = %+v, want both findings", got)
 	}
 }
+
+func TestReviewF121MovedArchiveUnderPublicURLPrefix(t *testing.T) {
+	for _, prefix := range []string{"", "/bodega"} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			root := t.TempDir()
+			var base string
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET "+prefix+"/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+				src := aptsources.Render(aptsources.State{PublicURL: base, Suites: []string{"trixie"}, Components: []string{"main"}, Mirrored: true, Archive: "debian"})
+				_ = json.NewEncoder(w).Encode(map[string]any{"apt": map[string]any{"sources": []aptsources.Sources{src}}})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			base = srv.URL + prefix
+			before := clientconf.Apt(aptsources.Render(aptsources.State{PublicURL: base, Suites: []string{"trixie"}, Components: []string{"main"}, Mirrored: true}))
+			file := filepath.Join(root, clientconf.AptSourcesPath)
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(before.Content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h := &aptSourcesHost{goos: "linux", root: root}
+			got := h.rootFinding(host.Finding{Check: "apt-sources", Status: host.StatusOK}, base, aptServedRootsAt(base, "", true))
+			if got.Status != host.StatusWarn || !strings.Contains(got.Detail, base+"/apt/debian/") || !strings.Contains(got.Remediation, "--suite trixie --apply --url "+base) {
+				t.Fatalf("stale sources under public URL prefix %q escaped the archive check: %+v", prefix, got)
+			}
+		})
+	}
+}

@@ -188,23 +188,30 @@ func aptServedRoots(client *Client) (map[string]string, error) {
 	return out, nil
 }
 
-// aptRootPath is the path of an apt URI under bodega's apt tree, without a
-// trailing slash: /apt, or /apt/{archive}. ok is false for any other path.
-func aptRootPath(uri string) (string, bool) {
+// aptRootPath is the path of an apt URI under bodega's apt tree, relative to
+// basePath (the path of the server's public URL, which a reverse proxy may
+// set) and without a trailing slash: /apt, or /apt/{archive}. ok is false
+// for any path outside {basePath}/apt, compared by whole path segments so
+// /bodega-old/apt is not under /bodega.
+func aptRootPath(basePath, uri string) (string, bool) {
 	u, err := url.Parse(uri)
 	if err != nil {
 		return "", false
 	}
 	p := strings.TrimRight(u.Path, "/")
-	return p, p == "/apt" || strings.HasPrefix(p, "/apt/")
+	rest, found := strings.CutPrefix(p, strings.TrimRight(basePath, "/"))
+	if !found {
+		return "", false
+	}
+	return rest, rest == "/apt" || strings.HasPrefix(rest, "/apt/")
 }
 
 // rootFinding folds into the apt-sources row whether each source naming
 // bodega reads its suites from the root bodega serves them under. A codename
 // moved into an apt_archives archive answers 404 at /apt/dists/, so a host
 // whose sources predate the move stops receiving that suite at the next
-// "apt-get update". Any root under /apt/ counts as bodega's; only a root
-// that differs from the one served is reported.
+// "apt-get update". Any root under {base}/apt/, base path included, counts
+// as bodega's; only a root that differs from the one served is reported.
 //
 // served is asked only when a source names bodega, so a host that reads
 // nothing from bodega makes no request. A failure to ask leaves the row
@@ -242,7 +249,7 @@ func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() 
 			if port == 0 {
 				port = defaultPort[access]
 			}
-			root, ok := aptRootPath(uri)
+			root, ok := aptRootPath(b.Path, uri)
 			if ok && strings.EqualFold(hostname, b.Hostname()) && port == wantPort {
 				ours = append(ours, bodegaSource{entry: e, uri: uri, root: root})
 			}
@@ -277,7 +284,7 @@ func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() 
 			if !ok {
 				continue
 			}
-			if wantRoot, _ := aptRootPath(want); wantRoot == o.root {
+			if wantRoot, ok := aptRootPath(b.Path, want); ok && wantRoot == o.root {
 				continue
 			}
 			file := strings.TrimPrefix(o.entry.File, strings.TrimRight(h.root, "/"))
