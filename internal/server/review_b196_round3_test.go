@@ -239,3 +239,77 @@ func TestReviewB196CachedHitDoesNotWaitForFillDelivery(t *testing.T) {
 		t.Fatal("cached request waited for the first client's delivery after the complete object and pin were stored")
 	}
 }
+
+func TestReviewB196SharedStoreReplacementCannotBorrowPin(t *testing.T) {
+	const old = "distribution build one"
+	const newer = "distribution build two"
+	archive := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: old}, map[string]string{fixtureDeb: old})
+	first, second := mirrorServer(t, archive), mirrorServer(t, archive)
+	store := storage.NewLocal(t.TempDir())
+	first.stores = storage.NewSingle(store)
+	second.stores = storage.NewSingle(store)
+	key := manifest.AptKey(fixtureDeb)
+
+	if code, body := mirrorGet(t, first, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != old {
+		t.Fatalf("first instance's fill = %d %q", code, body)
+	}
+	fresh := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: newer}, map[string]string{fixtureDeb: newer})
+	for rel, data := range fresh.objects {
+		archive.setObject(rel, data)
+	}
+	if code, body := mirrorGet(t, second, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != newer {
+		t.Fatalf("second instance's repair = %d %q", code, body)
+	}
+	want, conflict := first.aptPoolParagraph(t.Context(), key)
+	if want == nil || conflict != nil || want.sha256 != sha256Of(old) {
+		t.Fatal("first instance lost the paragraph its request must enforce")
+	}
+	if pin, err := first.auditDB.GetChecksum(t.Context(), key); err != nil || pin == nil || pin.Value != sha256Of(old) {
+		t.Fatalf("first instance's pin = %+v %v", pin, err)
+	}
+	if code, body := mirrorGet(t, first, "/apt/"+fixtureDeb); code != http.StatusBadGateway {
+		t.Fatalf("first instance after shared-store replacement = %d %q, want 502: its paragraph names %q and upstream only serves %q", code, body, old, newer)
+	}
+}
+
+func TestReviewB196ServedPackagesRetainAuthorityBeforeFirstPoolRequest(t *testing.T) {
+	const wrong = "wrong distribution build"
+	archive := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: fixtureDebBody}, map[string]string{fixtureDeb: wrong})
+	s := mirrorServer(t, archive)
+	for _, rel := range []string{"Release", packagesPath + ".gz"} {
+		if code, _ := mirrorGet(t, s, "/apt/dists/"+mirroredCodename+"/"+rel); code != http.StatusOK {
+			t.Fatalf("client's index read %s = %d", rel, code)
+		}
+	}
+	archive.removeObject("dists/" + mirroredCodename + "/Release")
+	s.cache.MetadataTTL = time.Nanosecond
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusBadGateway {
+		t.Errorf("after serving Packages then losing Release, first pool request = %d %q, want 502 for bytes the served paragraph rejects", code, body)
+	}
+	key := manifest.AptKey(fixtureDeb)
+	if info, err := s.typeStore(manifest.TypeApt).Head(t.Context(), key); err != nil || (info != nil && info.Exists) {
+		t.Errorf("known mismatching bytes reached storage: %+v %v", info, err)
+	}
+	if pin, err := s.auditDB.GetChecksum(t.Context(), key); err != nil || (pin != nil && pin.Value != "") {
+		t.Errorf("known mismatching bytes were pinned: %+v %v", pin, err)
+	}
+}
+
+func TestReviewB196ScopedBaseRepairsWrongVendorCache(t *testing.T) {
+	s, _, scoped, _, vendor := scopedVendorArchives(t)
+	const stale = "nginx from the wrong distribution"
+	key := manifest.AptKey(profileNginxDeb)
+	store := s.typeStore(manifest.TypeApt)
+	if err := store.Put(t.Context(), key, []byte(stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.StoreChecksum(t.Context(), key, manifest.TypeApt, "nginx", profileNginxVersion, "sha256", sha256Of(stale), "computed"); err != nil {
+		t.Fatal(err)
+	}
+	s.recordCacheOrigin(t.Context(), store, key, vendor.URL()+"/"+profileNginxDeb, sha256Of(stale))
+	code, body := clientGet(t, s, scoped.token, "/apt/"+profileNginxDeb)
+	if code != http.StatusOK || body != aptProfilePool()[profileNginxDeb] {
+		t.Fatalf("scoped host's permitted base package = %d %q, want 200 and its base's listed build after repairing the wrong vendor copy", code, body)
+	}
+}

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"path"
 	"slices"
@@ -157,7 +156,10 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 		s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 		return
 	}
-	observe := func(ctx context.Context, raw []byte) { s.observeAptMirrorDists(ctx, codename, rest, raw) }
+	observe := func(ctx context.Context, raw []byte) {
+		s.observeAptMirrorDists(ctx, codename, rest, raw)
+		s.retainAptServedIndex(ctx, codename, rest, raw)
+	}
 	r = withInputObserver(r, &inputObserver{observe: observe})
 	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 }
@@ -218,15 +220,17 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 	// mirrored .deb after the first was served with nothing in the trail
 	// saying the cache answered it.
 	//
-	// The profile's refusal is judged first: it is a verdict on this request
-	// whatever the bytes are, and a paragraph repair run for a host that may
-	// not have the path would answer it with the repair's outcome instead.
+	// The profile judges the cached object only once admit has said it is
+	// the build this request would be served. A copy admit rejects is
+	// repaired, and the origin of bytes about to be removed says nothing
+	// about the build that replaces them; serveAptPoolListed authorizes that
+	// one against its paragraph's codename before anything is removed.
 	serveHit := func(admit func(cachedObject) bool) {
 		s.serveCacheHitIf(w, r, store, key, true, func(obj cachedObject) bool {
-			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
+			if !admit(obj) {
 				return false
 			}
-			if !admit(obj) {
+			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
 				return false
 			}
 			return s.aptMirrorHitGate(w, r, poolPath)
@@ -237,7 +241,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 	}
 
 	if want != nil {
-		s.serveAptPoolListed(w, r, store, key, poolPath, name, *want, serveHit, refuse)
+		s.serveAptPoolListed(w, r, store, key, poolPath, name, *want, serveHit, refused, refuse)
 		return
 	}
 
@@ -290,24 +294,30 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 // serveAptPoolListed serves a pool object a Packages paragraph names, and
 // only ever the build that paragraph lists.
 //
-// The object is opened and its pin read under the lock every repair and fill
-// of this key takes, and the lock is released only once the handle is open,
-// before any byte is streamed. A pin read outside it can belong to a
-// replacement that landed after the open, so a handle on the rejected build
-// would be served under the listed build's pin. The opened handle's length is
-// held to the paragraph's Size as well, since the pin records a digest and no
-// length. Holding the lock for the open alone keeps concurrent hits on one
-// cached .deb from queueing behind each other's transfers. Anything else (no
-// copy, no pin, another pin, another length) is settled under the same lock,
-// so a request that waited behind a fill judges what that fill left against
-// its own paragraph.
-func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza, serveHit func(admit func(cachedObject) bool), refuse func(base string) bool) {
+// The object is opened and judged under the lock every repair and fill of this
+// key takes, and the lock is released only once the handle is admitted, before
+// any byte is streamed. The handle is admitted on the SHA256 of the object it
+// is open on (aptOpenedDigest), its length and this process's pin all equaling
+// the paragraph's. The pin alone is not evidence: it belongs to the key, and a
+// bodega sharing the store with its own checksum database can replace the
+// object without touching it. Holding the lock for the open alone keeps
+// concurrent hits on one cached .deb from queueing behind each other's
+// transfers. Anything else (no copy, no pin, another digest, another length)
+// is settled under the same lock, so a request that waited behind a fill
+// judges what that fill left against its own paragraph.
+//
+// A copy that is not the listed build is repaired, and the profile is asked
+// about the build the repair would fetch: when every root of the paragraph's
+// codename is one the host's profile refuses, the request is refused before
+// anything is removed.
+func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza, serveHit func(admit func(cachedObject) bool), refused map[string][]string, refuse func(base string) bool) {
 	var once sync.Once
 	locked := s.aptMirror.lock(key)
 	release := func() { once.Do(locked) }
 	defer release()
 	listed := func(obj cachedObject) bool {
-		return want.sizeMatches(obj.id.Size) && s.aptPinned(r.Context(), key) == want.sha256
+		return want.sizeMatches(obj.id.Size) && s.aptPinned(r.Context(), key) == want.sha256 &&
+			s.aptOpenedDigest(r.Context(), key, obj) == want.sha256
 	}
 
 	if s.aptCached(r.Context(), store, key, true) != nil {
@@ -325,6 +335,11 @@ func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, stor
 		}
 	}
 
+	roots := s.aptCodenameRoots(want.codename)
+	if len(refused) > 0 && len(roots) > 0 && !slices.ContainsFunc(roots, func(root string) bool { return len(refused[root]) == 0 }) {
+		refuse(roots[0])
+		return
+	}
 	cached, f := s.aptSettleListedCache(r.Context(), store, key, poolPath, name, want)
 	if f != nil {
 		f.write(w, r)
@@ -345,7 +360,7 @@ func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, stor
 		})
 		return
 	}
-	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, s.aptCodenameRoots(want.codename))
+	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, roots)
 	if !ok {
 		return
 	}
@@ -378,11 +393,14 @@ func (s *Server) aptPinned(ctx context.Context, key string) string {
 // when the cached copy is the paragraph's build and pinned as such, and false
 // when there is no copy and no disagreeing pin, so a fetch may run.
 //
-// A copy with no pin is hashed rather than trusted: a blank pin is what an
-// operator's checksum clear leaves, and it says nothing about the bytes. A
-// copy that disagrees is deleted before its pin is cleared, and a failed
-// delete refuses the request and keeps the pin, because the pin is what makes
-// the next request try the repair again.
+// A copy is kept only on the digest of its own bytes, read here, whether its
+// pin is blank or already the listed one: a blank pin is what an operator's
+// checksum clear leaves, and a matching pin is this process's record for the
+// key, which another bodega sharing the store does not update when it
+// replaces the object. A copy whose pin names another build is dropped
+// unread. A copy that disagrees is deleted before its pin is cleared, and a
+// failed delete refuses the request and keeps the pin, because the pin is
+// what makes the next request try the repair again.
 func (s *Server) aptSettleListedCache(ctx context.Context, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza) (bool, *refusal) {
 	if s.auditDB == nil || store == nil {
 		return s.aptCached(ctx, store, key, true) != nil, nil
@@ -405,23 +423,23 @@ func (s *Server) aptSettleListedCache(ctx context.Context, store storage.ObjectS
 	}
 	dropped := false
 	if info != nil && info.Exists {
-		if pinned == want.sha256 && want.sizeMatches(info.Size) {
-			return true, nil
-		}
 		stored, storedSize := pinned, info.Size
-		if pinned == "" {
-			sum, size, err := aptStoredDigest(ctx, store, key)
+		if pinned == "" || pinned == want.sha256 {
+			id, sum, err := identifyObject(ctx, store, key)
 			if err != nil {
-				return false, fail("hash the unpinned cached object", err)
+				return false, fail("hash the cached object", err)
 			}
-			if sum == want.sha256 && want.sizeMatches(size) {
-				pkgType, pkgName, pkgVersion := manifest.ParseKey(key)
-				if err := s.auditDB.StoreChecksum(ctx, key, pkgType, pkgName, pkgVersion, "sha256", sum, "computed"); err != nil {
-					return false, fail("pin the unpinned cached object", err)
+			if sum == want.sha256 && want.sizeMatches(id.Size) {
+				if pinned == "" {
+					pkgType, pkgName, pkgVersion := manifest.ParseKey(key)
+					if err := s.auditDB.StoreChecksum(ctx, key, pkgType, pkgName, pkgVersion, "sha256", sum, "computed"); err != nil {
+						return false, fail("pin the unpinned cached object", err)
+					}
 				}
+				s.aptMeasured.put(key, id, sum)
 				return true, nil
 			}
-			stored, storedSize = sum, size
+			stored, storedSize = sum, id.Size
 		}
 		s.logger.Warn("a cached .deb is not the build the Packages paragraph naming its path lists, so bodega drops the object and its pin and fetches it again",
 			"key", key, "cached", stored, "cached_size", storedSize, "pinned", pinned,
@@ -452,22 +470,77 @@ func (s *Server) aptRepairRefusal(ctx context.Context, key, poolPath, name strin
 	return f
 }
 
-// aptStoredDigest is the SHA256 and size of the object stored at key.
-func aptStoredDigest(ctx context.Context, store storage.ObjectStore, key string) (string, int64, error) {
-	res, err := store.GetStream(ctx, key)
+// aptMeasuredMax bounds aptMeasuredDigests. Past it the map is dropped whole,
+// as aptRouteCache is, and each cached .deb costs one more read on its next
+// hit.
+const aptMeasuredMax = 65536
+
+// aptMeasuredDigest is the SHA256 bodega read off one stored object, and the
+// identity the store gave that object on the read.
+type aptMeasuredDigest struct {
+	id     audit.ObjectIdentity
+	sha256 string
+}
+
+// aptMeasuredDigests remembers what each cached pool object hashed to, so a
+// hit on an object bodega has already read costs no second read. An entry
+// answers only for the identity it was measured under: a replacement, by this
+// process or another sharing the store, is a different identity and is read
+// again.
+type aptMeasuredDigests struct {
+	mu   sync.Mutex
+	byID map[string]aptMeasuredDigest
+}
+
+func (m *aptMeasuredDigests) get(key string, id audit.ObjectIdentity) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.byID[key]
+	if !ok || e.id != id {
+		return "", false
+	}
+	return e.sha256, true
+}
+
+func (m *aptMeasuredDigests) put(key string, id audit.ObjectIdentity, sum string) {
+	if !id.Known() {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.byID == nil || len(m.byID) >= aptMeasuredMax {
+		m.byID = make(map[string]aptMeasuredDigest, aptMeasuredMax/8)
+	}
+	m.byID[key] = aptMeasuredDigest{id: id, sha256: sum}
+}
+
+// aptOpenedDigest is the SHA256 of the object obj was opened on, or "" when
+// bodega cannot establish it.
+//
+// A digest measured earlier answers when the store reports the same identity
+// for this open. Otherwise the object is read through a second handle, and
+// that read counts only when the store reports the same identity for it as
+// for obj: a second handle onto a replacement would certify bytes this
+// request is not about to send. An object the store reports no identity for
+// cannot be tied to a read and is never admitted on one.
+func (s *Server) aptOpenedDigest(ctx context.Context, key string, obj cachedObject) string {
+	if obj.store == nil || !obj.id.Known() {
+		return ""
+	}
+	if sum, ok := s.aptMeasured.get(key, obj.id); ok {
+		return sum
+	}
+	id, sum, err := identifyObject(context.WithoutCancel(ctx), obj.store, key)
 	if err != nil {
-		return "", 0, err
+		s.logFor(ctx).Warn("a cached .deb could not be read back to check it against its Packages paragraph, so it is repaired rather than served",
+			"key", key, "error", err)
+		return ""
 	}
-	if res == nil {
-		return "", 0, fmt.Errorf("%s vanished while being read", key)
+	if id != obj.id {
+		return ""
 	}
-	defer func() { _ = res.Body.Close() }()
-	h := sha256.New()
-	n, err := io.Copy(h, res.Body)
-	if err != nil {
-		return "", 0, err
-	}
-	return hex.EncodeToString(h.Sum(nil)), n, nil
+	s.aptMeasured.put(key, id, sum)
+	return sum
 }
 
 // aptCodenameRoots is the roots one mirrored codename is configured with, in
@@ -850,9 +923,10 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 }
 
 // buildAptPoolIndexFrom is buildAptPoolIndex with the index it replaces. A
-// codename this build cannot read keeps the paragraphs prev read for it: a
-// failed read does not make a path unnamed, and treating it as unnamed would
-// pin whatever build the probe reached first.
+// codename this build cannot read keeps the paragraphs prev read for it, and
+// those of the Packages files clients were served for it: a failed read does
+// not make a path unnamed, and treating it as unnamed would pin whatever build
+// the probe reached first.
 func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, prev *aptPoolIndex) *aptPoolIndex {
 	idx := &aptPoolIndex{ident: s.aptPoolIndexIdent(codenames), byKey: map[string]aptPoolStanza{},
 		shadow: map[string][]aptPoolStanza{}, conflicts: map[string]aptPoolConflict{}, archives: map[string]string{},
@@ -865,7 +939,9 @@ func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, 
 		idx.archives[c] = s.cfg.AptArchiveOf(c)
 		if err := s.indexAptPool(ctx, c, idx, prev, reads); err != nil {
 			idx.failed = append(idx.failed, err.Error())
-			idx.carry(prev, c)
+			s.aptServed.carryInto(idx, prev, c)
+		} else {
+			s.aptServed.forget(c, idx.at)
 		}
 	}
 	if len(idx.failed) > 0 {
@@ -933,26 +1009,13 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *a
 			}
 			triple := codename + "/" + comp.name + "/" + arch
 			if read.notPublished {
-				if prev != nil && prev.indexed[triple] {
+				if (prev != nil && prev.indexed[triple]) || s.aptServed.indexed(codename, archive, triple) {
 					vanished = append(vanished, triple)
 				}
 				continue
 			}
 			idx.indexed[triple] = true
-			err = deb822.ParseStreamRaw(bytes.NewReader(read.body), func(_ []byte, fields map[string]string) error {
-				filename := strings.TrimSpace(fields["Filename"])
-				if filename == "" {
-					return nil
-				}
-				size, perr := strconv.ParseInt(strings.TrimSpace(fields["Size"]), 10, 64)
-				if perr != nil {
-					size = -1
-				}
-				idx.add(manifest.AptArchiveKey(archive, filename), aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields),
-					sha256: strings.ToLower(strings.TrimSpace(fields["SHA256"])), size: size, codename: codename})
-				return nil
-			})
-			if err != nil {
+			if err := aptPoolStanzas(read.body, archive, codename, idx.add); err != nil {
 				return fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
 			}
 		}
@@ -961,6 +1024,215 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *a
 		return fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
 	}
 	return nil
+}
+
+// aptPoolStanzas hands add each paragraph of one decompressed Packages file of
+// codename that names a Filename, keyed as an object of archive. A parse break
+// returns the error after the paragraphs before it.
+func aptPoolStanzas(body []byte, archive, codename string, add func(key string, st aptPoolStanza)) error {
+	return deb822.ParseStreamRaw(bytes.NewReader(body), func(_ []byte, fields map[string]string) error {
+		filename := strings.TrimSpace(fields["Filename"])
+		if filename == "" {
+			return nil
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(fields["Size"]), 10, 64)
+		if err != nil {
+			size = -1
+		}
+		add(manifest.AptArchiveKey(archive, filename), aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields),
+			sha256: strings.ToLower(strings.TrimSpace(fields["SHA256"])), size: size, codename: codename})
+		return nil
+	})
+}
+
+// aptServedIndexes is what each listed Packages file a client was served
+// said, per codename and component/arch, for the pool index to fall back on.
+//
+// apt reads Release and Packages before it asks for a single .deb, and from
+// then on it expects the builds those paragraphs list. The pool index reads
+// the archive on its own schedule, so the first pool request after
+// `apt update` can be the first build, and that build can fail; without this
+// the paths apt was just told about would be judged as named by nothing.
+//
+// It has its own lock because the client read that fills it can run while the
+// pool index builds, and the builder's lock is held across that build.
+type aptServedIndexes struct {
+	mu         sync.Mutex
+	byCodename map[string]*aptServedCodename
+}
+
+// aptServedReleases is how many served Releases of one codename a Packages
+// file is checked against: the newest, and the one before it, which a client
+// that read its Release just ahead of an archive update still fetches against.
+const aptServedReleases = 2
+
+// aptServedCodename is one codename's served paragraphs: the archive they
+// were keyed under, when the newest of them was read, per triple
+// (codename/component/arch) the paragraphs of the last file served for it,
+// and the Packages paths the newest served Releases list, by SHA256.
+type aptServedCodename struct {
+	archive  string
+	at       time.Time
+	triples  map[string]map[string]aptPoolStanza
+	releases []map[string]string
+}
+
+// entry is codename's record under archive, created or reset as needed. The
+// caller holds mu.
+func (sv *aptServedIndexes) entry(codename, archive string) *aptServedCodename {
+	if sv.byCodename == nil {
+		sv.byCodename = map[string]*aptServedCodename{}
+	}
+	c := sv.byCodename[codename]
+	if c == nil || c.archive != archive {
+		c = &aptServedCodename{archive: archive, triples: map[string]map[string]aptPoolStanza{}}
+		sv.byCodename[codename] = c
+	}
+	return c
+}
+
+// recordRelease keeps the Packages paths a Release served for codename lists,
+// by SHA256.
+func (sv *aptServedIndexes) recordRelease(codename, archive string, byDigest map[string]string) {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	c := sv.entry(codename, archive)
+	c.releases = append(c.releases, byDigest)
+	if len(c.releases) > aptServedReleases {
+		c.releases = slices.Clone(c.releases[len(c.releases)-aptServedReleases:])
+	}
+}
+
+// releasePath is the Packages path a served Release of codename lists with
+// SHA256 sum, newest first, or "" when none does.
+func (sv *aptServedIndexes) releasePath(codename, archive, sum string) string {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	c := sv.byCodename[codename]
+	if c == nil || c.archive != archive {
+		return ""
+	}
+	for i := len(c.releases) - 1; i >= 0; i-- {
+		if rel := c.releases[i][sum]; rel != "" {
+			return rel
+		}
+	}
+	return ""
+}
+
+// record replaces what triple of codename last said with stanzas.
+func (sv *aptServedIndexes) record(codename, archive, triple string, stanzas map[string]aptPoolStanza, at time.Time) {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	c := sv.entry(codename, archive)
+	c.triples[triple] = stanzas
+	if at.After(c.at) {
+		c.at = at
+	}
+}
+
+// indexed reports whether a file served for triple of codename, under
+// archive, named its paragraphs.
+func (sv *aptServedIndexes) indexed(codename, archive, triple string) bool {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	c := sv.byCodename[codename]
+	return c != nil && c.archive == archive && c.triples[triple] != nil
+}
+
+// forget drops the paragraphs served for codename before at, which a build
+// that read every index of codename at at has superseded. The served Releases
+// stay, since a client may still fetch a Packages file one of them lists.
+func (sv *aptServedIndexes) forget(codename string, at time.Time) {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	if c := sv.byCodename[codename]; c != nil && c.at.Before(at) {
+		c.triples = map[string]map[string]aptPoolStanza{}
+		c.at = time.Time{}
+	}
+}
+
+// carryInto adds to idx the paragraphs of codename that prev and the served
+// files hold, for a build that could not read codename. The newer of the two
+// answers for a path both name; each adds the triples only it read.
+func (sv *aptServedIndexes) carryInto(idx, prev *aptPoolIndex, codename string) {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	c := sv.byCodename[codename]
+	if c == nil || c.archive != idx.archives[codename] {
+		idx.carry(prev, codename)
+		return
+	}
+	servedFirst := prev == nil || prev.archives[codename] != idx.archives[codename] || c.at.After(prev.at)
+	if !servedFirst {
+		idx.carry(prev, codename)
+	}
+	for triple, stanzas := range c.triples {
+		if !servedFirst && prev.indexed[triple] {
+			continue
+		}
+		idx.indexed[triple] = true
+		for k, st := range stanzas {
+			idx.add(k, st)
+		}
+	}
+	if servedFirst {
+		idx.carry(prev, codename)
+	}
+}
+
+// retainAptServedIndex keeps what a client was served from a mirrored
+// codename's dists/ tree for the pool index to fall back on: the Packages
+// digests a Release or InRelease lists, and the paragraphs of a Packages file
+// one of those Releases lists, read whole. A Packages file no served Release
+// lists, nor a Release the age gate recorded, is not authority and is skipped,
+// as is one that does not parse whole.
+func (s *Server) retainAptServedIndex(ctx context.Context, codename, rest string, raw []byte) {
+	archive := s.cfg.AptArchiveOf(codename)
+	if rest == "Release" || rest == "InRelease" {
+		release, err := deb822.ParseSingle(aptClearsignedBody(raw))
+		if err != nil {
+			return
+		}
+		byDigest := map[string]string{}
+		for rel, sum := range aptReleaseDigests(release) {
+			if _, _, ok := aptPackagesIndexPath(rel); ok && !aptByHash(rel) {
+				byDigest[strings.ToLower(sum)] = rel
+			}
+		}
+		s.aptServed.recordRelease(codename, archive, byDigest)
+		return
+	}
+	if _, _, ok := aptPackagesIndexPath(rest); !ok {
+		return
+	}
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+	rel := s.aptServed.releasePath(codename, archive, digest)
+	if rel == "" && s.auditDB != nil {
+		if snap, listed, err := s.auditDB.LookupAptIndex(context.WithoutCancel(ctx), codename, digest); err == nil && listed {
+			rel = snap.Path
+		}
+	}
+	component, arch, ok := aptPackagesIndexPath(rel)
+	if !ok {
+		return
+	}
+	body, err := aptDecompressSniffed(codename, rest, raw)
+	if err != nil {
+		return
+	}
+	stanzas := map[string]aptPoolStanza{}
+	if err := aptPoolStanzas(body, archive, codename, func(key string, st aptPoolStanza) {
+		if _, seen := stanzas[key]; !seen {
+			stanzas[key] = st
+		}
+	}); err != nil {
+		s.logger.Warn("a mirrored Packages file served to a client does not parse, so its paragraphs are not kept for the pool index to fall back on",
+			"codename", codename, "index", rest, "error", err)
+		return
+	}
+	s.aptServed.record(codename, archive, codename+"/"+component+"/"+arch, stanzas, time.Now())
 }
 
 // The age gate's record of a mirrored codename is built from observations: a

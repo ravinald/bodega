@@ -269,6 +269,13 @@ type Server struct {
 	// which is where the OSV gate reads the epoch the pool filename drops and
 	// where a pool fetch learns the root, size and SHA256 it must have.
 	aptPoolIdx aptPoolIndexCache
+	// aptServed holds the paragraphs of every listed Packages file a client
+	// was served, so a pool index build that cannot read an index still knows
+	// what apt was told to expect.
+	aptServed aptServedIndexes
+	// aptMeasured holds the SHA256 bodega read off each cached pool object,
+	// against the store's identity for that object.
+	aptMeasured aptMeasuredDigests
 
 	// reloadSignals, when set, is a SIGHUP channel the caller registered
 	// before New. Start otherwise registers its own.
