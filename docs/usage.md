@@ -473,6 +473,8 @@ With the hide in place:
 
 A codename with no hidden stanza in it stays proxied byte-for-byte. Removing the last hide in a group returns it to the archive's own `InRelease` at the next rebuild, and the host's stanza has to go back to the distro keyring with it.
 
+**Rebuild cost while a hide is active.** The first rebuild after a hide is added or removed, or after the archive publishes a new `Packages`, refilters the indexes that change reaches: every index of every rewritten group for a hide change, since each one is filtered against the whole hide set, and only the changed index for an upstream change. Every other rebuild, the hourly one and the one each profile write triggers, reuses the filtered `Packages`, its gzip and both digests from the previous rebuild, so it costs fetching and parsing each `Release`, writing the new one and signing it. An index is reused only while the `SHA256` its upstream `Release` publishes is unchanged. A group with no hidden stanza in it keeps nothing to reuse, so a hide set that reaches one group still has every other mirrored group read and filtered at each rebuild to confirm it drops nothing.
+
 With no apt signing key installed, bodega does not rewrite the index, because an unsigned rewrite would need `[trusted=yes]` on every host. The pool still refuses the version, and the server logs an error saying the index still lists it. Run `bodega apt key generate` and reload.
 
 ### `bodega pkg freeze TYPE NAME`
