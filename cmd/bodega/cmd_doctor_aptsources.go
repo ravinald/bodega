@@ -6,8 +6,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -159,4 +162,145 @@ func aptUpdateAgainst(sources string) []string {
 		"-o", "Dir::Etc::SourceParts=-",
 		"-o", "APT::Get::List-Cleanup=0",
 		"-o", "APT::Update::Error-Mode=any"}
+}
+
+// aptServedRoots asks the server where it serves each apt suite: the URI of
+// the block /api/v1/status renders for it. A codename in an apt_archives
+// archive is served under /apt/{archive}/ and nowhere else, which only the
+// server's config knows.
+func aptServedRoots(client *Client) (map[string]string, error) {
+	var status struct {
+		Apt struct {
+			Sources []aptsources.Sources `json:"sources"`
+		} `json:"apt"`
+	}
+	if err := getJSON(client, "/api/v1/status", &status); err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, src := range status.Apt.Sources {
+		if src.Suite != "" && src.URI != "" {
+			out[src.Suite] = src.URI
+		}
+	}
+	return out, nil
+}
+
+// aptRootPath is the path of an apt URI under bodega's apt tree, without a
+// trailing slash: /apt, or /apt/{archive}. ok is false for any other path.
+func aptRootPath(uri string) (string, bool) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", false
+	}
+	p := strings.TrimRight(u.Path, "/")
+	return p, p == "/apt" || strings.HasPrefix(p, "/apt/")
+}
+
+// rootFinding folds into the apt-sources row whether each source naming
+// bodega reads its suites from the root bodega serves them under. A codename
+// moved into an apt_archives archive answers 404 at /apt/dists/, so a host
+// whose sources predate the move stops receiving that suite at the next
+// "apt-get update". Any root under /apt/ counts as bodega's; only a root
+// that differs from the one served is reported.
+//
+// served is asked only when a source names bodega, so a host that reads
+// nothing from bodega makes no request. A failure to ask leaves the row
+// unable to say, which an OK row reports as a skip.
+func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() (map[string]string, error)) host.Finding {
+	if h.goos != "linux" || f.Check != "apt-sources" || (f.Status != host.StatusOK && f.Status != host.StatusWarn) {
+		return f
+	}
+	b, err := url.Parse(base)
+	if err != nil || b.Host == "" {
+		return f
+	}
+	entries, err := clientconf.LoadAptSources(h.root)
+	if err != nil {
+		return f
+	}
+	defaultPort := map[string]int{"https": 443, "http": 80}
+	wantPort := defaultPort[b.Scheme]
+	if p, err := strconv.Atoi(b.Port()); err == nil {
+		wantPort = p
+	}
+	type bodegaSource struct {
+		entry clientconf.AptSourceEntry
+		uri   string
+		root  string
+	}
+	var ours []bodegaSource
+	for _, e := range entries {
+		for _, uri := range e.URIs {
+			access, hostname, port := clientconf.AptURIHost(uri)
+			if port == 0 {
+				port = defaultPort[access]
+			}
+			root, ok := aptRootPath(uri)
+			if ok && strings.EqualFold(hostname, b.Hostname()) && port == wantPort {
+				ours = append(ours, bodegaSource{entry: e, uri: uri, root: root})
+			}
+		}
+	}
+	if len(ours) == 0 {
+		return f
+	}
+	roots, err := served()
+	if err != nil {
+		if f.Status == host.StatusOK {
+			f.Status = host.StatusSkip
+			f.Detail += "; whether each apt source naming bodega reads its suites from the root bodega serves them under is unchecked: " + err.Error()
+			f.Remediation = "pass --token with a read-scope token (or bind this host's address with bodega identity bind cidr), and --url naming the server, then re-run doctor"
+		}
+		return f
+	}
+	var moved, fixes []string
+	for _, o := range ours {
+		for _, suite := range o.entry.Suites {
+			want, ok := roots[suite]
+			if !ok {
+				continue
+			}
+			if wantRoot, _ := aptRootPath(want); wantRoot == o.root {
+				continue
+			}
+			file := strings.TrimPrefix(o.entry.File, strings.TrimRight(h.root, "/"))
+			moved = append(moved, fmt.Sprintf("%s entry %d reads %s from %s, which bodega serves at %s and answers 404 for there", file, o.entry.Entry, suite, o.uri, want))
+			// A vendor archive's own file is rewritten by naming the archive;
+			// --suite there would make the vendor codename the host's main
+			// stanza.
+			selects := "--suite " + o.entry.Suites[0]
+			if file == clientconf.AptArchiveSourcesPath(o.entry.Suites[0]) {
+				selects = "--suite <this host's codename> --archive " + o.entry.Suites[0]
+			}
+			fix := fmt.Sprintf("bodega doctor --configure apt %s --apply --url %s", selects, strings.TrimRight(base, "/"))
+			if !slices.Contains(fixes, fix) {
+				fixes = append(fixes, fix)
+			}
+		}
+	}
+	if len(moved) == 0 {
+		return f
+	}
+	detail := "apt sources name a root bodega no longer serves their suite under: " + strings.Join(moved, "; ")
+	remedy := "rewrite bodega's sources from the server's plan: " + strings.Join(fixes, "; ")
+	if f.Status == host.StatusWarn {
+		f.Detail, f.Remediation = f.Detail+"; "+detail, f.Remediation+"; "+remedy
+	} else {
+		f.Status, f.Detail, f.Remediation = host.StatusWarn, detail, remedy
+	}
+	return f
+}
+
+// aptServedRootsAt is rootFinding's served for the server at base, bounded
+// so a server that does not answer cannot hold the report.
+func aptServedRootsAt(base, token string, allowPlaintext bool) func() (map[string]string, error) {
+	return func() (map[string]string, error) {
+		client, err := NewClient(base, token, allowPlaintext)
+		if err != nil {
+			return nil, err
+		}
+		client.HTTP.Timeout = 10 * time.Second
+		return aptServedRoots(client)
+	}
 }

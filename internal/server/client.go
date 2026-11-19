@@ -585,10 +585,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and this server mirrors %s with no filtered codename for the profile: the rebuild withdrew it, and the server log names why (a codename another profile also derives, or an upstream read that failed). A host reading %s alone would stop receiving the updates and security fixes those pockets publish",
 				h.profile.Name(), base, strings.Join(missing, ", "), strings.Join(suites, " ")))
 		}
-		one := s.aptSourcesState(r)
-		one.Suites = suites
-		one.Components = s.aptServedComponents(suites)
-		rendered := aptsources.Render(one)
+		rendered := s.aptStanzas(r, suites, false)
 		src = &rendered
 	} else {
 		filtered := map[string]bool{}
@@ -650,14 +647,16 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 	return append(out, s.planAptArchives(r, h, aptStanzaSuites(src.Deb822))...)
 }
 
-// aptStanzaSuites reads the Suites: line back out of a rendered stanza.
+// aptStanzaSuites reads the suites back out of a rendered block, from every
+// stanza's Suites: line.
 func aptStanzaSuites(deb822 string) []string {
+	var out []string
 	for _, line := range strings.Split(deb822, "\n") {
 		if rest, ok := strings.CutPrefix(line, "Suites: "); ok {
-			return strings.Fields(rest)
+			out = append(out, strings.Fields(rest)...)
 		}
 	}
-	return nil
+	return out
 }
 
 // planAptArchives renders each vendor archive the host named: its stanza,
@@ -694,7 +693,7 @@ func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []st
 }
 
 func (s *Server) aptArchiveFile(h *clientHost, codename string) clientconf.File {
-	return clientconf.AptArchive(h.base, codename, s.cfg.AptComponentsFor(codename))
+	return clientconf.AptArchiveIn(h.base, s.cfg.AptArchiveOf(codename), codename, s.cfg.AptComponentsFor(codename))
 }
 
 // aptPocketSuffixes are the pockets a mirrored Ubuntu base carries, in the
@@ -728,33 +727,55 @@ func (s *Server) aptMirroredPockets(base string) []string {
 	return out
 }
 
-// aptPocketStanza renders a mirrored base and its pockets as one stanza. The
-// Components: line is the union of what each suite's upstreams declare, for
-// the reason AptComponentsFor takes a union across hosts: apt reads one line
-// for every suite on the stanza, and a component any of them publishes is one
-// apt may request.
-//
-// A group the rebuild rewrote to drop a hidden version is rewritten whole
-// (apt_hide.go), so the stanza is bodega-signed and names what the generated
-// Releases declare.
+// aptPocketStanza renders a mirrored base and its pockets as one choice, in
+// as few stanzas as aptStanzas allows. A group the rebuild rewrote to drop a
+// hidden version is rewritten whole (apt_hide.go), so its stanzas are
+// bodega-signed and each suite names what its generated Release declares.
 func (s *Server) aptPocketStanza(r *http.Request, base string, pockets []string) aptsources.Sources {
-	one := s.aptSourcesState(r)
-	one.Suites = append([]string{base}, pockets...)
-	if s.aptMirrorRewritten(base) {
-		one.Components = s.aptServedComponents(one.Suites)
-		return aptsources.Render(one)
+	return s.aptStanzas(r, append([]string{base}, pockets...), !s.aptMirrorRewritten(base))
+}
+
+// aptStanzas renders suites as one sources block: a stanza per archive root
+// and distinct Components: line, the suites in the order they are named.
+//
+// apt reads a stanza's one URIs: and one Components: line for every suite on
+// it. A suite under another archive's root answers 404 at the root the stanza
+// names, and a component a suite does not publish stops "apt-get update" on
+// the Packages file it cannot fetch, which is what a hide did to a pocket
+// whose apt_upstreams entry lists fewer components than its base (#337): the
+// rebuilt Release declares that pocket's own list, not the union.
+//
+// A mirrored suite's components are what its upstreams declare; a generated
+// one's are what its generated Release declares.
+func (s *Server) aptStanzas(r *http.Request, suites []string, mirrored bool) aptsources.Sources {
+	type group struct {
+		archive    string
+		components []string
+		suites     []string
 	}
-	one.Mirrored = true
-	seen := map[string]bool{}
-	for _, suite := range one.Suites {
-		for _, c := range aptsources.MirroredComponentList(s.cfg.AptComponentsFor(suite)) {
-			if !seen[c] {
-				seen[c] = true
-				one.Components = append(one.Components, c)
-			}
+	var groups []*group
+	for _, suite := range suites {
+		archive := s.cfg.AptArchiveOf(suite)
+		components := s.aptServedComponents([]string{suite})
+		if mirrored {
+			components = aptsources.MirroredComponentList(s.cfg.AptComponentsFor(suite))
 		}
+		i := slices.IndexFunc(groups, func(g *group) bool {
+			return g.archive == archive && componentsKey(g.components) == componentsKey(components)
+		})
+		if i < 0 {
+			groups = append(groups, &group{archive: archive, components: components})
+			i = len(groups) - 1
+		}
+		groups[i].suites = append(groups[i].suites, suite)
 	}
-	return aptsources.Render(one)
+	parts := make([]aptsources.Sources, len(groups))
+	for i, g := range groups {
+		one := s.aptSourcesState(r)
+		one.Suites, one.Components, one.Mirrored, one.Archive = g.suites, g.components, mirrored, g.archive
+		parts[i] = aptsources.Render(one)
+	}
+	return aptsources.Join(parts)
 }
 
 // planRpm renders bodega.repo for the repositories this host's distribution

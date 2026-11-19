@@ -15,6 +15,7 @@ package aptsources
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -133,6 +134,12 @@ type State struct {
 	// when it is set: bodega's key signs what bodega generates and nothing
 	// else, so a signing instance still forwards upstream's signature here.
 	Mirrored bool
+
+	// Archive is the named archive (apt_archives) these suites belong to, and
+	// "" for the default one. A named archive is served under its own root,
+	// /apt/{archive}/, and a stanza naming its codenames at /apt/ reaches a
+	// server that answers 404 for every one of them.
+	Archive string
 }
 
 // Sources is one rendered client configuration. The JSON tags are the wire
@@ -143,6 +150,7 @@ type Sources struct {
 	Mirrored bool   `json:"mirrored,omitempty"`
 	Suite    string `json:"suite"`
 	URI      string `json:"uri"`
+	Archive  string `json:"archive,omitempty"`
 
 	// Components is the rendered Components: line, space-separated, so a
 	// consumer reading the JSON does not have to parse it back out of Deb822.
@@ -199,6 +207,9 @@ func MirroredComponentList(named []string) []string {
 // rendered alongside for the panes that have room for a single line.
 func Render(st State) Sources {
 	uri := st.BaseURL() + "/apt/"
+	if st.Archive != "" {
+		uri += st.Archive + "/"
+	}
 
 	suites := make([]string, 0, len(st.Suites))
 	for _, s := range st.Suites {
@@ -225,7 +236,7 @@ func Render(st State) Sources {
 		"Components: " + components,
 	}
 
-	out := Sources{Signed: st.Signed, Suite: suites[0], URI: uri, Mirrored: st.Mirrored, Components: components}
+	out := Sources{Signed: st.Signed, Suite: suites[0], URI: uri, Archive: st.Archive, Mirrored: st.Mirrored, Components: components}
 	switch {
 	case st.Mirrored:
 		// No trust option at all. apt falls back to its configured trusted
@@ -249,5 +260,34 @@ func Render(st State) Sources {
 		out.Notes = append(out.Notes, TrustStoreNote)
 	}
 	out.Deb822 = strings.Join(stanza, "\n")
+	return out
+}
+
+// Join folds stanzas rendered for one choice into one sources block: the
+// deb822 stanzas separated by a blank line, as a .sources file holds several,
+// the one-line entries one per line, and each note once. The rest is the
+// first stanza's, which names the suite the choice is known by.
+//
+// One choice is several stanzas when its suites differ in archive root or in
+// Components: apt reads one URIs: and one Components: line for every suite on
+// a stanza, and fetches each component of each suite from that root.
+func Join(parts []Sources) Sources {
+	if len(parts) == 0 {
+		return Sources{}
+	}
+	out := parts[0]
+	out.Notes = nil
+	stanzas := make([]string, len(parts))
+	lines := make([]string, len(parts))
+	for i, p := range parts {
+		stanzas[i], lines[i] = p.Deb822, p.OneLine
+		for _, n := range p.Notes {
+			if !slices.Contains(out.Notes, n) {
+				out.Notes = append(out.Notes, n)
+			}
+		}
+	}
+	out.Deb822 = strings.Join(stanzas, "\n\n")
+	out.OneLine = strings.Join(lines, "\n")
 	return out
 }

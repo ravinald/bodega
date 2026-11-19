@@ -27,8 +27,10 @@ type AptSourceEntry struct {
 	// the number of a stanza, each counted from 1 as apt's errors count them.
 	File  string
 	Entry int
-	// URIs are the entry's URIs as the file writes them.
-	URIs []string
+	// URIs are the entry's URIs as the file writes them, and Suites the
+	// suites it reads from each.
+	URIs   []string
+	Suites []string
 }
 
 // aptSourceTypes are the types apt's Debian system registers: debSLTypeDeb
@@ -210,7 +212,7 @@ func parseAptList(file, text string) ([]AptSourceEntry, error) {
 		case !absolute && !more:
 			return out, malformed("Component")
 		}
-		out = append(out, AptSourceEntry{File: file, Entry: n, URIs: []string{uri}})
+		out = append(out, AptSourceEntry{File: file, Entry: n, URIs: []string{uri}, Suites: []string{dist}})
 	}
 	return out, nil
 }
@@ -270,7 +272,7 @@ func parseAptDeb822(file, text string) ([]AptSourceEntry, error) {
 				}
 			}
 		}
-		out = append(out, AptSourceEntry{File: file, Entry: n, URIs: uris})
+		out = append(out, AptSourceEntry{File: file, Entry: n, URIs: uris, Suites: suites})
 		return nil
 	}
 	for i, line := range strings.Split(text, "\n") {
