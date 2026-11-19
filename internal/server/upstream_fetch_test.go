@@ -366,11 +366,11 @@ func TestObservedInputObservesAtTheReadThatCompletesTheObject(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var observed []byte
 			calls := 0
-			obs := &inputObserver{observe: func(_ context.Context, raw []byte) {
+			obs := &inputObserver{observe: func(_ context.Context, raw []byte, _ time.Time) {
 				calls++
 				observed = append([]byte(nil), raw...)
 			}}
-			in := obs.wrap(t.Context(), tc.r, tc.want)
+			in := obs.wrap(t.Context(), tc.r, tc.want, time.Now())
 			var got []byte
 			p := make([]byte, 64)
 			for {

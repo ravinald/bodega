@@ -313,3 +313,52 @@ func TestReviewB196ScopedBaseRepairsWrongVendorCache(t *testing.T) {
 		t.Fatalf("scoped host's permitted base package = %d %q, want 200 and its base's listed build after repairing the wrong vendor copy", code, body)
 	}
 }
+
+func TestReviewB196CachedMetadataReplayCannotReplaceBuiltAuthority(t *testing.T) {
+	const old = "previous distribution build"
+	archive := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: old}, map[string]string{fixtureDeb: old})
+	s := mirrorServer(t, archive)
+	readMetadata := func() {
+		t.Helper()
+		for _, rel := range []string{"Release", packagesPath + ".gz"} {
+			if code, _ := mirrorGet(t, s, "/apt/dists/"+mirroredCodename+"/"+rel); code != http.StatusOK {
+				t.Fatalf("client metadata read %s = %d", rel, code)
+			}
+		}
+	}
+	readMetadata()
+	fresh := indexedArchive(t, mirroredCodename, map[string]string{fixtureDeb: fixtureDebBody}, map[string]string{fixtureDeb: fixtureDebBody})
+	for rel, data := range fresh.objects {
+		archive.setObject(rel, data)
+	}
+	s.aptUpstreamIdx.Clear()
+	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("pool build from the newer archive = %d %q", code, body)
+	}
+	key := manifest.AptKey(fixtureDeb)
+	want, conflict := s.aptPoolParagraph(t.Context(), key)
+	if want == nil || conflict != nil || want.sha256 != sha256Of(fixtureDebBody) {
+		t.Fatal("pool index did not establish the new paragraph")
+	}
+	reads := archive.count("dists/" + mirroredCodename + "/" + packagesPath + ".gz")
+	readMetadata()
+	if got := archive.count("dists/" + mirroredCodename + "/" + packagesPath + ".gz"); got != reads {
+		t.Fatal("metadata replay must use the older cached document, not a new upstream read")
+	}
+	archive.setObject(fixtureDeb, old)
+	archive.removeObject("dists/" + mirroredCodename + "/Release")
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx.at = s.aptPoolIdx.idx.at.Add(-2 * s.aptPoolIdx.idx.ttl)
+	s.aptPoolIdx.mu.Unlock()
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusBadGateway && (code != http.StatusOK || string(body) != fixtureDebBody) {
+		t.Errorf("failed refresh after old metadata replay = %d %q, want the cached build %q from the last successful pool-index read or a 502 refusal", code, body, fixtureDebBody)
+	}
+	if pin, err := s.auditDB.GetChecksum(t.Context(), key); err != nil || (pin != nil && pin.Value != "" && pin.Value != sha256Of(fixtureDebBody)) {
+		t.Errorf("last successful pool-index digest was replaced: %+v %v", pin, err)
+	}
+	if stored, err := s.typeStore(manifest.TypeApt).Get(t.Context(), key); err != nil || (len(stored) > 0 && string(stored) != fixtureDebBody) {
+		t.Errorf("last successful pool-index build was replaced: %q %v", stored, err)
+	}
+}

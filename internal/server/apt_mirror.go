@@ -156,9 +156,9 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 		s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 		return
 	}
-	observe := func(ctx context.Context, raw []byte) {
+	observe := func(ctx context.Context, raw []byte, acquired time.Time) {
 		s.observeAptMirrorDists(ctx, codename, rest, raw)
-		s.retainAptServedIndex(ctx, codename, rest, raw)
+		s.retainAptServedIndex(ctx, codename, rest, raw, acquired)
 	}
 	r = withInputObserver(r, &inputObserver{observe: observe})
 	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
@@ -790,9 +790,34 @@ type aptPoolIndex struct {
 	// or one it carried from, read a body for. A 404 for one of them is a
 	// failed read rather than an architecture the root does not serve.
 	indexed map[string]bool
-	failed  []string
-	at      time.Time
-	ttl     time.Duration
+	// acquired is, per triple in indexed, when bodega read from upstream the
+	// Packages this index or one it carried from parsed for it. at is when
+	// the build ran, which says nothing about how old its documents were.
+	acquired map[string]time.Time
+	failed   []string
+	at       time.Time
+	ttl      time.Duration
+}
+
+// acquire records that the Packages of triple read from upstream at at went
+// into idx.
+func (idx *aptPoolIndex) acquire(triple string, at time.Time) {
+	idx.indexed[triple] = true
+	if at.After(idx.acquired[triple]) {
+		idx.acquired[triple] = at
+	}
+}
+
+// acquiredFor is when the newest Packages idx parsed for codename was read
+// from upstream, zero when it parsed none.
+func (idx *aptPoolIndex) acquiredFor(codename string) time.Time {
+	var newest time.Time
+	for triple, at := range idx.acquired {
+		if strings.HasPrefix(triple, codename+"/") && at.After(newest) {
+			newest = at
+		}
+	}
+	return newest
 }
 
 // add records one codename's paragraph for key. A path two codenames of one
@@ -822,7 +847,7 @@ func (idx *aptPoolIndex) carry(prev *aptPoolIndex, codename string) {
 	}
 	for k := range prev.indexed {
 		if strings.HasPrefix(k, codename+"/") {
-			idx.indexed[k] = true
+			idx.acquire(k, prev.acquired[k])
 		}
 	}
 	for k, first := range prev.byKey {
@@ -930,7 +955,7 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, prev *aptPoolIndex) *aptPoolIndex {
 	idx := &aptPoolIndex{ident: s.aptPoolIndexIdent(codenames), byKey: map[string]aptPoolStanza{},
 		shadow: map[string][]aptPoolStanza{}, conflicts: map[string]aptPoolConflict{}, archives: map[string]string{},
-		indexed: map[string]bool{}, at: time.Now(), ttl: s.cache.MetadataTTL}
+		indexed: map[string]bool{}, acquired: map[string]time.Time{}, at: time.Now(), ttl: s.cache.MetadataTTL}
 	if idx.ttl <= 0 {
 		idx.ttl = aptRouteTTL
 	}
@@ -941,7 +966,7 @@ func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, 
 			idx.failed = append(idx.failed, err.Error())
 			s.aptServed.carryInto(idx, prev, c)
 		} else {
-			s.aptServed.forget(c, idx.at)
+			s.aptServed.forget(c, idx)
 		}
 	}
 	if len(idx.failed) > 0 {
@@ -1014,7 +1039,7 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *a
 				}
 				continue
 			}
-			idx.indexed[triple] = true
+			idx.acquire(triple, read.at)
 			if err := aptPoolStanzas(read.body, archive, codename, idx.add); err != nil {
 				return fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
 			}
@@ -1067,14 +1092,33 @@ type aptServedIndexes struct {
 const aptServedReleases = 2
 
 // aptServedCodename is one codename's served paragraphs: the archive they
-// were keyed under, when the newest of them was read, per triple
-// (codename/component/arch) the paragraphs of the last file served for it,
-// and the Packages paths the newest served Releases list, by SHA256.
+// were keyed under, per triple (codename/component/arch) the paragraphs of the
+// newest file served for it, and the Packages paths the newest served
+// Releases list, by SHA256.
 type aptServedCodename struct {
 	archive  string
-	at       time.Time
-	triples  map[string]map[string]aptPoolStanza
+	triples  map[string]aptServedTriple
 	releases []map[string]string
+}
+
+// aptServedTriple is the paragraphs of one served Packages file and when
+// bodega read that file from upstream. A file a client was served from the
+// cache has a zero time: bodega learned nothing new about upstream by
+// delivering it, so it ranks below every read that did.
+type aptServedTriple struct {
+	stanzas map[string]aptPoolStanza
+	at      time.Time
+}
+
+// newest is when the newest Packages served for c was read from upstream.
+func (c *aptServedCodename) newest() time.Time {
+	var newest time.Time
+	for _, t := range c.triples {
+		if t.at.After(newest) {
+			newest = t.at
+		}
+	}
+	return newest
 }
 
 // entry is codename's record under archive, created or reset as needed. The
@@ -1085,7 +1129,7 @@ func (sv *aptServedIndexes) entry(codename, archive string) *aptServedCodename {
 	}
 	c := sv.byCodename[codename]
 	if c == nil || c.archive != archive {
-		c = &aptServedCodename{archive: archive, triples: map[string]map[string]aptPoolStanza{}}
+		c = &aptServedCodename{archive: archive, triples: map[string]aptServedTriple{}}
 		sv.byCodename[codename] = c
 	}
 	return c
@@ -1120,15 +1164,16 @@ func (sv *aptServedIndexes) releasePath(codename, archive, sum string) string {
 	return ""
 }
 
-// record replaces what triple of codename last said with stanzas.
+// record keeps stanzas as what triple of codename says, unless a file read
+// from upstream after at already does.
 func (sv *aptServedIndexes) record(codename, archive, triple string, stanzas map[string]aptPoolStanza, at time.Time) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	c := sv.entry(codename, archive)
-	c.triples[triple] = stanzas
-	if at.After(c.at) {
-		c.at = at
+	if held, ok := c.triples[triple]; ok && at.Before(held.at) {
+		return
 	}
+	c.triples[triple] = aptServedTriple{stanzas: stanzas, at: at}
 }
 
 // indexed reports whether a file served for triple of codename, under
@@ -1137,24 +1182,43 @@ func (sv *aptServedIndexes) indexed(codename, archive, triple string) bool {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	c := sv.byCodename[codename]
-	return c != nil && c.archive == archive && c.triples[triple] != nil
+	if c == nil || c.archive != archive {
+		return false
+	}
+	_, ok := c.triples[triple]
+	return ok
 }
 
-// forget drops the paragraphs served for codename before at, which a build
-// that read every index of codename at at has superseded. The served Releases
-// stay, since a client may still fetch a Packages file one of them lists.
-func (sv *aptServedIndexes) forget(codename string, at time.Time) {
+// forget drops the paragraphs served for codename that idx, a build that read
+// every index of codename, superseded: a triple read from upstream before idx
+// read it, or before the newest file idx read for codename where idx read no
+// file for that triple. The served Releases stay, since a client may still
+// fetch a Packages file one of them lists.
+func (sv *aptServedIndexes) forget(codename string, idx *aptPoolIndex) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
-	if c := sv.byCodename[codename]; c != nil && c.at.Before(at) {
-		c.triples = map[string]map[string]aptPoolStanza{}
-		c.at = time.Time{}
+	c := sv.byCodename[codename]
+	if c == nil {
+		return
+	}
+	newest := idx.acquiredFor(codename)
+	for triple, t := range c.triples {
+		read, ok := idx.acquired[triple]
+		if !ok {
+			read = newest
+		}
+		if t.at.Before(read) {
+			delete(c.triples, triple)
+		}
 	}
 }
 
 // carryInto adds to idx the paragraphs of codename that prev and the served
-// files hold, for a build that could not read codename. The newer of the two
-// answers for a path both name; each adds the triples only it read.
+// files hold, for a build that could not read codename. Whichever of the two
+// holds the Packages read from upstream more recently answers for a path both
+// name, prev on a tie; each adds the triples only it read. Both are ordered by
+// when bodega read upstream, never by when a cached copy was delivered, so a
+// replay of an older file cannot displace what the last pool read found.
 func (sv *aptServedIndexes) carryInto(idx, prev *aptPoolIndex, codename string) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -1163,16 +1227,16 @@ func (sv *aptServedIndexes) carryInto(idx, prev *aptPoolIndex, codename string) 
 		idx.carry(prev, codename)
 		return
 	}
-	servedFirst := prev == nil || prev.archives[codename] != idx.archives[codename] || c.at.After(prev.at)
+	servedFirst := prev == nil || prev.archives[codename] != idx.archives[codename] || c.newest().After(prev.acquiredFor(codename))
 	if !servedFirst {
 		idx.carry(prev, codename)
 	}
-	for triple, stanzas := range c.triples {
+	for triple, t := range c.triples {
 		if !servedFirst && prev.indexed[triple] {
 			continue
 		}
-		idx.indexed[triple] = true
-		for k, st := range stanzas {
+		idx.acquire(triple, t.at)
+		for k, st := range t.stanzas {
 			idx.add(k, st)
 		}
 	}
@@ -1187,7 +1251,7 @@ func (sv *aptServedIndexes) carryInto(idx, prev *aptPoolIndex, codename string) 
 // one of those Releases lists, read whole. A Packages file no served Release
 // lists, nor a Release the age gate recorded, is not authority and is skipped,
 // as is one that does not parse whole.
-func (s *Server) retainAptServedIndex(ctx context.Context, codename, rest string, raw []byte) {
+func (s *Server) retainAptServedIndex(ctx context.Context, codename, rest string, raw []byte, acquired time.Time) {
 	archive := s.cfg.AptArchiveOf(codename)
 	if rest == "Release" || rest == "InRelease" {
 		release, err := deb822.ParseSingle(aptClearsignedBody(raw))
@@ -1232,7 +1296,7 @@ func (s *Server) retainAptServedIndex(ctx context.Context, codename, rest string
 			"codename", codename, "index", rest, "error", err)
 		return
 	}
-	s.aptServed.record(codename, archive, codename+"/"+component+"/"+arch, stanzas, time.Now())
+	s.aptServed.record(codename, archive, codename+"/"+component+"/"+arch, stanzas, acquired)
 }
 
 // The age gate's record of a mirrored codename is built from observations: a

@@ -2448,7 +2448,7 @@ func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, s3Key strin
 	if want <= 0 {
 		want = -1
 	}
-	in := obs.wrap(r.Context(), result.Body, want)
+	in := obs.wrap(r.Context(), result.Body, want, time.Time{})
 	if _, err := io.Copy(w, in); err != nil {
 		_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
 	}

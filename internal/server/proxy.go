@@ -596,7 +596,7 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 		up.body = struct {
 			io.Reader
 			io.Closer
-		}{obs.wrap(ctx, up.body, up.contentLength), up.body}
+		}{obs.wrap(ctx, up.body, up.contentLength, time.Now()), up.body}
 	}
 	spool, err := s.spoolUpstream(up)
 	if err != nil {
@@ -754,8 +754,11 @@ func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstream
 // read cannot learn it from the response.
 type inputObserverCtxKey struct{}
 
+// acquired is when bodega read the object from upstream, and zero for a cached
+// object: delivering a copy observes nothing new about upstream, so a reader
+// ordering observations by it must not rank a replay above a fresh read.
 type inputObserver struct {
-	observe func(ctx context.Context, raw []byte)
+	observe func(ctx context.Context, raw []byte, acquired time.Time)
 }
 
 // fillHooks is what a caller holding a key's fill lock tells the proxy about
@@ -799,9 +802,9 @@ func inputObserverFor(ctx context.Context) *inputObserver {
 // wrap returns body as a reader that reports the whole object to the observer
 // when it is read to its end. want is the declared length, negative when
 // nobody declared one.
-func (o *inputObserver) wrap(ctx context.Context, body io.Reader, want int64) *observedInput {
+func (o *inputObserver) wrap(ctx context.Context, body io.Reader, want int64, acquired time.Time) *observedInput {
 	ctx = context.WithoutCancel(ctx)
-	return &observedInput{r: body, want: want, observe: func(raw []byte) { o.observe(ctx, raw) }}
+	return &observedInput{r: body, want: want, observe: func(raw []byte) { o.observe(ctx, raw, acquired) }}
 }
 
 // observedInput hands an object to its observer inside the Read that
