@@ -1233,6 +1233,7 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	for _, codename := range mirrored {
 		one := st
 		one.Suites = []string{codename}
+		one.Archive = s.cfg.AptArchiveOf(codename)
 		if s.aptMirrorRewritten(codename) {
 			one.Components = s.aptServedComponents(one.Suites)
 		} else {
@@ -1250,7 +1251,7 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 		one.Components = s.aptServedComponents(one.Suites)
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
-	out.Profile, out.Host = s.aptHostSources(r, st, out)
+	out.Profile, out.Host = s.aptHostSources(r, out)
 	return out
 }
 
@@ -1281,7 +1282,7 @@ func (s *Server) aptFilteredSuites() (names []string, byCodename map[string]stri
 // Everyone else gets an answer only when there is one codename to give. With
 // several served and no profile to choose between them, naming one would point
 // a host at a suite nobody decided on, and it would look authoritative.
-func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptStatus) (string, *aptsources.Sources) {
+func (s *Server) aptHostSources(r *http.Request, out aptStatus) (string, *aptsources.Sources) {
 	if r != nil {
 		p := s.profileFor(r)
 		base, _ := p.AptScope()
@@ -1293,10 +1294,7 @@ func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptSta
 				// this host the unfiltered index its profile exists to narrow.
 				return p.Name(), nil
 			}
-			one := st
-			one.Suites = suites
-			one.Components = s.aptServedComponents(suites)
-			rendered := aptsources.Render(one)
+			rendered := s.aptStanzas(r, suites, false)
 			return p.Name(), &rendered
 		}
 	}
@@ -1308,7 +1306,7 @@ func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptSta
 }
 
 // aptProfileHostSuites lists the filtered codenames a host bound to p reads,
-// the base's first and then each mirrored pocket's in aptPocketSuffixes order,
+// the base's first and then each mirrored pocket's in clientconf.AptPockets order,
 // and separately the mirrored pockets whose codename this snapshot does not
 // carry. suites is empty when the base's own codename is missing.
 //
@@ -1899,13 +1897,14 @@ func (s *Server) requireStorage(w http.ResponseWriter, store storage.ObjectStore
 	return true
 }
 
-// mirroredStanzas renders the mirrored codenames as stanzas, one per distinct
-// Components: line, in the order MirroredAptCodenames reports them.
+// mirroredStanzas renders the mirrored codenames as stanzas, one per archive
+// root and distinct Components: line (aptStanzas), in the order
+// MirroredAptCodenames reports them.
 //
-// Grouped on the components rather than collapsed to one, because a stanza
-// carries a single Components: line for every suite on it: two codenames
-// mirrored from archives publishing different component sets cannot share one
-// without offering apt a path one of them 404s.
+// Grouped rather than collapsed to one, because a stanza carries a single
+// URIs: and Components: line for every suite on it: two codenames under
+// different roots, or mirrored from archives publishing different component
+// sets, cannot share one without offering apt a path one of them 404s.
 //
 // The key is the effective set, ordered and deduplicated, rather than the
 // configured spelling: a codename that declares none renders the same line as
@@ -1913,39 +1912,23 @@ func (s *Server) requireStorage(w http.ResponseWriter, store storage.ObjectStore
 // in different order render the same line too. Grouping on the spelling split
 // all three into stanzas apt cannot tell apart. The line itself keeps the first
 // codename's configured order, so the output is stable across runs.
-func (s *Server) mirroredStanzas(st aptsources.State) []aptsources.Sources {
-	var order []string
-	byKey := map[string][]string{}
-	comps := map[string][]string{}
-	var rewritten []string
+func (s *Server) mirroredStanzas() []aptsources.Sources {
+	var proxied, rewritten []string
 	for _, codename := range s.cfg.MirroredAptCodenames() {
 		if s.aptMirrorRewritten(codename) {
 			rewritten = append(rewritten, codename)
-			continue
+		} else {
+			proxied = append(proxied, codename)
 		}
-		effective := aptsources.MirroredComponentList(s.cfg.AptComponentsFor(codename))
-		key := componentsKey(effective)
-		if _, seen := byKey[key]; !seen {
-			order = append(order, key)
-			comps[key] = effective
-		}
-		byKey[key] = append(byKey[key], codename)
 	}
-	out := make([]aptsources.Sources, 0, len(order))
-	for _, key := range order {
-		one := st
-		one.Suites = byKey[key]
-		one.Mirrored = true
-		one.Components = comps[key]
-		out = append(out, aptsources.Render(one))
+	var out []aptsources.Sources
+	if len(proxied) > 0 {
+		out = append(out, s.aptStanzas(nil, proxied, true))
 	}
 	// A codename rewritten to drop a hidden version is bodega-signed, so it
 	// cannot share a stanza with one apt verifies against the distro keyring.
 	if len(rewritten) > 0 {
-		one := st
-		one.Suites = rewritten
-		one.Components = s.aptServedComponents(rewritten)
-		out = append(out, aptsources.Render(one))
+		out = append(out, s.aptStanzas(nil, rewritten, false))
 	}
 	return out
 }
@@ -1976,7 +1959,7 @@ func (s *Server) aptSourcesBanner() string {
 	// which differs in the only line that matters here — what authenticates the
 	// suite — so folding them together would apply the wrong trust to half of
 	// it.
-	blocks = append(blocks, s.mirroredStanzas(st)...)
+	blocks = append(blocks, s.mirroredStanzas()...)
 	// And one per filtered codename. A profile's suite is not in apt_suites
 	// and not in apt_upstreams, so an operator reading the config file finds
 	// no trace of it; leaving it off the banner as well would mean the only

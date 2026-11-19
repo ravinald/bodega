@@ -5922,3 +5922,40 @@ func TestRedactLocationsWithoutParsing(t *testing.T) {
 		}
 	}
 }
+
+// F121 R1: a two-archive server's files. Each archive's codenames are
+// configured at its own root, a choice whose suites differ in root or in
+// components is one stanza per distinct pair, and a vendor archive in a named
+// archive points at that archive's root too.
+func TestAptFilesNameTheArchiveRoot(t *testing.T) {
+	render := func(archive string, suites, components []string) aptsources.Sources {
+		return aptsources.Render(aptsources.State{PublicURL: testBase, Suites: suites, Components: components, Mirrored: true, Archive: archive})
+	}
+	ubuntu := Apt(render("ubuntu", []string{"resolute", "resolute-updates"}, nil))
+	if want := "URIs: " + testBase + "/apt/ubuntu/\n"; !strings.Contains(ubuntu.Content, want) {
+		t.Errorf("ubuntu file =\n%s\nwant %q", ubuntu.Content, want)
+	}
+	debian := Apt(aptsources.Join([]aptsources.Sources{
+		render("debian", []string{"trixie", "trixie-updates"}, []string{"main", "contrib"}),
+		render("debian", []string{"trixie-security"}, []string{"main"}),
+	}))
+	want := "Types: deb\nURIs: " + testBase + "/apt/debian/\nSuites: trixie trixie-updates\nComponents: main contrib\n\n" +
+		"Types: deb\nURIs: " + testBase + "/apt/debian/\nSuites: trixie-security\nComponents: main\n"
+	if debian.Content != want || debian.Scope != "trixie" {
+		t.Errorf("debian file (scope %s) =\n%s\nwant\n%s", debian.Scope, debian.Content, want)
+	}
+	if n := strings.Count(strings.Join(debian.Notes, "\n"), aptsources.MirroredNote); n != 1 {
+		t.Errorf("the joined file carries the mirrored note %d times, want once", n)
+	}
+	if got := render("", []string{"stable"}, nil).URI; got != testBase+"/apt/" {
+		t.Errorf("a codename in no archive renders URIs: %s, want %s/apt/", got, testBase)
+	}
+
+	vendor := AptArchiveIn(testBase, "debian", "grafana", nil)
+	if !strings.Contains(vendor.Content, "URIs: "+testBase+"/apt/debian/\n") {
+		t.Errorf("vendor archive in debian =\n%s\nwant its root at /apt/debian/", vendor.Content)
+	}
+	if AptArchiveIn(testBase, "", "grafana", nil).Content != AptArchive(testBase, "grafana", nil).Content {
+		t.Error("AptArchiveIn with no archive differs from AptArchive")
+	}
+}

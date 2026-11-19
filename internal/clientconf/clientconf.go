@@ -405,9 +405,20 @@ func AptArchiveSourcesPath(codename string) string {
 // codename forwards the upstream InRelease unchanged and no stock keyring
 // carries a vendor's key.
 func AptArchive(base, codename string, components []string) File {
+	return AptArchiveIn(base, "", codename, components)
+}
+
+// AptArchiveIn is AptArchive for a codename in the named archive archive
+// (apt_archives), whose URIs: is that archive's root, {base}/apt/{archive}/.
+// "" is the default archive at {base}/apt/.
+func AptArchiveIn(base, archive, codename string, components []string) File {
+	root := trim(base) + "/apt/"
+	if archive != "" {
+		root += archive + "/"
+	}
 	stanza := strings.Join([]string{
 		"Types: deb",
-		"URIs: " + trim(base) + "/apt/",
+		"URIs: " + root,
 		"Suites: " + codename,
 		"Components: " + strings.Join(aptsources.MirroredComponentList(components), " "),
 		"Signed-By: " + AptArchiveKeyPath(codename),

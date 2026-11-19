@@ -2232,6 +2232,8 @@ It exits 0 when every check is clean, 2 when one or more produced a finding, and
 
 **`apt-sources`** reads `/etc/apt/sources.list` and every `.list` and `.sources` file in `/etc/apt/sources.list.d` the way apt does: a `.sources` file as deb822 stanzas, the rest as one-line `deb` and `deb-src` entries. It judges only the URIs apt would fetch from, so a stanza with `Enabled: no`, a commented-out line and a hostname that appears only in a comment all count for nothing. Each URI's host is compared with the public archives (`archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com`, `deb.debian.org`, `security.debian.org`, `packages.debian.org`) and their subdomains, so `us.archive.ubuntu.com` warns and `notarchive.ubuntu.com.example` does not. A `mirror+file://` URI, which Debian 13's cloud image uses in place of a host, is followed to the mirror list it names, and each URI in that list is judged the same way; a public host found there warns, naming both the sources file and the mirror list. A mirror list doctor cannot read makes the row `SKIPPED`, naming the path and the error, unless another source already warned.
 
+A source whose URI names bodega's host and port (from `--url`, or `public_url`) under `/apt/` counts as bodega's, whichever root it names: `/apt/` or a named archive's `/apt/<archive>/`. For those, doctor asks `GET /api/v1/status` where the server serves each suite the source reads, and warns on a source at a root the server no longer serves that suite under, which is a host configured before the codename moved into an [`apt_archives`](#apt_archives) archive. The detail names the file, the stanza, the suite and both roots, and the remediation is the run that rewrites bodega's sources from the plan, `bodega doctor --configure apt --suite <codename> --apply --url <url>`. The request is made only when a source names bodega, with `--token` when one is given; when the server does not answer, the row reports `SKIPPED` with the error instead of `OK`.
+
 On FreeBSD two checks ask `pkg` and `make` where the host fetches from, rather than reading their configuration files, and both report `N/A` on any other system, as `apt-sources` does off Linux and on a Linux host with no `/etc/apt` (Fedora, Alpine, a distroless image). `apt-sources` reports `SKIPPED`, naming the error, when `/etc/apt` cannot be inspected for any reason but its absence, such as a permission error or an `/etc` that is not a directory:
 
 - **`pkg-repos`** runs `pkg -vv` and reads the `Repositories:` section it prints, which is the list pkg uses after its own configuration parsing: `pkg.conf`, every `REPOS_DIR`, `repos_state`, and any pkg setting in doctor's environment. It warns for each enabled repository whose `url` is not a bodega pkg route (an `http` or `https` URL whose path sits under `/freebsd/`, or `/freebsd-profile/` for a profile-bound host, on any host but `pkg.FreeBSD.org`, with no query, fragment or `.` or `..` segment), and when no enabled repository is one. A `pkg -vv` that exits non-zero warns with what pkg printed, since every pkg command on the host is then failing the same way. Without `pkg` on `PATH` the check reports `N/A`. The remediation is `bodega doctor --write-pkg-repo`.
@@ -6256,6 +6258,22 @@ bodega's pkg fingerprint is not in the plan. The FreeBSD stanza names it and say
 
 A host bound to a profile that governs freebsd gets the stanza for that profile's filtered catalogue, the same one [pkg under a profile](#pkg-under-a-profile) describes; a host bound to a profile that scopes apt gets its filtered codename. `GET /client/{system}` renders from the same decision, so the file at a record's `url` is the file whose SHA-256 the record carries.
 
+An apt codename in a named archive ([`apt_archives`](#apt_archives)) is configured at that archive's root, `/apt/<archive>/`, and a codename in no archive at `/apt/`. A choice whose suites differ in root or in `Components:` is written as one stanza per root and component list, in one file. apt reads a stanza's one `URIs:` and one `Components:` line for every suite on it, and stops `apt-get update` on a component a suite does not publish. For `codename=trixie`, with all three codenames in the `debian` archive and `trixie-security`'s `apt_upstreams` entry listing only `main`:
+
+```text
+Types: deb
+URIs: https://bodega-host:8080/apt/debian/
+Suites: trixie trixie-updates
+Components: main contrib non-free non-free-firmware
+
+Types: deb
+URIs: https://bodega-host:8080/apt/debian/
+Suites: trixie-security
+Components: main
+```
+
+The host names no archive. The plan carries it, so `bodega doctor --configure apt` and the setup script write the stanzas above from `codename=trixie` alone, and a vendor archive in `archives=` is written at its own archive's root the same way.
+
 **`plan.txt`.** One record per line, fields separated by one tab, no header. The reason is last, so it may carry spaces. Each field decodes by one rule:
 
 - `-` alone is an empty field. `read` treats a tab as white space and collapses two in a row, so an empty field written as nothing would shift every later column left.
@@ -6669,6 +6687,27 @@ apt archive "fedora" is not declared in apt_archives (declared: debian, ubuntu)
 Objects cached under `packages/apt/` before a codename moved into an archive stay there and are not served from the archive's root; the first request under the new root fetches from upstream again.
 
 Config load refuses, naming the key and the value: an archive name that does not match `^[a-zA-Z][a-zA-Z0-9_-]*$`; a name bodega already uses as a route or a storage directory (`pool`, `dists`, `keys`, `packages` and the other names `git_upstreams` and `binary_upstreams` refuse as a namespace); a codename `apt_upstreams` does not mirror; a codename listed in two archives; and a generated suite from `apt_suites`, which bodega signs and serves at `/apt/dists/` only.
+
+#### Moving a running server to archives
+
+A server that mirrored one distribution and adds a second moves the first one's codenames under a root of their own. Do it in this order:
+
+1. Declare `apt_archives` in the config, as above.
+2. Restart bodega. The key is read at load, and from then on each named codename answers under `/apt/<archive>/` and nowhere else.
+3. On each client, re-run `sudo bodega doctor --configure apt --suite <codename> --apply`, or the setup script with `--codename <codename> --apply`. The plan now names the archive's root, so the run rewrites `/etc/apt/sources.list.d/bodega.sources` with nothing at the old root left in it, and keeps the previous file beside it as `bodega.sources.bodega-<timestamp>`.
+
+Between steps 2 and 3, a client still reads the moved codenames at `/apt/dists/`. `apt-get update` fails for each of them, and apt prints the server's reason:
+
+```text
+apt codename "resolute" is in archive "ubuntu": it is served at /apt/ubuntu/dists/resolute/
+```
+
+The host receives nothing newer from those suites, security fixes included, until it is re-run. A `.deb` already cached under the old key is still served at `/apt/pool/`; one that is not answers `404`, because `/apt/pool/` no longer asks a named archive's upstreams. `bodega doctor`'s `apt-sources` row reports a host in this state, naming the `--configure` run that corrects it.
+
+The objects cached before the move stay in the store under their old keys and are never served from the new root:
+
+- `packages/apt/dists/<codename>/` for each codename that moved. Nothing reads these once the codename is in an archive, so each prefix can be removed whole.
+- `packages/apt/pool/`, for the `.deb` files those codenames fetched. Their keys do not say which codename fetched them, and the same prefix holds the pool of every codename still at `/apt/` and every `.deb` bodega built. Remove it only when no mirrored codename and no generated suite is left outside an archive; otherwise leave it.
 
 #### `[trusted=yes]` is not needed, and is wrong here
 

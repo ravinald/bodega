@@ -159,6 +159,36 @@ func AptSuiteChoiceReason(suites []string) string {
 		len(suites), strings.Join(suites, ", "), AptSuiteRemedy("<suite>"))
 }
 
+// aptPocketSuffixes are the pockets a mirrored Ubuntu base carries, in the
+// order Ubuntu's own sources file names them.
+var aptPocketSuffixes = []string{"-updates", "-backports", "-security"}
+
+// AptPocketBase names the base suite is a pocket of, where has reports the
+// base served. The plan configures a pocket only together with its base, so
+// the server choosing stanzas and doctor naming the --suite that rewrites one
+// have to agree on which suite that is. A suffix whose base has no entry is
+// not a pocket: a vendor codename can end in "-security" too.
+func AptPocketBase(suite string, has func(string) bool) (string, bool) {
+	for _, suffix := range aptPocketSuffixes {
+		if base, ok := strings.CutSuffix(suite, suffix); ok && base != "" && has(base) {
+			return base, true
+		}
+	}
+	return "", false
+}
+
+// AptPockets lists the pockets of base that has reports served, in the order
+// Ubuntu's own sources file names them.
+func AptPockets(base string, has func(string) bool) []string {
+	var out []string
+	for _, suffix := range aptPocketSuffixes {
+		if has(base + suffix) {
+			out = append(out, base+suffix)
+		}
+	}
+	return out
+}
+
 // AptSuiteRemedy names how each entry point states the apt suite, since one
 // plan reaches doctor, the setup script and direct requests alike, and each
 // takes the suite under a different name.
