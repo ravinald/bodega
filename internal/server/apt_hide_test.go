@@ -1,16 +1,24 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"maps"
 	"net/http"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 
+	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 )
 
 // The fixture archive's htop is the vulnerable build being withdrawn: a binary
@@ -272,4 +280,359 @@ func TestMirroredHideAddsNoDefaultPinTheArchiveLacks(t *testing.T) {
 			t.Errorf("rewritten Release carries %s: %q, which the archive does not publish", field, v)
 		}
 	}
+}
+
+// ---- reuse of filtered mirror indexes across rebuilds -------------------------
+
+const (
+	hideGroupBase    = mirroredCodename
+	hideGroupUpdates = mirroredCodename + "-updates"
+	hideGroupOther   = "other"
+)
+
+// hideStanza is one binary paragraph of a synthetic upstream index.
+func hideStanza(pkg, version, arch string) string {
+	return fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\nFilename: pool/main/%c/%s/%s_%s_%s.deb\nSize: 42\nSHA256: %s\nDescription: fixture %s\n a continuation line\n\n",
+		pkg, version, arch, pkg[0], pkg, pkg, version, arch, strings.Repeat("0", 64), pkg)
+}
+
+// hideGroupIndexes is the upstream content the reuse tests start from,
+// codename then architecture: a base and its -updates pocket carrying two
+// architectures each, and a second base of its own.
+func hideGroupIndexes() map[string]map[string]string {
+	return map[string]map[string]string{
+		hideGroupBase: {
+			"amd64": hideStanza("htop", "1.0-1", "amd64") + hideStanza("nginx", "1.24-1", "amd64"),
+			"arm64": hideStanza("htop", "1.0-1", "arm64") + hideStanza("nginx", "1.24-1", "arm64"),
+		},
+		hideGroupUpdates: {
+			"amd64": hideStanza("htop", "1.0-2", "amd64") + hideStanza("curl", "8.5-1", "amd64"),
+			"arm64": hideStanza("htop", "1.0-2", "arm64") + hideStanza("curl", "8.5-1", "arm64"),
+		},
+		hideGroupOther: {
+			"amd64": hideStanza("otherpkg", "2.0-1", "amd64") + hideStanza("vim", "9.1-1", "amd64"),
+		},
+	}
+}
+
+// hideGroupDists renders one codename's dists/ tree the way an archive
+// publishes it: plain and gzip Packages per architecture, and a Release
+// naming the SHA256 of each.
+func hideGroupDists(codename string, byArch map[string]string) map[string]string {
+	base := "dists/" + codename + "/"
+	objects := map[string]string{}
+	arches := slices.Sorted(maps.Keys(byArch))
+	var digests []string
+	for _, arch := range arches {
+		rest := "main/binary-" + arch + "/Packages"
+		gz := string(gzipFixture(byArch[arch]))
+		objects[base+rest] = byArch[arch]
+		objects[base+rest+".gz"] = gz
+		digests = append(digests,
+			fmt.Sprintf(" %s %d %s", sha256Hex(byArch[arch]), len(byArch[arch]), rest),
+			fmt.Sprintf(" %s %d %s.gz", sha256Hex(gz), len(gz), rest))
+	}
+	objects[base+"Release"] = strings.Join(append([]string{
+		"Origin: Ubuntu",
+		"Label: Ubuntu",
+		"Suite: " + codename,
+		"Codename: " + codename,
+		"Components: main",
+		"Architectures: " + strings.Join(arches, " "),
+		"SHA256:",
+	}, append(digests, "")...), "\n")
+	return objects
+}
+
+// hideGroupServer is a mirroring server with a bodega signing key over the
+// codenames indexes names, every one of them served by the same archive.
+func hideGroupServer(tb testing.TB, indexes map[string]map[string]string) (*Server, *fixtureArchive) {
+	tb.Helper()
+	dir := tb.TempDir()
+	tb.Setenv(aptsign.CredentialsEnv, dir)
+	kr, err := aptsign.Generate("bodega test archive", "test@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		tb.Fatalf("generate signing key: %v", err)
+	}
+	if err := kr.WritePrivate(filepath.Join(dir, aptsign.KeyFileName)); err != nil {
+		tb.Fatalf("write signing key: %v", err)
+	}
+	objects := map[string]string{}
+	for codename, byArch := range indexes {
+		maps.Copy(objects, hideGroupDists(codename, byArch))
+	}
+	archive := newFixtureArchive(tb, objects)
+	s := mirrorServer(tb, archive)
+	for codename := range indexes {
+		s.cfg.AptUpstreams[codename] = []config.AptUpstream{{URL: archive.URL()}}
+	}
+	if s.aptSign.Load() == nil {
+		tb.Fatal("no apt signing key loaded; no mirrored group would be rewritten")
+	}
+	return s, archive
+}
+
+// recordHide records one hide without rebuilding, so the test chooses which
+// snapshot the next build starts from.
+func recordHide(t *testing.T, s *Server, name, version, codename string) {
+	t.Helper()
+	if err := s.auditDB.InsertAptMirrorHide(context.Background(), audit.AptMirrorHide{
+		Name: name, Version: version, Codenames: []string{codename}, HiddenBy: "tester",
+	}); err != nil {
+		t.Fatalf("record the hide: %v", err)
+	}
+}
+
+// buildFrom builds a snapshot with prev as the one being served, publishes
+// it, and returns it. A nil prev is a cold build.
+func buildFrom(t *testing.T, s *Server, prev *aptSnapshot) *aptSnapshot {
+	t.Helper()
+	s.aptSnap.Store(prev)
+	snap, err := s.buildAptSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("build the apt snapshot: %v", err)
+	}
+	s.aptSnap.Store(snap)
+	return snap
+}
+
+// countMirrorFilter counts the filter runs a rewrite makes from here on.
+func countMirrorFilter(t *testing.T) *int {
+	t.Helper()
+	calls := new(int)
+	saved := aptMirrorFilter
+	aptMirrorFilter = func(index []byte, keep func(map[string]string) bool) ([]byte, int, int, error) {
+		*calls++
+		return saved(index, keep)
+	}
+	t.Cleanup(func() { aptMirrorFilter = saved })
+	return calls
+}
+
+// assertSameRewrite fails unless two snapshots rewrite the same codenames and
+// serve byte-identical Packages, Packages.gz and Release SHA256 blocks for
+// each. Date, Valid-Until and the signature are allowed to differ.
+func assertSameRewrite(t *testing.T, want, got *aptSnapshot) {
+	t.Helper()
+	if !maps.Equal(want.mirrorRewritten, got.mirrorRewritten) {
+		t.Fatalf("rewritten codenames = %v, want %v", got.mirrorRewritten, want.mirrorRewritten)
+	}
+	for codename := range want.mirrorRewritten {
+		w, g := want.suites[codename], got.suites[codename]
+		if !slices.Equal(w.components, g.components) {
+			t.Errorf("%s components = %v, want %v", codename, g.components, w.components)
+		}
+		for comp := range w.packages {
+			for arch := range w.packages[comp] {
+				if !bytes.Equal(w.packages[comp][arch], g.packages[comp][arch]) {
+					t.Errorf("%s %s/%s Packages differs from the cold build", codename, comp, arch)
+				}
+				if !bytes.Equal(w.packagesGz[comp][arch], g.packagesGz[comp][arch]) {
+					t.Errorf("%s %s/%s Packages.gz differs from the cold build", codename, comp, arch)
+				}
+			}
+		}
+		wr, gr := mustParseRelease(t, w.release), mustParseRelease(t, g.release)
+		if wr["SHA256"] != gr["SHA256"] {
+			t.Errorf("%s Release SHA256 block differs from the cold build:\n%s\nwant:\n%s", codename, gr["SHA256"], wr["SHA256"])
+		}
+	}
+}
+
+// sameBacking reports whether two slices share their backing array.
+func sameBacking(a, b []byte) bool {
+	return len(a) > 0 && len(a) == len(b) && &a[0] == &b[0]
+}
+
+// hideGroupIndexCount is how many Packages the fixture's two rewritten
+// groups carry: two architectures in each of base and pocket, one in other.
+const hideGroupIndexCount = 5
+
+func TestMirrorRewriteWarmMatchesCold(t *testing.T) {
+	s, _ := hideGroupServer(t, hideGroupIndexes())
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	recordHide(t, s, "otherpkg", "2.0-1", hideGroupOther)
+	calls := countMirrorFilter(t)
+
+	cold := buildFrom(t, s, nil)
+	if *calls != hideGroupIndexCount {
+		t.Fatalf("cold build filtered %d indexes, want %d", *calls, hideGroupIndexCount)
+	}
+	if len(cold.mirrorRewritten) != 3 || len(cold.mirrorIndexes) != hideGroupIndexCount {
+		t.Fatalf("cold build rewrote %v and kept %d indexes; want 3 codenames and %d", cold.mirrorRewritten, len(cold.mirrorIndexes), hideGroupIndexCount)
+	}
+	if strings.Contains(string(cold.suites[hideGroupBase].packages["main"]["amd64"]), "Package: htop") {
+		t.Fatal("the cold rewrite still lists the hidden htop")
+	}
+
+	*calls = 0
+	warm := buildFrom(t, s, cold)
+	if *calls != 0 {
+		t.Errorf("warm build with nothing changed filtered %d indexes, want 0", *calls)
+	}
+	assertSameRewrite(t, cold, warm)
+	// Reused, not rebuilt: the warm snapshot serves the cold one's bytes.
+	if !sameBacking(cold.suites[hideGroupUpdates].packagesGz["main"]["arm64"], warm.suites[hideGroupUpdates].packagesGz["main"]["arm64"]) {
+		t.Error("the warm build served a copy of the Packages.gz rather than the one the cold build made")
+	}
+}
+
+func TestMirrorRewriteHideChangeRefiltersAndMatchesCold(t *testing.T) {
+	s, _ := hideGroupServer(t, hideGroupIndexes())
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	recordHide(t, s, "otherpkg", "2.0-1", hideGroupOther)
+	first := buildFrom(t, s, nil)
+
+	recordHide(t, s, "curl", "8.5-1", hideGroupUpdates)
+	calls := countMirrorFilter(t)
+	warm := buildFrom(t, s, first)
+	// The hide set is one digest in every key, so a change to it reaches
+	// every index of every rewritten group.
+	if *calls != hideGroupIndexCount {
+		t.Errorf("a hide change refiltered %d indexes, want %d", *calls, hideGroupIndexCount)
+	}
+	if strings.Contains(string(warm.suites[hideGroupUpdates].packages["main"]["arm64"]), "Package: curl") {
+		t.Error("the rebuild after a new hide still lists the newly hidden curl")
+	}
+	cold := buildFrom(t, s, nil)
+	assertSameRewrite(t, cold, warm)
+}
+
+func TestMirrorRewriteUpstreamChangeRefiltersOnlyThatIndex(t *testing.T) {
+	indexes := hideGroupIndexes()
+	s, archive := hideGroupServer(t, indexes)
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	recordHide(t, s, "otherpkg", "2.0-1", hideGroupOther)
+	first := buildFrom(t, s, nil)
+
+	indexes[hideGroupUpdates]["arm64"] += hideStanza("jq", "1.7-1", "arm64")
+	for rel, body := range hideGroupDists(hideGroupUpdates, indexes[hideGroupUpdates]) {
+		archive.setObject(rel, body)
+	}
+	s.aptUpstreamIdx.Clear()
+
+	calls := countMirrorFilter(t)
+	warm := buildFrom(t, s, first)
+	if *calls != 1 {
+		t.Errorf("one changed upstream index refiltered %d indexes, want 1", *calls)
+	}
+	if !strings.Contains(string(warm.suites[hideGroupUpdates].packages["main"]["arm64"]), "Package: jq") {
+		t.Error("the rebuild after an upstream change still serves the old index")
+	}
+	if !sameBacking(first.suites[hideGroupUpdates].packages["main"]["amd64"], warm.suites[hideGroupUpdates].packages["main"]["amd64"]) {
+		t.Error("the unchanged index beside the changed one was rebuilt rather than reused")
+	}
+	cold := buildFrom(t, s, nil)
+	assertSameRewrite(t, cold, warm)
+}
+
+// A path the Release publishes no SHA256 for names no particular bytes, so
+// nothing recorded under it may stand in for what the archive serves now.
+func TestMirrorIndexWithoutUpstreamDigestIsNeverReused(t *testing.T) {
+	key := aptMirrorIndexKey{codename: hideGroupBase, path: "main/binary-amd64/Packages.gz", hides: "h"}
+	pass := &aptMirrorPass{prev: map[aptMirrorIndexKey]aptMirrorIndex{key: {dropped: 1}}}
+	if _, ok := pass.reuse(key); ok {
+		t.Error("an index keyed with no upstream digest was reused")
+	}
+	key.upstreamSHA256 = strings.Repeat("a", 64)
+	pass.prev[key] = aptMirrorIndex{dropped: 1}
+	if _, ok := pass.reuse(key); !ok {
+		t.Error("an index keyed with its upstream digest was not reused")
+	}
+}
+
+func TestMirrorIndexCacheFollowsThePublishedSnapshot(t *testing.T) {
+	s, archive := hideGroupServer(t, hideGroupIndexes())
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	recordHide(t, s, "otherpkg", "2.0-1", hideGroupOther)
+	first := buildFrom(t, s, nil)
+
+	// Every entry is a byte slice the snapshot serves, not a copy of one.
+	for key, idx := range first.mirrorIndexes {
+		served := false
+		for _, byArch := range first.suites[key.codename].packages {
+			for arch, body := range byArch {
+				if sameBacking(body, idx.body.plain) && sameBacking(first.suites[key.codename].packagesGz["main"][arch], idx.body.gz) {
+					served = true
+				}
+			}
+		}
+		if !served {
+			t.Errorf("the cache entry for %s %s holds bytes the snapshot does not serve", key.codename, key.path)
+		}
+	}
+
+	// A failed group is carried with its entries.
+	rel := "dists/" + hideGroupUpdates + "/Release"
+	release, _ := archive.object(rel)
+	archive.removeObject(rel)
+	s.aptUpstreamIdx.Clear()
+	carried := buildFrom(t, s, first)
+	if !carried.mirrorRewritten[hideGroupUpdates] {
+		t.Fatal("the group whose upstream read failed was not carried")
+	}
+	if !maps.EqualFunc(first.mirrorIndexes, carried.mirrorIndexes, func(a, b aptMirrorIndex) bool {
+		return sameBacking(a.body.plain, b.body.plain) && sameBacking(a.body.gz, b.body.gz)
+	}) {
+		t.Errorf("a carried group lost or copied its cache entries: %d before, %d after", len(first.mirrorIndexes), len(carried.mirrorIndexes))
+	}
+	archive.setObject(rel, release)
+	s.aptUpstreamIdx.Clear()
+
+	// A group whose last hide is removed goes back to proxy and drops its
+	// entries; the other group keeps its own.
+	if _, err := s.auditDB.DeleteAptMirrorHide(context.Background(), "otherpkg", "2.0-1"); err != nil {
+		t.Fatalf("remove the hide: %v", err)
+	}
+	proxied := buildFrom(t, s, carried)
+	if proxied.mirrorRewritten[hideGroupOther] {
+		t.Fatal("the group with no hide left is still rewritten")
+	}
+	for key := range proxied.mirrorIndexes {
+		if key.codename == hideGroupOther {
+			t.Errorf("the proxied group still holds a cache entry for %s", key.path)
+		}
+	}
+	if got := len(proxied.mirrorIndexes); got != hideGroupIndexCount-1 {
+		t.Errorf("cache holds %d entries after the other group returned to proxy, want %d", got, hideGroupIndexCount-1)
+	}
+}
+
+// BenchmarkAptMirrorRewrite measures one group's rewrite over a synthetic
+// archive-sized index, from nothing and from the previous rebuild. The
+// upstream reads are served from the metadata cache in both, so the figures
+// are the filter, compression and hashing a reuse skips.
+func BenchmarkAptMirrorRewrite(b *testing.B) {
+	const stanzas = 50_000
+	var body strings.Builder
+	for i := range stanzas {
+		body.WriteString(hideStanza(fmt.Sprintf("pkg%05d", i), "1.0-1", "amd64"))
+	}
+	s, _ := hideGroupServer(b, map[string]map[string]string{hideGroupBase: {"amd64": body.String()}})
+	hidden := aptMirrorHides{"pkg00042": {"1.0-1": true}}
+	now := time.Now().UTC()
+	ctx := context.Background()
+
+	rewrite := func(b *testing.B) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
+		out, reusable := s.aptMirrorRewrites(ctx, hidden, now, now.Add(aptValidity))
+		if out[hideGroupBase] == nil {
+			b.Fatal("the benchmark group was not rewritten")
+		}
+		return out, reusable
+	}
+
+	b.Run("cold", func(b *testing.B) {
+		s.aptSnap.Store(nil)
+		for b.Loop() {
+			rewrite(b)
+		}
+	})
+	b.Run("warm", func(b *testing.B) {
+		s.aptSnap.Store(nil)
+		out, reusable := rewrite(b)
+		s.aptSnap.Store(&aptSnapshot{suites: out, mirrorRewritten: map[string]bool{hideGroupBase: true}, mirrorIndexes: reusable})
+		for b.Loop() {
+			rewrite(b)
+		}
+	})
 }

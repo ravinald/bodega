@@ -3,11 +3,15 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -92,6 +96,66 @@ func (h aptMirrorHides) permits(fields map[string]string) bool {
 	return !h.hides(fields["Package"], fields["Version"])
 }
 
+// digest names the whole hide set, so a filtered index records which set it
+// was filtered under. Any hide added or removed changes it, including one in
+// a package the index never carried: telling those apart would mean parsing
+// the index, which is the cost a reuse exists to skip.
+func (h aptMirrorHides) digest() string {
+	var pairs []string
+	for name, versions := range h {
+		for version, on := range versions {
+			if on {
+				pairs = append(pairs, name+"\x00"+version)
+			}
+		}
+	}
+	slices.Sort(pairs)
+	sum := sha256.Sum256([]byte(strings.Join(pairs, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+// aptMirrorIndexKey is everything one filtered Packages of a rewritten group
+// is a function of: the upstream bytes, named by the SHA256 their Release
+// publishes, and the hide set. The archive and codename keep two codenames
+// that publish an identical index from sharing a key across a config reload
+// that moves one of them.
+type aptMirrorIndexKey struct {
+	archive, codename, path string
+	upstreamSHA256          string
+	hides                   string
+}
+
+// aptMirrorIndex is one filtered Packages as the snapshot serves it, and how
+// many stanzas the filter dropped, which decides whether its group is
+// rewritten at all.
+type aptMirrorIndex struct {
+	body    aptIndexBody
+	dropped int
+}
+
+// aptMirrorFilter is the filter a rewrite runs on an index it cannot reuse.
+// A variable so a test can count the calls.
+var aptMirrorFilter = filterAptParagraphs
+
+// aptMirrorPass is what one rebuild's rewrites share: the hide set, the
+// indexes the previous snapshot served, and the upstream reads made so far.
+type aptMirrorPass struct {
+	hidden  aptMirrorHides
+	hideSet string
+	prev    map[aptMirrorIndexKey]aptMirrorIndex
+	reads   map[string]aptIndexRead
+}
+
+// reuse returns the previous snapshot's index for key. A key with no
+// upstream digest names no particular bytes and is never reused.
+func (p *aptMirrorPass) reuse(key aptMirrorIndexKey) (aptMirrorIndex, bool) {
+	if key.upstreamSHA256 == "" {
+		return aptMirrorIndex{}, false
+	}
+	idx, ok := p.prev[key]
+	return idx, ok
+}
+
 // aptMirrorHidesFrom reads every hide. A read that fails returns the previous
 // snapshot's set rather than none: an empty set would put a withdrawn version
 // back in the index and open the pool to it over a transient database error.
@@ -145,30 +209,43 @@ func (s *Server) aptMirrorGroups() [][]string {
 // front of every host, and the pool refusal would then abort their apt runs
 // mid-transaction, which is the outcome apt_profile.go explains the index
 // filter exists to prevent.
-func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, date, validUntil time.Time) map[string]*aptSuiteIndex {
+//
+// The second map is every filtered Packages the returned rewrites serve, for
+// the next rebuild to reuse: an index whose upstream SHA256 and hide set are
+// unchanged is the same bytes, and filtering, compressing and hashing it again
+// is what made each rebuild cost the size of the archive rather than the size
+// of the change. A carried group carries its entries with it; a group that
+// goes back to proxy has none to keep.
+func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, date, validUntil time.Time) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
 	if len(hidden) == 0 {
-		return nil
+		return nil, nil
 	}
 	if s.aptSign.Load() == nil {
 		s.logger.Error("mirrored apt versions are hidden and no apt signing key is installed, so the mirrored indexes still list them and only the pool refuses them; run bodega apt key generate and reload",
 			"hidden", len(hidden))
-		return nil
+		return nil, nil
 	}
 	prev := s.aptSnap.Load()
-	cache := map[string]aptIndexRead{}
+	pass := &aptMirrorPass{hidden: hidden, hideSet: hidden.digest(), reads: map[string]aptIndexRead{}}
+	if prev != nil {
+		pass.prev = prev.mirrorIndexes
+	}
 	out := map[string]*aptSuiteIndex{}
+	reusable := map[aptMirrorIndexKey]aptMirrorIndex{}
 	for _, group := range s.aptMirrorGroups() {
 		indexes := make(map[string]*aptSuiteIndex, len(group))
-		dropped := 0
+		built := map[aptMirrorIndexKey]aptMirrorIndex{}
+		dropped, refiltered := 0, 0
 		var failed error
 		for _, codename := range group {
-			idx, d, err := s.aptMirrorRewrite(ctx, codename, hidden, cache, date, validUntil)
+			idx, d, n, err := s.aptMirrorRewrite(ctx, codename, pass, built, date, validUntil)
 			if err != nil {
 				failed = fmt.Errorf("%s: %w", codename, err)
 				break
 			}
 			indexes[codename] = idx
 			dropped += d
+			refiltered += n
 		}
 		switch {
 		case failed != nil:
@@ -178,15 +255,23 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, d
 			for codename, idx := range carried {
 				out[codename] = idx
 			}
+			if carried != nil {
+				for key, idx := range pass.prev {
+					if slices.Contains(group, key.codename) {
+						reusable[key] = idx
+					}
+				}
+			}
 		case dropped > 0:
 			s.logger.Info("rewrote and re-signed a mirrored apt group to drop hidden versions",
-				"group", strings.Join(group, " "), "dropped", dropped)
+				"group", strings.Join(group, " "), "dropped", dropped, "refiltered", refiltered)
 			for codename, idx := range indexes {
 				out[codename] = idx
 			}
+			maps.Copy(reusable, built)
 		}
 	}
-	return out
+	return out, reusable
 }
 
 // mirrorGroup returns this snapshot's rewrite of every codename in group, or
@@ -206,42 +291,58 @@ func (snap *aptSnapshot) mirrorGroup(group []string) map[string]*aptSuiteIndex {
 }
 
 // aptMirrorRewrite builds one mirrored codename's index with the hidden
-// stanzas dropped, and returns how many it dropped.
-func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, hidden aptMirrorHides, cache map[string]aptIndexRead, date, validUntil time.Time) (*aptSuiteIndex, int, error) {
+// stanzas dropped, records each filtered Packages it serves in built, and
+// returns how many stanzas it dropped and how many indexes it had to filter
+// rather than reuse.
+func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, pass *aptMirrorPass, built map[aptMirrorIndexKey]aptMirrorIndex, date, validUntil time.Time) (*aptSuiteIndex, int, int, error) {
 	release, err := s.aptUpstreamRelease(ctx, codename)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	layout, err := s.aptUpstreamComponents(codename, release)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	packages := map[string]map[string][]byte{}
+	digests := aptReleaseDigests(release)
+	archive := s.cfg.AptArchiveOf(codename)
+	bodies := map[string]map[string]aptIndexBody{}
 	var components []string
-	dropped := 0
+	dropped, refiltered := 0, 0
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
-			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, cache)
-			if err != nil {
-				return nil, 0, err
+			key := aptMirrorIndexKey{
+				archive: archive, codename: codename, path: comp.index[arch],
+				upstreamSHA256: digests[comp.index[arch]], hides: pass.hideSet,
 			}
-			if read.notPublished {
-				continue
+			idx, ok := pass.reuse(key)
+			if !ok {
+				read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, pass.reads)
+				if err != nil {
+					return nil, 0, 0, err
+				}
+				if read.notPublished {
+					continue
+				}
+				body, _, d, err := aptMirrorFilter(read.body, pass.hidden.permits)
+				if err != nil {
+					return nil, 0, 0, fmt.Errorf("filter the upstream Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
+				}
+				idx = aptMirrorIndex{body: newAptIndexBody(body), dropped: d}
+				refiltered++
 			}
-			body, _, d, err := filterAptParagraphs(read.body, hidden.permits)
-			if err != nil {
-				return nil, 0, fmt.Errorf("filter the upstream Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
+			if key.upstreamSHA256 != "" {
+				built[key] = idx
 			}
-			dropped += d
-			if packages[comp.name] == nil {
-				packages[comp.name] = map[string][]byte{}
+			dropped += idx.dropped
+			if bodies[comp.name] == nil {
+				bodies[comp.name] = map[string]aptIndexBody{}
 				components = append(components, comp.name)
 			}
-			packages[comp.name][arch] = body
+			bodies[comp.name][arch] = idx.body
 		}
 	}
-	if len(packages) == 0 {
-		return nil, 0, fmt.Errorf("%s publishes none of the architectures its Release names in any component bodega mirrors", codename)
+	if len(bodies) == 0 {
+		return nil, 0, 0, fmt.Errorf("%s publishes none of the architectures its Release names in any component bodega mirrors", codename)
 	}
 	header := aptReleaseHeader{
 		origin:   release["Origin"],
@@ -259,7 +360,7 @@ func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, hidden a
 	if header.codename == "" {
 		header.codename = codename
 	}
-	return s.aptIndexWithHeader(header, components, packages, date, validUntil), dropped, nil
+	return s.aptIndexWithBodies(header, components, bodies, date, validUntil), dropped, refiltered, nil
 }
 
 // aptMirrorRewritten reports whether the loaded snapshot serves this mirrored
