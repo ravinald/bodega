@@ -216,6 +216,11 @@ func (s *Server) aptMirrorGroups() [][]string {
 // is what made each rebuild cost the size of the archive rather than the size
 // of the change. A carried group carries its entries with it; a group that
 // goes back to proxy has none to keep.
+//
+// A reused index is never read, so it never reaches the age gate observer
+// that a read feeds. Any record that observer failed to write is retried
+// first, from the versions it parsed, so a database that recovers between
+// rebuilds still gets the evidence.
 func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, date, validUntil time.Time) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
 	if len(hidden) == 0 {
 		return nil, nil
@@ -225,6 +230,7 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, d
 			"hidden", len(hidden))
 		return nil, nil
 	}
+	s.retryAptUnrecorded(ctx)
 	prev := s.aptSnap.Load()
 	pass := &aptMirrorPass{hidden: hidden, hideSet: hidden.digest(), reads: map[string]aptIndexRead{}}
 	if prev != nil {

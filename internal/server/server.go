@@ -247,6 +247,12 @@ type Server struct {
 	// adding twenty entries would refetch the base's Packages twenty times
 	// from an archive that republishes it daily.
 	aptUpstreamIdx sync.Map
+	// aptUnrecorded holds the parsed versions of each mirrored Packages whose
+	// age gate record failed, keyed by codename and index, until a write
+	// succeeds. A mirror rewrite that reuses an index never reads it again,
+	// so without these nothing would retry the record once the database
+	// recovers.
+	aptUnrecorded sync.Map
 	// aptReleaseRecorded holds, per codename, the identity of the last
 	// Release whose digests reached the audit database, so the readers
 	// sharing one Release do not rewrite its rows on every read.

@@ -3,9 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -19,6 +21,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // The fixture archive's htop is the vulnerable build being withdrawn: a binary
@@ -635,4 +638,78 @@ func BenchmarkAptMirrorRewrite(b *testing.B) {
 			rewrite(b)
 		}
 	})
+}
+
+func TestReviewE30WarmRebuildRetriesAgeEvidence(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	setAptAge(t, s, policy.ActionBlock)
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(body string, date time.Time) {
+		for rel, data := range hideGroupDists(hideGroupBase, map[string]string{"amd64": body}) {
+			if strings.HasSuffix(rel, "/Release") {
+				data = "Date: " + date.Format(time.RFC1123Z) + "\n" + data
+			}
+			archive.setObject(rel, data)
+		}
+		s.aptUpstreamIdx.Clear()
+	}
+	publish(hideStanza("htop", "1.0-1", "amd64"), now.Add(-30*24*time.Hour))
+	first := buildFrom(t, s, nil)
+
+	db, err := sql.Open("sqlite", s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER review_e30_fail_observation BEFORE INSERT ON apt_observed_indexes
+		BEGIN SELECT RAISE(FAIL, 'temporary observation write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	publish(hideStanza("htop", "1.0-1", "amd64")+hideStanza("nginx", "1.24-1", "amd64"), now.Add(-time.Hour))
+	failedObservation := buildFrom(t, s, first)
+	poolPath := "pool/main/n/nginx/nginx_1.24-1_amd64.deb"
+	if _, why := s.aptMirrorStanza(t.Context(), poolPath); why != "" {
+		t.Fatal(why)
+	}
+	if _, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "nginx", "1.24-1"); err != nil || ok {
+		t.Fatalf("failed-write setup: recorded=%v err=%v, want no date", ok, err)
+	}
+	if _, err := db.Exec("DROP TRIGGER review_e30_fail_observation"); err != nil {
+		t.Fatal(err)
+	}
+
+	buildFrom(t, s, failedObservation)
+	if result, ran := s.aptMirrorAge(t.Context(), poolPath); !ran || result.Action != policy.ActionBlock {
+		t.Errorf("age gate after database recovery and warm rebuild: ran=%v action=%s reason=%s; want block for a one-hour-old version under the seven-day policy", ran, result.Action, result.Reason)
+	}
+}
+
+// TestUsageDocumentsMirrorRewriteCost holds the bodega pkg hide section of
+// docs/usage.md to the reuse aptMirrorRewrite performs: a hide change or an
+// upstream index change refilters what it reaches, and every other rebuild
+// reuses the previous filtered index.
+func TestUsageDocumentsMirrorRewriteCost(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read usage.md: %v", err)
+	}
+	_, after, ok := strings.Cut(string(raw), "\n### `bodega pkg hide")
+	if !ok {
+		t.Fatal("usage.md has no `bodega pkg hide` section")
+	}
+	section, _, _ := strings.Cut(after, "\n### ")
+	for _, want := range []string{
+		"**Rebuild cost while a hide is active.**",
+		"The first rebuild after a hide is added or removed, or after the archive publishes a new `Packages`, refilters the indexes that change reaches",
+		"only the changed index for an upstream change",
+		"Every other rebuild, the hourly one and the one each profile write triggers, reuses the filtered `Packages`, its gzip and both digests from the previous rebuild",
+		"An index is reused only while the `SHA256` its upstream `Release` publishes is unchanged.",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("the `bodega pkg hide` section of usage.md does not say %q", want)
+		}
+	}
 }
