@@ -13,6 +13,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -128,9 +129,75 @@ type aptMirrorIndexKey struct {
 // aptMirrorIndex is one filtered Packages as the snapshot serves it, and how
 // many stanzas the filter dropped, which decides whether its group is
 // rewritten at all.
+//
+// evidence is the full upstream membership the index was built from, held
+// only while the audit database has no record of it. A reused index is never
+// read again, so this is the one copy the age gate can still be told about;
+// it is keyed by the immutable upstream digest through the index key, so a
+// later or delayed read of the same mutable path cannot replace it.
 type aptMirrorIndex struct {
-	body    aptIndexBody
-	dropped int
+	body     aptIndexBody
+	dropped  int
+	evidence *aptIndexEvidence
+}
+
+// aptIndexEvidence is the parsed membership of one upstream Packages whose
+// record failed, shared by every snapshot that reuses an index built from it.
+type aptIndexEvidence struct {
+	codename, path, sum string
+	entries             []audit.AptIndexEntry
+	recorded            atomic.Bool
+}
+
+// pending returns e while its record is still owed, nil once it succeeded,
+// so a reuse stops carrying membership nobody needs.
+func (e *aptIndexEvidence) pending() *aptIndexEvidence {
+	if e == nil || e.recorded.Load() {
+		return nil
+	}
+	return e
+}
+
+// aptMirrorEvidence returns the membership of a freshly read upstream index
+// when the audit database holds no record of its digest. The read that just
+// happened already tried to record it; a database that refused that write
+// usually refuses this lookup too, and either answer short of "recorded"
+// keeps the membership, because losing it leaves new versions undated.
+func (s *Server) aptMirrorEvidence(ctx context.Context, codename, path, sum string, body []byte) *aptIndexEvidence {
+	if s.auditDB == nil || sum == "" {
+		return nil
+	}
+	if seen, err := s.auditDB.AptIndexObserved(ctx, codename, sum); err == nil && seen {
+		return nil
+	}
+	entries, err := aptIndexEntries(body)
+	if err != nil || !aptEntriesNameAVersion(entries) {
+		return nil
+	}
+	return &aptIndexEvidence{codename: codename, path: path, sum: sum, entries: entries}
+}
+
+// retryAptMirrorEvidence records every membership the published snapshot
+// still owes the age gate. Each is tried once per rebuild; one that succeeds
+// is marked so the indexes reusing it stop carrying it.
+func (s *Server) retryAptMirrorEvidence(ctx context.Context, indexes map[aptMirrorIndexKey]aptMirrorIndex) {
+	if s.auditDB == nil {
+		return
+	}
+	tried := map[*aptIndexEvidence]bool{}
+	for _, idx := range indexes {
+		e := idx.evidence.pending()
+		if e == nil || tried[e] {
+			continue
+		}
+		tried[e] = true
+		if s.recordAptIndexEntries(ctx, e.codename, e.path, e.sum, e.entries) == nil {
+			e.recorded.Store(true)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
 }
 
 // aptMirrorFilter is the filter a rewrite runs on an index it cannot reuse.
@@ -218,9 +285,9 @@ func (s *Server) aptMirrorGroups() [][]string {
 // goes back to proxy has none to keep.
 //
 // A reused index is never read, so it never reaches the age gate observer
-// that a read feeds. Any record that observer failed to write is retried
-// first, from the versions it parsed, so a database that recovers between
-// rebuilds still gets the evidence.
+// that a read feeds. Each index whose record failed carries the membership it
+// was built from, and the previous snapshot's are retried first, so a
+// database that recovers between rebuilds still gets the evidence.
 func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, date, validUntil time.Time) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
 	if len(hidden) == 0 {
 		return nil, nil
@@ -230,12 +297,12 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, d
 			"hidden", len(hidden))
 		return nil, nil
 	}
-	s.retryAptUnrecorded(ctx)
 	prev := s.aptSnap.Load()
 	pass := &aptMirrorPass{hidden: hidden, hideSet: hidden.digest(), reads: map[string]aptIndexRead{}}
 	if prev != nil {
 		pass.prev = prev.mirrorIndexes
 	}
+	s.retryAptMirrorEvidence(ctx, pass.prev)
 	out := map[string]*aptSuiteIndex{}
 	reusable := map[aptMirrorIndexKey]aptMirrorIndex{}
 	for _, group := range s.aptMirrorGroups() {
@@ -333,9 +400,13 @@ func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, pass *ap
 				if err != nil {
 					return nil, 0, 0, fmt.Errorf("filter the upstream Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
 				}
-				idx = aptMirrorIndex{body: newAptIndexBody(body), dropped: d}
+				idx = aptMirrorIndex{
+					body: newAptIndexBody(body), dropped: d,
+					evidence: s.aptMirrorEvidence(ctx, codename, key.path, key.upstreamSHA256, read.body),
+				}
 				refiltered++
 			}
+			idx.evidence = idx.evidence.pending()
 			if key.upstreamSHA256 != "" {
 				built[key] = idx
 			}

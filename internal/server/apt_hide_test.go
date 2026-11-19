@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -711,5 +714,103 @@ func TestUsageDocumentsMirrorRewriteCost(t *testing.T) {
 		if !strings.Contains(section, want) {
 			t.Errorf("the `bodega pkg hide` section of usage.md does not say %q", want)
 		}
+	}
+}
+
+func TestReviewE30DelayedReadKeepsSnapshotEvidence(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(body string, date time.Time) {
+		for rel, data := range hideGroupDists(hideGroupBase, map[string]string{"amd64": body}) {
+			if strings.HasSuffix(rel, "/Release") {
+				data = "Date: " + date.Format(time.RFC1123Z) + "\n" + data
+			}
+			archive.setObject(rel, data)
+		}
+		s.aptUpstreamIdx.Clear()
+	}
+	publish(hideStanza("htop", "1.0-1", "amd64"), now.Add(-30*24*time.Hour))
+	if _, err := s.aptUpstreamFetch(t.Context(), hideGroupBase, "main/binary-amd64/Packages.gz"); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER review_e30_fail_observation BEFORE INSERT ON apt_observed_indexes
+		BEGIN SELECT RAISE(FAIL, 'temporary observation write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	older := hideStanza("htop", "1.0-1", "amd64") + hideStanza("curl", "8.5-1", "amd64")
+	publish(older, now.Add(-2*time.Hour))
+	rel := "dists/" + hideGroupBase + "/main/binary-amd64/Packages.gz"
+	started, unblock := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/ubuntu/"+rel && first.CompareAndSwap(false, true) {
+			close(started)
+			<-unblock
+			_, _ = w.Write(gzipFixture(older))
+			return
+		}
+		archive.ts.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+	s.cfg.AptUpstreams[hideGroupBase] = []config.AptUpstream{{URL: upstream.URL + "/ubuntu"}}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(unblock) }) }
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	handler := s.Handler()
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/apt/"+rel, nil))
+	}()
+	defer func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("delayed request did not exit")
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client request did not reach upstream")
+	}
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	publish(hideStanza("htop", "1.0-1", "amd64")+hideStanza("nginx", "1.24-1", "amd64"), now.Add(-time.Hour))
+	failedObservation := buildFrom(t, s, nil)
+	poolPath := "pool/main/n/nginx/nginx_1.24-1_amd64.deb"
+	if _, why := s.aptMirrorStanza(t.Context(), poolPath); why != "" {
+		t.Fatal(why)
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delayed request did not complete")
+	}
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), gzipFixture(older)) {
+		t.Fatalf("delayed request = %d, want the older upstream Packages", response.Code)
+	}
+	if _, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "nginx", "1.24-1"); err != nil || ok {
+		t.Fatalf("failed-write setup: recorded=%v err=%v, want no date", ok, err)
+	}
+	if _, err := db.Exec("DROP TRIGGER review_e30_fail_observation"); err != nil {
+		t.Fatal(err)
+	}
+
+	buildFrom(t, s, failedObservation)
+	if result, ran := s.aptMirrorAge(t.Context(), poolPath); !ran || result.Action != policy.ActionBlock {
+		t.Errorf("age gate after delayed read, database recovery and warm rebuild: ran=%v action=%s reason=%s; want block for a one-hour-old version under the seven-day policy", ran, result.Action, result.Reason)
 	}
 }

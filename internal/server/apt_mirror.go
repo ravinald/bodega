@@ -587,7 +587,7 @@ func (s *Server) observeAptMirrorDists(ctx context.Context, codename, rest strin
 			"codename", codename, "index", rest, "error", err)
 		return
 	}
-	s.recordAptIndexEntries(ctx, codename, rest, digest, entries)
+	_ = s.recordAptIndexEntries(ctx, codename, rest, digest, entries)
 }
 
 func aptEntriesNameAVersion(entries []audit.AptIndexEntry) bool {
@@ -621,42 +621,17 @@ func aptDecompressSniffed(codename, rest string, raw []byte) ([]byte, error) {
 // source version for each pool path, then reads any index the record left the
 // gate needing. A failure is logged and costs only those versions' coverage:
 // the gate finds no record and leaves them unchecked, and the next read of
-// the file, or the next mirror rewrite, tries again from the entries kept in
-// aptUnrecorded. A newer copy of the same index replaces an older one there,
-// so what is kept is bounded by the number of index paths, not by how long
-// the database stays down.
-func (s *Server) recordAptIndexEntries(ctx context.Context, codename, label, sum string, entries []audit.AptIndexEntry) {
+// the file tries again, as does the next mirror rewrite that reuses an index
+// built from it.
+func (s *Server) recordAptIndexEntries(ctx context.Context, codename, label, sum string, entries []audit.AptIndexEntry) error {
 	ctx = context.WithoutCancel(ctx)
-	key := codename + "\x00" + label
 	if err := s.auditDB.RecordAptIndexMembers(ctx, codename, sum, entries); err != nil {
-		s.aptUnrecorded.Store(key, &aptUnrecordedIndex{codename: codename, label: label, sum: sum, entries: entries})
 		s.logger.Warn("could not record which versions a mirrored apt index listed, so the age gate leaves the new ones unchecked until the next read or index rebuild retries",
 			"codename", codename, "index", label, "error", err)
-		return
-	}
-	if kept, ok := s.aptUnrecorded.Load(key); ok && kept.(*aptUnrecordedIndex).sum == sum {
-		s.aptUnrecorded.CompareAndDelete(key, kept)
+		return err
 	}
 	s.readPendingAptIndexes(ctx, codename)
-}
-
-// aptUnrecordedIndex is one mirrored Packages whose versions bodega parsed and
-// could not record.
-type aptUnrecordedIndex struct {
-	codename, label, sum string
-	entries              []audit.AptIndexEntry
-}
-
-// retryAptUnrecorded records every index whose earlier record failed.
-func (s *Server) retryAptUnrecorded(ctx context.Context) {
-	if s.auditDB == nil {
-		return
-	}
-	s.aptUnrecorded.Range(func(_, v any) bool {
-		u := v.(*aptUnrecordedIndex)
-		s.recordAptIndexEntries(ctx, u.codename, u.label, u.sum, u.entries)
-		return ctx.Err() == nil
-	})
+	return nil
 }
 
 // readPendingAptIndexes reads, by hash from the archive, each Packages file
