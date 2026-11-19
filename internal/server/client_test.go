@@ -1800,3 +1800,174 @@ func TestClientPlanRpmMapsTheHostsDistribution(t *testing.T) {
 		t.Errorf("a malformed os_id = %d, want 400", code)
 	}
 }
+
+// twoArchiveClientServer mirrors Ubuntu's resolute and Debian's trixie, each with two
+// pockets, as two named archives, and serves no generated suite.
+func twoArchiveClientServer(t *testing.T) (*Server, *profileFixture) {
+	t.Helper()
+	s, f := pocketServer(t)
+	s.cfg.AptSuites, s.cfg.AptCodename = nil, ""
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{}
+	for _, c := range []string{"resolute", "resolute-updates", "resolute-security"} {
+		s.cfg.AptUpstreams[c] = []config.AptUpstream{{URL: "https://archive.ubuntu.com/ubuntu"}}
+	}
+	for _, c := range []string{"trixie", "trixie-updates", "trixie-security"} {
+		s.cfg.AptUpstreams[c] = []config.AptUpstream{{URL: "https://deb.debian.org/debian", Components: []string{"main", "contrib"}}}
+	}
+	s.cfg.AptArchives = map[string][]string{
+		"ubuntu": {"resolute", "resolute-updates", "resolute-security"},
+		"debian": {"trixie", "trixie-updates", "trixie-security"},
+	}
+	return s, f
+}
+
+// F121 R1: a codename in a named archive is configured at that archive's
+// root, by the plan and by /client/apt alike, and no stanza mixes archives.
+func TestClientAptPlanNamesTheArchiveRoot(t *testing.T) {
+	s, f := twoArchiveClientServer(t)
+	for codename, want := range map[string]string{
+		"resolute": "Types: deb\nURIs: http://bodega.example.com:8080/apt/ubuntu/\nSuites: resolute resolute-updates resolute-security\nComponents: " + aptsources.MirroredComponents + "\n",
+		"trixie":   "Types: deb\nURIs: http://bodega.example.com:8080/apt/debian/\nSuites: trixie trixie-updates trixie-security\nComponents: main contrib\n",
+	} {
+		recs := aptPlanRecords(t, s, f.token, codename)
+		if len(recs) == 0 || recs[0].Action != planInstall || recs[0].Path != clientconf.AptSourcesPath {
+			t.Fatalf("codename=%s plan = %+v, want the sources file installed", codename, recs)
+		}
+		code, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename="+codename)
+		if code != http.StatusOK || body != want {
+			t.Errorf("GET /client/apt codename=%s = %d\n%s\nwant\n%s", codename, code, body, want)
+		}
+		if sum := sha256.Sum256([]byte(body)); recs[0].SHA256 != hex.EncodeToString(sum[:]) {
+			t.Errorf("codename=%s: the plan's digest is not over the file /client/apt serves", codename)
+		}
+	}
+
+	// A codename moved out of every archive goes back to the shared root.
+	s.cfg.AptArchives = map[string][]string{"debian": {"trixie", "trixie-updates", "trixie-security"}}
+	_, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=resolute")
+	if !strings.Contains(body, "URIs: http://bodega.example.com:8080/apt/\n") {
+		t.Errorf("resolute in no archive =\n%s\nwant URIs: at /apt/", body)
+	}
+}
+
+// F121 R1, issue #337: a pocket whose apt_upstreams entry lists fewer
+// components than its base gets a stanza of its own, so no suite is named
+// beside a component it does not serve; one archive split across two roots
+// would get two stanzas the same way.
+func TestClientAptPlanSplitsSuitesByComponents(t *testing.T) {
+	s, f := twoArchiveClientServer(t)
+	s.cfg.AptUpstreams["trixie-security"] = []config.AptUpstream{{URL: "https://security.debian.org/debian-security", Components: []string{"main"}}}
+	s.cfg.AptArchives["debian-security"] = []string{"trixie-security"}
+	s.cfg.AptArchives["debian"] = []string{"trixie", "trixie-updates"}
+	_, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=trixie")
+	want := "Types: deb\nURIs: http://bodega.example.com:8080/apt/debian/\nSuites: trixie trixie-updates\nComponents: main contrib\n\n" +
+		"Types: deb\nURIs: http://bodega.example.com:8080/apt/debian-security/\nSuites: trixie-security\nComponents: main\n"
+	if body != want {
+		t.Errorf("stanzas =\n%s\nwant\n%s", body, want)
+	}
+
+	// The component case alone, inside one archive.
+	s.cfg.AptArchives["debian"] = []string{"trixie", "trixie-updates", "trixie-security"}
+	delete(s.cfg.AptArchives, "debian-security")
+	_, body = clientGet(t, s, f.token, "/client/apt?os=linux&codename=trixie")
+	want = "Types: deb\nURIs: http://bodega.example.com:8080/apt/debian/\nSuites: trixie trixie-updates\nComponents: main contrib\n\n" +
+		"Types: deb\nURIs: http://bodega.example.com:8080/apt/debian/\nSuites: trixie-security\nComponents: main\n"
+	if body != want {
+		t.Errorf("stanzas =\n%s\nwant\n%s", body, want)
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(root+clientconf.AptSourcesParts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(root+clientconf.AptSourcesPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := clientconf.LoadAptSources(root); err != nil || len(entries) != 2 {
+		t.Errorf("apt reads %d stanzas (%v), want 2", len(entries), err)
+	}
+}
+
+// F121 R1: /api/v1/status names each mirrored codename at its archive's root,
+// which is what doctor compares a host's sources against.
+func TestAptStatusNamesTheArchiveRoot(t *testing.T) {
+	s, _ := twoArchiveClientServer(t)
+	st := s.aptStatusFor(nil)
+	got := map[string]string{}
+	for _, src := range st.Sources {
+		got[src.Suite] = src.URI
+	}
+	if !strings.HasSuffix(got["trixie-security"], "/apt/debian/") || !strings.HasSuffix(got["resolute"], "/apt/ubuntu/") {
+		t.Errorf("status sources by suite = %v, want each at its archive's root", got)
+	}
+}
+
+// F121 R4: the served setup script writes the stanza the plan carries, at the
+// archive's root.
+func TestSetupScriptWritesTheArchiveRoot(t *testing.T) {
+	for _, tool := range []string{"sh", "awk", "diff", "cmp"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not on PATH", tool)
+		}
+	}
+	s, f := twoArchiveClientServer(t)
+	out, _, err := setupScriptAgainst(t, s, f.token, nil, "--systems", "apt", "--codename", "trixie")
+	if err != nil {
+		t.Fatalf("sh setup.sh --codename trixie: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "/apt/debian/") || strings.Contains(out, "/apt/\n") || !strings.Contains(out, "Suites: trixie trixie-updates trixie-security") {
+		t.Errorf("the dry run does not configure trixie at /apt/debian/:\n%s", out)
+	}
+}
+
+// F121 R5: usage.md shows a named archive's stanza where the client plan is
+// documented, and says how to move a running server to archives: the order,
+// the refusal a client not yet re-run reads, and what is left in the store.
+func TestUsageDocumentsArchiveClients(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read usage.md: %v", err)
+	}
+	doc := string(raw)
+	section := func(heading string) string {
+		_, after, ok := strings.Cut(doc, "\n"+heading+"\n")
+		if !ok {
+			t.Fatalf("usage.md has no %q heading", heading)
+		}
+		body, _, _ := strings.Cut(after, "\n#")
+		return body
+	}
+
+	s, _, _, _ := archiveServer(t)
+	code, body := mirrorGet(t, s, "/apt/dists/resolute/InRelease")
+	if code != http.StatusNotFound {
+		t.Fatalf("GET /apt/dists/resolute/InRelease = %d, want 404", code)
+	}
+	for _, sec := range []struct {
+		heading string
+		wants   []string
+	}{
+		{"#### Client plan and per-system files", []string{
+			"URIs: https://bodega-host:8080/apt/debian/\nSuites: trixie trixie-updates\nComponents: main contrib non-free non-free-firmware\n\nTypes: deb\nURIs: https://bodega-host:8080/apt/debian/\nSuites: trixie-security\nComponents: main\n",
+			"The host names no archive",
+		}},
+		{"#### Moving a running server to archives", []string{
+			"1. Declare `apt_archives`",
+			"2. Restart bodega",
+			"3. On each client, re-run `sudo bodega doctor --configure apt --suite <codename> --apply`",
+			strings.TrimSpace(string(body)),
+			"`packages/apt/dists/<codename>/`",
+			"`packages/apt/pool/`",
+		}},
+	} {
+		got := section(sec.heading)
+		for _, want := range sec.wants {
+			if !strings.Contains(got, want) {
+				t.Errorf("usage.md %q lacks %q", sec.heading, want)
+			}
+		}
+	}
+	if !strings.Contains(doc, "#### Moving a running server to archives\n") ||
+		strings.Index(doc, "### Mirroring an upstream archive") > strings.Index(doc, "#### Moving a running server to archives") {
+		t.Error("the migration section is not under \"Mirroring an upstream archive\"")
+	}
+}

@@ -3223,6 +3223,14 @@ components:
           type: string
         uri:
           type: string
+          description: >-
+            The URIs: line: `{base}/apt/`, or `{base}/apt/{archive}/` for a
+            codename in a named archive.
+        archive:
+          type: string
+          description: >-
+            The apt_archives archive this codename belongs to. Absent for the
+            default archive at `/apt/`.
         components:
           type: string
           description: >-
@@ -3231,10 +3239,15 @@ components:
             apt_upstreams entry names, or Ubuntu's four when it names none.
         deb822:
           type: string
-          description: The .sources stanza, newline separated.
+          description: >-
+            The .sources stanza, newline separated. A choice whose suites differ
+            in archive root or in components is several stanzas, separated by a
+            blank line; the fields above describe the first.
         one_line:
           type: string
-          description: The .list equivalent, carrying the single suite above.
+          description: >-
+            The .list equivalent, one line per stanza, each carrying that
+            stanza's first suite.
         notes:
           type: array
           description: Consequences of the form rendered, for display beside it.

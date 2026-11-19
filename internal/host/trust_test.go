@@ -3098,3 +3098,18 @@ func TestLoopbackBodegaIsNotedNotRefused(t *testing.T) {
 		t.Errorf("notesOf = %q, want each note once", got)
 	}
 }
+
+// F121 R3: a source under a named archive's root, /apt/{archive}/, reaches
+// bodega for the --ca-file check as one under /apt/ does.
+func TestAptArchiveRootReachesBodegaForTheCACheck(t *testing.T) {
+	for _, root := range []string{"/apt/", "/apt/ubuntu/", "/apt/debian"} {
+		t.Run(root, func(t *testing.T) {
+			p, _, base := auditTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"),
+				"Types: deb\nURIs: "+base+root+"\nSuites: resolute\nComponents: main\n")
+			if v := auditState(t, p, "apt-sources", base); v.State != TrustVerified {
+				t.Errorf("verdict = %+v, want apt counted as reaching bodega and verified", v)
+			}
+		})
+	}
+}

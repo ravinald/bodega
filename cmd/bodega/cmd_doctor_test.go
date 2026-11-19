@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
@@ -4814,4 +4815,254 @@ func caAptPlanServer(t *testing.T) (*httptest.Server, []byte) {
 	}
 	t.Cleanup(func() { doctorTrustProbe = prev })
 	return srv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+}
+
+// movingAptServer answers /client/plan and /client/apt with the stanza the
+// server's renderer gives resolute, in the archive *archive names ("" for
+// none), and /api/v1/status with where it serves each suite. Changing
+// *archive is the server restarting with resolute moved.
+func movingAptServer(t *testing.T) (*httptest.Server, *string, *[]string) {
+	t.Helper()
+	archive := new(string)
+	var queries []string
+	var srv *httptest.Server
+	render := func() aptsources.Sources {
+		return aptsources.Render(aptsources.State{PublicURL: srv.URL, Suites: []string{"resolute", "resolute-updates"}, Mirrored: true, Archive: *archive})
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+		f := clientconf.Apt(render())
+		sum := sha256.Sum256([]byte(f.Content))
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{{
+			Identity: "ubuntu-host", Match: "cidr:192.0.2.1/32", System: manifest.TypeApt, Action: clientconf.PlanInstall,
+			Path: "~" + clientconf.AptSourcesPath, URL: srv.URL + "/client/apt", SHA256: hex.EncodeToString(sum[:]),
+		}}})
+	})
+	mux.HandleFunc("GET /client/apt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, clientconf.Apt(render()).Content)
+	})
+	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		var sources []aptsources.Sources
+		for _, suite := range []string{"resolute", "resolute-updates"} {
+			sources = append(sources, aptsources.Render(aptsources.State{PublicURL: srv.URL, Suites: []string{suite}, Mirrored: true, Archive: *archive}))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"apt": map[string]any{"sources": sources}})
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, archive, &queries
+}
+
+// F121 R2: the plan carries the archive, so the client names none, and a
+// second run after the server moves the codename rewrites bodega.sources,
+// backing up the old one, with no source left at the old root.
+func TestDoctorConfigureAptFollowsACodenameIntoAnArchive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var ran []string
+	var fail error
+	stubAptHost(t, home, &ran, &fail)
+	srv, archive, queries := movingAptServer(t)
+	args := []string{"--configure", "apt", "--suite", "resolute", "--url", srv.URL, "--allow-plaintext", "--apply"}
+	sources := filepath.Join(home, clientconf.AptSourcesPath)
+
+	if out, err := runDoctor(t, args...); err != nil {
+		t.Fatalf("first --apply = %v:\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(sources); !strings.Contains(string(got), "URIs: "+srv.URL+"/apt/\n") {
+		t.Fatalf("bodega.sources before the move =\n%s", got)
+	}
+
+	*archive = "ubuntu"
+	out, err := runDoctor(t, args...)
+	if err != nil || !strings.Contains(out, "backed up") {
+		t.Fatalf("second --apply = %v:\n%s", err, out)
+	}
+	got, _ := os.ReadFile(sources)
+	if !strings.Contains(string(got), "URIs: "+srv.URL+"/apt/ubuntu/\n") || strings.Contains(string(got), "URIs: "+srv.URL+"/apt/\n") {
+		t.Errorf("bodega.sources after the move =\n%s\nwant resolute at /apt/ubuntu/ and nothing at /apt/", got)
+	}
+	backups, _ := filepath.Glob(sources + ".bodega-*")
+	if len(backups) != 1 {
+		t.Fatalf("backups = %v, want the pre-move file kept once", backups)
+	}
+	if old, _ := os.ReadFile(backups[0]); !strings.Contains(string(old), "/apt/\n") {
+		t.Errorf("the backup does not hold the pre-move file:\n%s", old)
+	}
+	for _, q := range *queries {
+		if strings.Contains(q, "archive") {
+			t.Errorf("plan query %q names an archive; the plan carries it", q)
+		}
+	}
+}
+
+// F121 R3: the apt-sources row counts a source under /apt/{archive}/ as
+// bodega's, and reports one still at the root a codename moved from, with the
+// --configure run that corrects it.
+func TestDoctorAptRowReportsAMovedCodename(t *testing.T) {
+	home := t.TempDir()
+	var ran []string
+	var fail error
+	stubAptHost(t, home, &ran, &fail)
+	srv, archive, _ := movingAptServer(t)
+	*archive = "ubuntu"
+	write := func(root string) {
+		t.Helper()
+		body := "Types: deb\nURIs: " + srv.URL + root + "\nSuites: resolute resolute-updates\nComponents: main\n"
+		p := filepath.Join(home, clientconf.AptSourcesPath)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ok := host.Finding{Check: "apt-sources", Status: host.StatusOK, Detail: "no public apt mirrors referenced in /etc/apt/sources.list[.d]"}
+	served := aptServedRootsAt(srv.URL, "", true)
+
+	write("/apt/ubuntu/")
+	if got := aptSources.rootFinding(ok, srv.URL, served); got != ok {
+		t.Errorf("sources at the archive root: row = %+v, want it unchanged", got)
+	}
+
+	write("/apt/")
+	got := aptSources.rootFinding(ok, srv.URL, served)
+	if got.Status != host.StatusWarn ||
+		!strings.Contains(got.Detail, clientconf.AptSourcesPath+" entry 1 reads resolute from "+srv.URL+"/apt/, which bodega serves at "+srv.URL+"/apt/ubuntu/") ||
+		got.Remediation != "rewrite bodega's sources from the server's plan: bodega doctor --configure apt --suite resolute --apply --url "+srv.URL {
+		t.Errorf("sources at the old root: row = %+v", got)
+	}
+
+	vendor := filepath.Join(home, clientconf.AptArchiveSourcesPath("resolute-updates"))
+	if err := os.WriteFile(vendor, []byte("Types: deb\nURIs: "+srv.URL+"/apt/\nSuites: resolute-updates\nComponents: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := aptSources.rootFinding(ok, srv.URL, served); !strings.Contains(got.Remediation, "--archive resolute-updates --apply") {
+		t.Errorf("a stale vendor archive file is fixed by naming the archive: %+v", got)
+	}
+	if err := os.Remove(vendor); err != nil {
+		t.Fatal(err)
+	}
+
+	public := host.Finding{Check: "apt-sources", Status: host.StatusWarn, Detail: "apt configured to fetch from archive.ubuntu.com", Remediation: "rewrite sources"}
+	if got := aptSources.rootFinding(public, srv.URL, served); !strings.HasPrefix(got.Detail, public.Detail+"; ") || !strings.Contains(got.Remediation, "--suite resolute") {
+		t.Errorf("a row already warning keeps its finding and adds this one: %+v", got)
+	}
+
+	unreachable := func() (map[string]string, error) { return nil, errors.New("GET /api/v1/status: 401 Unauthorized") }
+	if got := aptSources.rootFinding(ok, srv.URL, unreachable); got.Status != host.StatusSkip || !strings.Contains(got.Detail, "401") {
+		t.Errorf("a server that will not say: row = %+v, want a skip naming why", got)
+	}
+	if got := aptSources.rootFinding(ok, "https://elsewhere.example", unreachable); got != ok {
+		t.Errorf("sources naming another host: row = %+v, want it unchanged and the server not asked", got)
+	}
+}
+
+func TestReviewF121MovedPocketUsesBaseRemediation(t *testing.T) {
+	root := t.TempDir()
+	h := &aptSourcesHost{goos: "linux", root: root}
+	base := "https://bodega.example"
+	file := filepath.Join(root, clientconf.AptSourcesPath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := "Types: deb\nURIs: " + base + "/apt/debian/\nSuites: trixie trixie-updates\nComponents: main contrib\n\n" +
+		"Types: deb\nURIs: " + base + "/apt/debian/\nSuites: trixie-security\nComponents: main\n"
+	if err := os.WriteFile(file, []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	served := func() (map[string]string, error) {
+		return map[string]string{
+			"trixie": base + "/apt/debian/", "trixie-updates": base + "/apt/debian/",
+			"trixie-security": base + "/apt/debian-security/",
+		}, nil
+	}
+	got := h.rootFinding(host.Finding{Check: "apt-sources", Status: host.StatusOK}, base, served)
+	if got.Status != host.StatusWarn || !strings.Contains(got.Remediation, "--suite trixie --apply") {
+		t.Fatalf("moved pocket remediation cannot select its base: %+v", got)
+	}
+}
+
+func TestReviewF121StatusFailurePreservesTLSFinding(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "read scope required", http.StatusForbidden)
+	}))
+	defer srv.Close()
+	file := filepath.Join(root, clientconf.AptSourcesPath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("Types: deb\nURIs: "+srv.URL+"/apt/ubuntu/\nSuites: resolute\nComponents: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := host.TrustProbe{
+		Root: root, Home: root, GOOS: "linux", Getenv: func(string) string { return "" },
+		Chain:  func(string) ([]*x509.Certificate, error) { return []*x509.Certificate{srv.Certificate()}, nil },
+		System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} },
+	}
+	ok := host.Finding{Check: "apt-sources", Status: host.StatusOK}
+	before := probe.Apply([]host.Finding{ok}, srv.URL)[0]
+	if before.Status != host.StatusWarn || !strings.Contains(before.Remediation, "--ca-file") {
+		t.Fatalf("fixture must produce the existing TLS warning: %+v", before)
+	}
+	h := &aptSourcesHost{goos: "linux", root: root}
+	row := h.rootFinding(ok, srv.URL, aptServedRootsAt(srv.URL, "", false))
+	got := probe.Apply([]host.Finding{row}, srv.URL)[0]
+	if got.Status != host.StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
+		t.Fatalf("status lookup suppressed the TLS finding: %+v", got)
+	}
+}
+
+// F121: doctor's own order, trust check first, keeps the --ca-file finding
+// when the status lookup is refused for want of a token, and adds the token
+// remediation to it rather than replacing it.
+func TestDoctorAptRootStatusRefusalComposesWithTLSFinding(t *testing.T) {
+	root := t.TempDir()
+	base := "https://bodega.example"
+	file := filepath.Join(root, clientconf.AptSourcesPath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("Types: deb\nURIs: "+base+"/apt/ubuntu/\nSuites: resolute\nComponents: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &aptSourcesHost{goos: "linux", root: root}
+	refused := func() (map[string]string, error) { return nil, errors.New("GET /api/v1/status: 401 Unauthorized") }
+	tlsWarn := host.Finding{Check: "apt-sources", Status: host.StatusWarn, Detail: "configured for bodega, and apt does not trust its certificate", Remediation: "install the CA that issued bodega's certificate: bodega doctor --configure apt --ca-file <CA certificate PEM> --apply"}
+	got := h.rootFinding(tlsWarn, base, refused)
+	if got.Status != host.StatusWarn || !strings.HasPrefix(got.Remediation, tlsWarn.Remediation+"; ") || !strings.Contains(got.Remediation, "--token") || !strings.Contains(got.Detail, "401") {
+		t.Errorf("a refused status lookup on a TLS warning: row = %+v, want both findings", got)
+	}
+}
+
+func TestReviewF121MovedArchiveUnderPublicURLPrefix(t *testing.T) {
+	for _, prefix := range []string{"", "/bodega"} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			root := t.TempDir()
+			var base string
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET "+prefix+"/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+				src := aptsources.Render(aptsources.State{PublicURL: base, Suites: []string{"trixie"}, Components: []string{"main"}, Mirrored: true, Archive: "debian"})
+				_ = json.NewEncoder(w).Encode(map[string]any{"apt": map[string]any{"sources": []aptsources.Sources{src}}})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			base = srv.URL + prefix
+			before := clientconf.Apt(aptsources.Render(aptsources.State{PublicURL: base, Suites: []string{"trixie"}, Components: []string{"main"}, Mirrored: true}))
+			file := filepath.Join(root, clientconf.AptSourcesPath)
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(before.Content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h := &aptSourcesHost{goos: "linux", root: root}
+			got := h.rootFinding(host.Finding{Check: "apt-sources", Status: host.StatusOK}, base, aptServedRootsAt(base, "", true))
+			if got.Status != host.StatusWarn || !strings.Contains(got.Detail, base+"/apt/debian/") || !strings.Contains(got.Remediation, "--suite trixie --apply --url "+base) {
+				t.Fatalf("stale sources under public URL prefix %q escaped the archive check: %+v", prefix, got)
+			}
+		})
+	}
 }
