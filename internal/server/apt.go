@@ -492,6 +492,11 @@ type aptSnapshot struct {
 	// those are served from the snapshot and signed with bodega's key.
 	hidden          aptMirrorHides
 	mirrorRewritten map[string]bool
+
+	// mirrorIndexes is every filtered Packages the rewritten groups above
+	// serve, keyed by what it was built from, for the next rebuild to reuse.
+	// Kept on the snapshot so it lives exactly as long as what it describes.
+	mirrorIndexes map[aptMirrorIndexKey]aptMirrorIndex
 }
 
 // rebuildAptSnapshot regenerates the index and publishes it to every
@@ -621,7 +626,9 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 		}
 		snap.profileSuites[ps.codename] = ps.profile
 	}
-	for codename, idx := range s.aptMirrorRewrites(ctx, snap.hidden, date, snap.validUntil) {
+	rewrites, reusable := s.aptMirrorRewrites(ctx, snap.hidden, date, snap.validUntil)
+	snap.mirrorIndexes = reusable
+	for codename, idx := range rewrites {
 		snap.suites[codename] = idx
 		if snap.mirrorRewritten == nil {
 			snap.mirrorRewritten = map[string]bool{}
@@ -942,13 +949,47 @@ type aptReleaseHeader struct {
 	notAutomatic, butAutomaticUpgrades      string
 }
 
+// aptIndexBody is one Packages body in the two forms a Release vouches for,
+// with the SHA256 of each as the Release prints it. Held together so a
+// rewrite that reuses a body reuses its gzip and digests with it, rather than
+// paying for them again on bytes that did not change.
+type aptIndexBody struct {
+	plain, gz       []byte
+	plainSum, gzSum string
+}
+
+func newAptIndexBody(plain []byte) aptIndexBody {
+	var gz bytes.Buffer
+	gw := gzip.NewWriter(&gz)
+	_, _ = gw.Write(plain)
+	_ = gw.Close()
+	plainSum, gzSum := sha256.Sum256(plain), sha256.Sum256(gz.Bytes())
+	return aptIndexBody{
+		plain: plain, gz: gz.Bytes(),
+		plainSum: hex.EncodeToString(plainSum[:]), gzSum: hex.EncodeToString(gzSum[:]),
+	}
+}
+
 // aptIndexWithHeader is aptIndexFrom with the Release's identity fields named
 // by the caller.
 func (s *Server) aptIndexWithHeader(header aptReleaseHeader, components []string, packages map[string]map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
+	bodies := make(map[string]map[string]aptIndexBody, len(packages))
+	for comp, byArch := range packages {
+		bodies[comp] = make(map[string]aptIndexBody, len(byArch))
+		for arch, plain := range byArch {
+			bodies[comp][arch] = newAptIndexBody(plain)
+		}
+	}
+	return s.aptIndexWithBodies(header, components, bodies, date, validUntil)
+}
+
+// aptIndexWithBodies is aptIndexWithHeader over bodies already compressed and
+// hashed. The served index shares their byte slices.
+func (s *Server) aptIndexWithBodies(header aptReleaseHeader, components []string, bodies map[string]map[string]aptIndexBody, date, validUntil time.Time) *aptSuiteIndex {
 	suite := header.suite
 	archSet := map[string]bool{}
 	for _, comp := range components {
-		for arch := range packages[comp] {
+		for arch := range bodies[comp] {
 			archSet[arch] = true
 		}
 	}
@@ -961,26 +1002,23 @@ func (s *Server) aptIndexWithHeader(header aptReleaseHeader, components []string
 	}
 	type indexEntry struct {
 		path string
-		data []byte
+		sum  string
+		size int
 	}
 	var entries []indexEntry
 	for _, comp := range components {
 		idx.packages[comp] = map[string][]byte{}
 		idx.packagesGz[comp] = map[string][]byte{}
 		for _, arch := range arches {
-			pkgData, ok := packages[comp][arch]
+			body, ok := bodies[comp][arch]
 			if !ok {
 				continue
 			}
-			var gz bytes.Buffer
-			gw := gzip.NewWriter(&gz)
-			_, _ = gw.Write(pkgData)
-			_ = gw.Close()
 			entries = append(entries,
-				indexEntry{path: comp + "/binary-" + arch + "/Packages", data: pkgData},
-				indexEntry{path: comp + "/binary-" + arch + "/Packages.gz", data: gz.Bytes()})
-			idx.packages[comp][arch] = pkgData
-			idx.packagesGz[comp][arch] = gz.Bytes()
+				indexEntry{path: comp + "/binary-" + arch + "/Packages", sum: body.plainSum, size: len(body.plain)},
+				indexEntry{path: comp + "/binary-" + arch + "/Packages.gz", sum: body.gzSum, size: len(body.gz)})
+			idx.packages[comp][arch] = body.plain
+			idx.packagesGz[comp][arch] = body.gz
 		}
 	}
 
@@ -1008,8 +1046,7 @@ func (s *Server) aptIndexWithHeader(header aptReleaseHeader, components []string
 	fmt.Fprintf(&buf, "Valid-Until: %s\n", validUntil.Format(time.RFC1123Z))
 	fmt.Fprintf(&buf, "SHA256:\n")
 	for _, e := range entries {
-		h := sha256.Sum256(e.data)
-		fmt.Fprintf(&buf, " %s %d %s\n", hex.EncodeToString(h[:]), len(e.data), e.path)
+		fmt.Fprintf(&buf, " %s %d %s\n", e.sum, e.size, e.path)
 	}
 	idx.release = buf.Bytes()
 	s.signAptRelease(idx, suite)

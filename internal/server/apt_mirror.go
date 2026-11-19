@@ -587,7 +587,7 @@ func (s *Server) observeAptMirrorDists(ctx context.Context, codename, rest strin
 			"codename", codename, "index", rest, "error", err)
 		return
 	}
-	s.recordAptIndexEntries(ctx, codename, rest, digest, entries)
+	_ = s.recordAptIndexEntries(ctx, codename, rest, digest, entries)
 }
 
 func aptEntriesNameAVersion(entries []audit.AptIndexEntry) bool {
@@ -621,15 +621,17 @@ func aptDecompressSniffed(codename, rest string, raw []byte) ([]byte, error) {
 // source version for each pool path, then reads any index the record left the
 // gate needing. A failure is logged and costs only those versions' coverage:
 // the gate finds no record and leaves them unchecked, and the next read of
-// the file tries again.
-func (s *Server) recordAptIndexEntries(ctx context.Context, codename, label, sum string, entries []audit.AptIndexEntry) {
+// the file tries again, as does the next mirror rewrite that reuses an index
+// built from it.
+func (s *Server) recordAptIndexEntries(ctx context.Context, codename, label, sum string, entries []audit.AptIndexEntry) error {
 	ctx = context.WithoutCancel(ctx)
 	if err := s.auditDB.RecordAptIndexMembers(ctx, codename, sum, entries); err != nil {
-		s.logger.Warn("could not record which versions a mirrored apt index listed, so the age gate leaves the new ones unchecked until the next read",
+		s.logger.Warn("could not record which versions a mirrored apt index listed, so the age gate leaves the new ones unchecked until the next read or index rebuild retries",
 			"codename", codename, "index", label, "error", err)
-		return
+		return err
 	}
 	s.readPendingAptIndexes(ctx, codename)
+	return nil
 }
 
 // readPendingAptIndexes reads, by hash from the archive, each Packages file
