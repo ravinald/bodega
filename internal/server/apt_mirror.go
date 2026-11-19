@@ -217,12 +217,16 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 	// line returns on discovery being off — so on a default install every
 	// mirrored .deb after the first was served with nothing in the trail
 	// saying the cache answered it.
-	serveHit := func(admit func() bool) {
+	//
+	// The profile's refusal is judged first: it is a verdict on this request
+	// whatever the bytes are, and a paragraph repair run for a host that may
+	// not have the path would answer it with the repair's outcome instead.
+	serveHit := func(admit func(cachedObject) bool) {
 		s.serveCacheHitIf(w, r, store, key, true, func(obj cachedObject) bool {
-			if admit != nil && !admit() {
+			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
 				return false
 			}
-			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
+			if !admit(obj) {
 				return false
 			}
 			return s.aptMirrorHitGate(w, r, poolPath)
@@ -241,11 +245,24 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 	// once a fleet is warm: the probe is per pool path and the cache read is
 	// not. The exception is a host whose profile refuses a vendor archive,
 	// where the archive the object came from is the whole question and
-	// aptAdmitCachedDeb answers it.
-	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
-		serveHit(nil)
+	// aptAdmitCachedDeb answers it. No paragraph names this path, so a hit has
+	// nothing to be judged against and takes no lock.
+	serveAny := func(cachedObject) bool { return true }
+	if s.aptCached(r.Context(), store, key, true) != nil {
+		serveHit(serveAny)
 		return
 	}
+
+	// A fill runs under the lock a listed request repairs this key under,
+	// because a paragraph naming the path can be published while this request
+	// is in flight, and the cache is read again under it: the miss above is a
+	// verdict on whatever sat at the key then, and a fill that trusted it would
+	// land beside, or after, that repair. The lock is released once the fill
+	// has stored its bytes and pin, never held for the transfer to the client.
+	var once sync.Once
+	locked := s.aptMirror.lock(key)
+	release := func() { once.Do(locked) }
+	defer release()
 	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, s.cfg.AptPoolUpstreamsIn(archive))
 	if !ok {
 		return
@@ -257,10 +274,17 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 	if refuse(base) {
 		return
 	}
+	if s.aptCached(r.Context(), store, key, true) != nil {
+		release()
+		serveHit(serveAny)
+		return
+	}
 	// The resolver answers with the archive root, which is what the route
 	// cache keys on: the pool path is already in hand and re-deriving it from
 	// a stored full URL would be a second parse of the same string.
-	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
+	upstream := base + "/" + poolPath
+	r = withFillHooks(r, fillHooks{fetchOnly: true, published: release})
+	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeApt, upstream, name, true, true)
 }
 
 // serveAptPoolListed serves a pool object a Packages paragraph names, and
@@ -270,31 +294,33 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 // of this key takes, and the lock is released only once the handle is open,
 // before any byte is streamed. A pin read outside it can belong to a
 // replacement that landed after the open, so a handle on the rejected build
-// would be served under the listed build's pin. Holding it for the open alone
-// keeps concurrent hits on one cached .deb from queueing behind each other's
-// transfers. Anything but a matching pin (no copy, no pin, another pin) is
-// settled under the same lock, so a request that waited behind a fill judges
-// what that fill left against its own paragraph.
-func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza, serveHit func(admit func() bool), refuse func(base string) bool) {
+// would be served under the listed build's pin. The opened handle's length is
+// held to the paragraph's Size as well, since the pin records a digest and no
+// length. Holding the lock for the open alone keeps concurrent hits on one
+// cached .deb from queueing behind each other's transfers. Anything else (no
+// copy, no pin, another pin, another length) is settled under the same lock,
+// so a request that waited behind a fill judges what that fill left against
+// its own paragraph.
+func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, poolPath, name string, want aptPoolStanza, serveHit func(admit func(cachedObject) bool), refuse func(base string) bool) {
 	var once sync.Once
 	locked := s.aptMirror.lock(key)
 	release := func() { once.Do(locked) }
 	defer release()
-	admitOpened := func() bool {
-		release()
-		return true
+	listed := func(obj cachedObject) bool {
+		return want.sizeMatches(obj.id.Size) && s.aptPinned(r.Context(), key) == want.sha256
 	}
 
 	if s.aptCached(r.Context(), store, key, true) != nil {
-		unpinned := false
-		serveHit(func() bool {
-			if s.aptPinned(r.Context(), key) == want.sha256 {
-				return admitOpened()
+		unlisted := false
+		serveHit(func(obj cachedObject) bool {
+			if listed(obj) {
+				release()
+				return true
 			}
-			unpinned = true
+			unlisted = true
 			return false
 		})
-		if !unpinned {
+		if !unlisted {
 			return
 		}
 	}
@@ -305,7 +331,18 @@ func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, stor
 		return
 	}
 	if cached {
-		serveHit(admitOpened)
+		// Under the lock, so this opens what the settle judged; a store some
+		// other process writes can still change it, and that is refused rather
+		// than served unjudged.
+		serveHit(func(obj cachedObject) bool {
+			if listed(obj) {
+				release()
+				return true
+			}
+			s.aptRepairRefusal(r.Context(), key, poolPath, name, want, "open the cached build it had just verified",
+				fmt.Errorf("the object changed while it was opened (%d bytes)", obj.id.Size)).write(w, r)
+			return false
+		})
 		return
 	}
 	base, ok := s.aptResolvePoolUpstreamAmong(w, r, key, s.aptCodenameRoots(want.codename))
@@ -319,7 +356,7 @@ func (s *Server) serveAptPoolListed(w http.ResponseWriter, r *http.Request, stor
 	if refuse(base) {
 		return
 	}
-	s.serveAptMirrorIndexed(w, r, store, key, base, poolPath, name, want)
+	s.serveAptMirrorIndexed(w, r, store, key, base, poolPath, name, want, release)
 }
 
 // aptPinned is the SHA256 pinned for key, or "" when none is pinned or the
@@ -351,15 +388,8 @@ func (s *Server) aptSettleListedCache(ctx context.Context, store storage.ObjectS
 		return s.aptCached(ctx, store, key, true) != nil, nil
 	}
 	ctx = context.WithoutCancel(ctx)
-	_, version := manifest.AptDebIdentity(path.Base(poolPath))
 	fail := func(what string, err error) *refusal {
-		f := newRefusal(checkChecksum, manifest.TypeApt, name, version, http.StatusBadGateway)
-		f.reason = fmt.Sprintf("bodega could not %s for %s, whose Packages paragraph in %s lists sha256 %s, so it serves nothing for it: %v.",
-			what, poolPath, want.codename, want.sha256, err)
-		f.next = fmt.Sprintf("retry; if it persists, give an operator incident %s, whose ERROR line in the server log names the step that failed.", f.incident)
-		s.logger.Error("bodega could not repair a cached .deb its Packages paragraph disagrees with, so it refused the request",
-			"key", key, "step", what, "listed", want.sha256, "error", err, "incident", f.incident)
-		return f
+		return s.aptRepairRefusal(ctx, key, poolPath, name, want, what, err)
 	}
 	pin, err := s.auditDB.GetChecksum(ctx, key)
 	if err != nil {
@@ -373,37 +403,53 @@ func (s *Server) aptSettleListedCache(ctx context.Context, store storage.ObjectS
 	if err != nil {
 		return false, fail("read the cached object", err)
 	}
+	dropped := false
 	if info != nil && info.Exists {
-		if pinned == want.sha256 {
+		if pinned == want.sha256 && want.sizeMatches(info.Size) {
 			return true, nil
 		}
-		stored := pinned
+		stored, storedSize := pinned, info.Size
 		if pinned == "" {
 			sum, size, err := aptStoredDigest(ctx, store, key)
 			if err != nil {
 				return false, fail("hash the unpinned cached object", err)
 			}
-			if sum == want.sha256 && (want.size < 0 || size == want.size) {
+			if sum == want.sha256 && want.sizeMatches(size) {
 				pkgType, pkgName, pkgVersion := manifest.ParseKey(key)
 				if err := s.auditDB.StoreChecksum(ctx, key, pkgType, pkgName, pkgVersion, "sha256", sum, "computed"); err != nil {
 					return false, fail("pin the unpinned cached object", err)
 				}
 				return true, nil
 			}
-			stored = sum
+			stored, storedSize = sum, size
 		}
 		s.logger.Warn("a cached .deb is not the build the Packages paragraph naming its path lists, so bodega drops the object and its pin and fetches it again",
-			"key", key, "cached", stored, "pinned", pinned, "listed", want.sha256, "codename", want.codename)
+			"key", key, "cached", stored, "cached_size", storedSize, "pinned", pinned,
+			"listed", want.sha256, "listed_size", want.size, "codename", want.codename)
 		if err := store.Delete(ctx, key); err != nil {
 			return false, fail("remove the cached build the paragraph disagrees with", err)
 		}
+		dropped = true
 	}
-	if pinned != "" && pinned != want.sha256 {
+	if pinned != "" && (pinned != want.sha256 || dropped) {
 		if err := s.auditDB.ClearChecksum(ctx, key); err != nil {
 			return false, fail("clear the pin the paragraph disagrees with", err)
 		}
 	}
 	return false, nil
+}
+
+// aptRepairRefusal answers a listed pool object bodega could not bring into
+// line with its paragraph, naming the step that failed.
+func (s *Server) aptRepairRefusal(ctx context.Context, key, poolPath, name string, want aptPoolStanza, what string, err error) *refusal {
+	_, version := manifest.AptDebIdentity(path.Base(poolPath))
+	f := newRefusal(checkChecksum, manifest.TypeApt, name, version, http.StatusBadGateway)
+	f.reason = fmt.Sprintf("bodega could not %s for %s, whose Packages paragraph in %s lists sha256 %s, so it serves nothing for it: %v.",
+		what, poolPath, want.codename, want.sha256, err)
+	f.next = fmt.Sprintf("retry; if it persists, give an operator incident %s, whose ERROR line in the server log names the step that failed.", f.incident)
+	s.logFor(ctx).Error("bodega could not repair a cached .deb its Packages paragraph disagrees with, so it refused the request",
+		"key", key, "step", what, "listed", want.sha256, "error", err, "incident", f.incident)
+	return f
 }
 
 // aptStoredDigest is the SHA256 and size of the object stored at key.
@@ -439,17 +485,20 @@ func (s *Server) aptCodenameRoots(codename string) []string {
 // serveAptMirrorIndexed is serveAptMirror for a .deb a Packages paragraph
 // names: the fetched bytes are held to the paragraph's size and SHA256 before
 // anything is pinned, cached or served. The caller holds the key's fill lock
-// and has settled the cache, so the proxy finds no copy to serve.
-func (s *Server) serveAptMirrorIndexed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, root, poolPath, name string, want aptPoolStanza) {
+// and has settled the cache, so the proxy is told to fetch rather than serve a
+// copy it would not hold to the paragraph, and released runs once the fill has
+// stored its bytes and pin.
+func (s *Server) serveAptMirrorIndexed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, root, poolPath, name string, want aptPoolStanza, released func()) {
 	upstream := root + "/" + poolPath
 	resolve := func(context.Context) (resolvedUpstream, error) {
 		return resolvedUpstream{url: upstream, check: func(ctx context.Context, sum string, size int64) *refusal {
-			if sum == want.sha256 && (want.size < 0 || size == want.size) {
+			if sum == want.sha256 && want.sizeMatches(size) {
 				return nil
 			}
 			return s.aptParagraphMismatch(ctx, key, root, poolPath, name, want, sum, size)
 		}}, nil
 	}
+	r = withFillHooks(r, fillHooks{fetchOnly: true, published: released})
 	s.proxyOrResolveIndexed(w, r, store, key, resolve, upstream, nil, manifest.TypeApt, upstream, name, true, true)
 }
 
@@ -630,6 +679,12 @@ type aptPoolStanza struct {
 	sha256   string
 	size     int64
 	codename string
+}
+
+// sizeMatches reports whether n bytes is the length the paragraph lists. A
+// paragraph with no Size field, read as -1, constrains nothing.
+func (st aptPoolStanza) sizeMatches(n int64) bool {
+	return st.size < 0 || n == st.size
 }
 
 // aptPoolConflict is a pool path two codenames of one archive list with
@@ -1333,10 +1388,11 @@ func (s *Server) aptPoolHitUpstream(r *http.Request, poolPath, key string, obj c
 // serveAptMirror runs one mirrored fetch through proxyOrCache, coalescing
 // concurrent misses for the same object.
 //
-// Coalescing is skipped on a hit. A fleet installing the same package at the
-// same minute should make one upstream fetch, but concurrent clients pulling
-// one already-cached 80 MB .deb out of storage must not serialize behind each
-// other — that would turn the cache into the bottleneck it exists to remove.
+// It serves the dists/ tree; pool objects take handleAptMirrorPool's lock,
+// which a listed repair shares. Coalescing is skipped on a hit. A fleet
+// running apt update at the same minute should make one upstream fetch, but
+// concurrent clients reading one cached index must not serialize behind each
+// other, which would turn the cache into the bottleneck it exists to remove.
 // The waiters re-enter proxyOrCache after the leader returns and find the
 // object in storage.
 func (s *Server) serveAptMirror(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, upstream, pkgName string, immutable bool) {
