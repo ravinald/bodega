@@ -696,10 +696,6 @@ func (s *Server) aptArchiveFile(h *clientHost, codename string) clientconf.File 
 	return clientconf.AptArchiveIn(h.base, s.cfg.AptArchiveOf(codename), codename, s.cfg.AptComponentsFor(codename))
 }
 
-// aptPocketSuffixes are the pockets a mirrored Ubuntu base carries, in the
-// order Ubuntu's own sources file names them.
-var aptPocketSuffixes = []string{"-updates", "-backports", "-security"}
-
 // aptPocketBase names the mirrored base a mirrored suite is a pocket of. A
 // pocket whose base this server does not mirror belongs to nothing and stays a
 // choice of its own.
@@ -707,24 +703,13 @@ func (s *Server) aptPocketBase(suite string) (string, bool) {
 	if !s.cfg.MirrorsAptCodename(suite) {
 		return "", false
 	}
-	for _, suffix := range aptPocketSuffixes {
-		if base, ok := strings.CutSuffix(suite, suffix); ok && base != "" && s.cfg.MirrorsAptCodename(base) {
-			return base, true
-		}
-	}
-	return "", false
+	return clientconf.AptPocketBase(suite, s.cfg.MirrorsAptCodename)
 }
 
 // aptMirroredPockets lists the pockets of base this server mirrors, in
-// aptPocketSuffixes order.
+// clientconf.AptPockets order.
 func (s *Server) aptMirroredPockets(base string) []string {
-	var out []string
-	for _, suffix := range aptPocketSuffixes {
-		if s.cfg.MirrorsAptCodename(base + suffix) {
-			out = append(out, base+suffix)
-		}
-	}
-	return out
+	return clientconf.AptPockets(base, s.cfg.MirrorsAptCodename)
 }
 
 // aptPocketStanza renders a mirrored base and its pockets as one choice, in

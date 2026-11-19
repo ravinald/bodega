@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -206,7 +208,11 @@ func aptRootPath(uri string) (string, bool) {
 //
 // served is asked only when a source names bodega, so a host that reads
 // nothing from bodega makes no request. A failure to ask leaves the row
-// unable to say, which an OK row reports as a skip.
+// unable to say, which an OK row reports as a skip and a WARN row adds to
+// what it already says. A certificate that did not verify is the exception:
+// the trust check measures that against the stores apt reads and remedies it
+// with --ca-file, which a token cannot, and it judges only OK and WARN rows,
+// so the row keeps its status and only notes what went unchecked.
 func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() (map[string]string, error)) host.Finding {
 	if h.goos != "linux" || f.Check != "apt-sources" || (f.Status != host.StatusOK && f.Status != host.StatusWarn) {
 		return f
@@ -247,13 +253,23 @@ func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() 
 	}
 	roots, err := served()
 	if err != nil {
-		if f.Status == host.StatusOK {
+		unchecked := "whether each apt source naming bodega reads its suites from the root bodega serves them under is unchecked: " + err.Error()
+		remedy := "pass --token with a read-scope token (or bind this host's address with bodega identity bind cidr), and --url naming the server, then re-run doctor"
+		var cert *tls.CertificateVerificationError
+		switch {
+		case errors.As(err, &cert):
+			f.Detail = strings.TrimPrefix(f.Detail+"; "+unchecked, "; ")
+		case f.Status == host.StatusOK:
 			f.Status = host.StatusSkip
-			f.Detail += "; whether each apt source naming bodega reads its suites from the root bodega serves them under is unchecked: " + err.Error()
-			f.Remediation = "pass --token with a read-scope token (or bind this host's address with bodega identity bind cidr), and --url naming the server, then re-run doctor"
+			f.Detail = strings.TrimPrefix(f.Detail+"; "+unchecked, "; ")
+			f.Remediation = remedy
+		default:
+			f.Detail = f.Detail + "; " + unchecked
+			f.Remediation = strings.TrimPrefix(f.Remediation+"; "+remedy, "; ")
 		}
 		return f
 	}
+	isServed := func(suite string) bool { _, ok := roots[suite]; return ok }
 	var moved, fixes []string
 	for _, o := range ours {
 		for _, suite := range o.entry.Suites {
@@ -268,8 +284,13 @@ func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() 
 			moved = append(moved, fmt.Sprintf("%s entry %d reads %s from %s, which bodega serves at %s and answers 404 for there", file, o.entry.Entry, suite, o.uri, want))
 			// A vendor archive's own file is rewritten by naming the archive;
 			// --suite there would make the vendor codename the host's main
-			// stanza.
-			selects := "--suite " + o.entry.Suites[0]
+			// stanza. bodega's own file is rewritten whole from its base,
+			// since the plan refuses a pocket named on its own.
+			codename := suite
+			if b, ok := clientconf.AptPocketBase(suite, isServed); ok {
+				codename = b
+			}
+			selects := "--suite " + codename
 			if file == clientconf.AptArchiveSourcesPath(o.entry.Suites[0]) {
 				selects = "--suite <this host's codename> --archive " + o.entry.Suites[0]
 			}

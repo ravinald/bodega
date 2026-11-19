@@ -320,9 +320,6 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
-			for i := range findings {
-				findings[i] = aptSources.rootFinding(findings[i], base, aptServedRootsAt(base, token, allowPlaintext))
-			}
 			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
 			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
@@ -335,6 +332,12 @@ See docs/threat-model.md for the rationale behind each check.`,
 			probe := doctorTrustProbe()
 			findings = append(findings, probe.Rows(base)...)
 			findings = probe.Apply(findings, base)
+			// After Apply: a row rootFinding skips is one Apply no longer
+			// judges, and a status lookup that failed says nothing about
+			// whether apt trusts bodega's certificate.
+			for i := range findings {
+				findings[i] = aptSources.rootFinding(findings[i], base, aptServedRootsAt(base, token, allowPlaintext))
+			}
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
 			for i := range findings {
 				findings[i].Detail = clientconf.RedactLocations(findings[i].Detail)

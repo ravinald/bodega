@@ -4958,3 +4958,81 @@ func TestDoctorAptRowReportsAMovedCodename(t *testing.T) {
 		t.Errorf("sources naming another host: row = %+v, want it unchanged and the server not asked", got)
 	}
 }
+
+func TestReviewF121MovedPocketUsesBaseRemediation(t *testing.T) {
+	root := t.TempDir()
+	h := &aptSourcesHost{goos: "linux", root: root}
+	base := "https://bodega.example"
+	file := filepath.Join(root, clientconf.AptSourcesPath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := "Types: deb\nURIs: " + base + "/apt/debian/\nSuites: trixie trixie-updates\nComponents: main contrib\n\n" +
+		"Types: deb\nURIs: " + base + "/apt/debian/\nSuites: trixie-security\nComponents: main\n"
+	if err := os.WriteFile(file, []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	served := func() (map[string]string, error) {
+		return map[string]string{
+			"trixie": base + "/apt/debian/", "trixie-updates": base + "/apt/debian/",
+			"trixie-security": base + "/apt/debian-security/",
+		}, nil
+	}
+	got := h.rootFinding(host.Finding{Check: "apt-sources", Status: host.StatusOK}, base, served)
+	if got.Status != host.StatusWarn || !strings.Contains(got.Remediation, "--suite trixie --apply") {
+		t.Fatalf("moved pocket remediation cannot select its base: %+v", got)
+	}
+}
+
+func TestReviewF121StatusFailurePreservesTLSFinding(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "read scope required", http.StatusForbidden)
+	}))
+	defer srv.Close()
+	file := filepath.Join(root, clientconf.AptSourcesPath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("Types: deb\nURIs: "+srv.URL+"/apt/ubuntu/\nSuites: resolute\nComponents: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := host.TrustProbe{
+		Root: root, Home: root, GOOS: "linux", Getenv: func(string) string { return "" },
+		Chain:  func(string) ([]*x509.Certificate, error) { return []*x509.Certificate{srv.Certificate()}, nil },
+		System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} },
+	}
+	ok := host.Finding{Check: "apt-sources", Status: host.StatusOK}
+	before := probe.Apply([]host.Finding{ok}, srv.URL)[0]
+	if before.Status != host.StatusWarn || !strings.Contains(before.Remediation, "--ca-file") {
+		t.Fatalf("fixture must produce the existing TLS warning: %+v", before)
+	}
+	h := &aptSourcesHost{goos: "linux", root: root}
+	row := h.rootFinding(ok, srv.URL, aptServedRootsAt(srv.URL, "", false))
+	got := probe.Apply([]host.Finding{row}, srv.URL)[0]
+	if got.Status != host.StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
+		t.Fatalf("status lookup suppressed the TLS finding: %+v", got)
+	}
+}
+
+// F121: doctor's own order, trust check first, keeps the --ca-file finding
+// when the status lookup is refused for want of a token, and adds the token
+// remediation to it rather than replacing it.
+func TestDoctorAptRootStatusRefusalComposesWithTLSFinding(t *testing.T) {
+	root := t.TempDir()
+	base := "https://bodega.example"
+	file := filepath.Join(root, clientconf.AptSourcesPath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("Types: deb\nURIs: "+base+"/apt/ubuntu/\nSuites: resolute\nComponents: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &aptSourcesHost{goos: "linux", root: root}
+	refused := func() (map[string]string, error) { return nil, errors.New("GET /api/v1/status: 401 Unauthorized") }
+	tlsWarn := host.Finding{Check: "apt-sources", Status: host.StatusWarn, Detail: "configured for bodega, and apt does not trust its certificate", Remediation: "install the CA that issued bodega's certificate: bodega doctor --configure apt --ca-file <CA certificate PEM> --apply"}
+	got := h.rootFinding(tlsWarn, base, refused)
+	if got.Status != host.StatusWarn || !strings.HasPrefix(got.Remediation, tlsWarn.Remediation+"; ") || !strings.Contains(got.Remediation, "--token") || !strings.Contains(got.Detail, "401") {
+		t.Errorf("a refused status lookup on a TLS warning: row = %+v, want both findings", got)
+	}
+}

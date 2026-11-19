@@ -1306,7 +1306,7 @@ func (s *Server) aptHostSources(r *http.Request, out aptStatus) (string, *aptsou
 }
 
 // aptProfileHostSuites lists the filtered codenames a host bound to p reads,
-// the base's first and then each mirrored pocket's in aptPocketSuffixes order,
+// the base's first and then each mirrored pocket's in clientconf.AptPockets order,
 // and separately the mirrored pockets whose codename this snapshot does not
 // carry. suites is empty when the base's own codename is missing.
 //
