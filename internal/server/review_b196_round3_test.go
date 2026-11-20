@@ -362,3 +362,90 @@ func TestReviewB196CachedMetadataReplayCannotReplaceBuiltAuthority(t *testing.T)
 		t.Errorf("last successful pool-index build was replaced: %q %v", stored, err)
 	}
 }
+
+func TestReviewB196FreshOtherArchitectureCannotPromoteCachedReplay(t *testing.T) {
+	const old = "previous distribution build"
+	const armPath = "main/binary-arm64/Packages"
+	const armDeb = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_arm64.deb"
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := func(amd string) map[string]string {
+		t.Helper()
+		main := fixtureDistsFor(t, kr, mirroredCodename, fixturePackages(fixtureDeb, amd), "amd64")
+		arm := fixtureDistsFor(t, kr, mirroredCodename,
+			strings.ReplaceAll(fixturePackages(armDeb, "arm64 package"), "Architecture: amd64", "Architecture: arm64"), "arm64")
+		base := "dists/" + mirroredCodename + "/"
+		_, hashes, ok := strings.Cut(arm[base+"Release"], "\nSHA256:\n")
+		if !ok {
+			t.Fatal("arm fixture has no hashes")
+		}
+		release := strings.Replace(main[base+"Release"], "Architectures: amd64", "Architectures: amd64 arm64", 1) + hashes
+		for k, v := range arm {
+			main[k] = v
+		}
+		main[base+"Release"] = release
+		signed, err := kr.ClearSign([]byte(release))
+		if err != nil {
+			t.Fatal(err)
+		}
+		main[base+"InRelease"] = string(signed)
+		detached, err := kr.DetachSign([]byte(release))
+		if err != nil {
+			t.Fatal(err)
+		}
+		main[base+"Release.gpg"] = string(detached)
+		main[fixtureDeb] = amd
+		return main
+	}
+	archive := newFixtureArchive(t, objects(old))
+	s := mirrorServer(t, archive)
+	read := func(rel string) {
+		t.Helper()
+		if code, body := mirrorGet(t, s, "/apt/dists/"+mirroredCodename+"/"+rel); code != http.StatusOK {
+			t.Fatalf("metadata %s = %d %q", rel, code, body)
+		}
+	}
+	read("Release")
+	read(packagesPath + ".gz")
+	for rel, data := range objects(fixtureDebBody) {
+		archive.setObject(rel, data)
+	}
+	s.aptUpstreamIdx.Clear()
+	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("new pool-index build = %d %q", code, body)
+	}
+	key := manifest.AptKey(fixtureDeb)
+	want, conflict := s.aptPoolParagraph(t.Context(), key)
+	if want == nil || conflict != nil || want.sha256 != sha256Of(fixtureDebBody) {
+		t.Fatal("pool did not establish the new paragraph")
+	}
+	reads := archive.count("dists/" + mirroredCodename + "/" + packagesPath + ".gz")
+	read("Release")
+	read(packagesPath + ".gz")
+	if archive.count("dists/"+mirroredCodename+"/"+packagesPath+".gz") != reads {
+		t.Fatal("amd64 replay fetched upstream")
+	}
+	armReads := archive.count("dists/" + mirroredCodename + "/" + armPath + ".gz")
+	read(armPath + ".gz")
+	if archive.count("dists/"+mirroredCodename+"/"+armPath+".gz") != armReads+1 {
+		t.Fatal("arm64 read did not fetch upstream")
+	}
+	archive.setObject(fixtureDeb, old)
+	archive.removeObject("dists/" + mirroredCodename + "/Release")
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx.at = time.Time{}
+	s.aptPoolIdx.mu.Unlock()
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusBadGateway && (code != http.StatusOK || string(body) != fixtureDebBody) {
+		t.Errorf("fresh arm64 read promoted old amd64 replay: got %d %q, want %q or 502", code, body, fixtureDebBody)
+	}
+	if pin, err := s.auditDB.GetChecksum(t.Context(), key); err != nil || (pin != nil && pin.Value != "" && pin.Value != sha256Of(fixtureDebBody)) {
+		t.Errorf("last pool-read pin replaced: %+v %v", pin, err)
+	}
+	if stored, err := s.typeStore(manifest.TypeApt).Get(t.Context(), key); err != nil || (len(stored) > 0 && string(stored) != fixtureDebBody) {
+		t.Errorf("last pool-read bytes replaced: %q %v", stored, err)
+	}
+}

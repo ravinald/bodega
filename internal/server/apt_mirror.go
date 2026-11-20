@@ -777,9 +777,8 @@ type aptPoolConflict struct {
 // the authority for its own.
 //
 // shadow holds the paragraphs of later codenames at a key byKey already
-// holds, and archives the archive each codename was indexed under, so a
-// rebuild that cannot read a codename carries forward every paragraph it last
-// read for it rather than only those that came first.
+// holds, so two codenames disagreeing about one path are both seen, and
+// archives the archive each codename was indexed under.
 type aptPoolIndex struct {
 	ident     string
 	byKey     map[string]aptPoolStanza
@@ -794,9 +793,76 @@ type aptPoolIndex struct {
 	// Packages this index or one it carried from parsed for it. at is when
 	// the build ran, which says nothing about how old its documents were.
 	acquired map[string]time.Time
-	failed   []string
-	at       time.Time
-	ttl      time.Duration
+	// documents is, per triple in indexed, the paragraphs of that one
+	// Packages by key. A rebuild that cannot read a codename weighs each
+	// triple's document against the one served for the same triple alone:
+	// a newer read of arm64 says nothing about amd64.
+	documents map[string]map[string]aptPoolStanza
+	failed    []string
+	at        time.Time
+	ttl       time.Duration
+}
+
+// aptPoolDocument is the paragraphs of one Packages, for one triple, and when
+// bodega read it from upstream.
+type aptPoolDocument struct {
+	triple  string
+	stanzas map[string]aptPoolStanza
+	at      time.Time
+}
+
+// read records one Packages of triple read from upstream at at and returns
+// the add that files its paragraphs both in the document and in the index.
+func (idx *aptPoolIndex) read(triple string, at time.Time) func(key string, st aptPoolStanza) {
+	idx.acquire(triple, at)
+	doc := idx.documents[triple]
+	if doc == nil {
+		doc = map[string]aptPoolStanza{}
+		idx.documents[triple] = doc
+	}
+	return func(key string, st aptPoolStanza) {
+		if _, seen := doc[key]; !seen {
+			doc[key] = st
+		}
+		idx.add(key, st)
+	}
+}
+
+// documentsOf is every document idx holds for codename, by triple, when idx
+// indexed codename under archive.
+func (idx *aptPoolIndex) documentsOf(codename, archive string) map[string]aptPoolDocument {
+	docs := map[string]aptPoolDocument{}
+	if idx == nil || idx.archives[codename] != archive {
+		return docs
+	}
+	for triple := range idx.indexed {
+		if strings.HasPrefix(triple, codename+"/") {
+			docs[triple] = aptPoolDocument{triple: triple, stanzas: idx.documents[triple], at: idx.acquired[triple]}
+		}
+	}
+	return docs
+}
+
+// carryDocuments adds docs, newest upstream read first, so that where two
+// triples of one codename name a path, add keeps the paragraph of the one
+// read more recently.
+func (idx *aptPoolIndex) carryDocuments(docs map[string]aptPoolDocument) {
+	ordered := make([]aptPoolDocument, 0, len(docs))
+	for _, d := range docs {
+		ordered = append(ordered, d)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if !ordered[i].at.Equal(ordered[j].at) {
+			return ordered[i].at.After(ordered[j].at)
+		}
+		return ordered[i].triple < ordered[j].triple
+	})
+	for _, d := range ordered {
+		add := idx.read(d.triple, d.at)
+		for k, st := range d.stanzas {
+			add(k, st)
+		}
+	}
 }
 
 // acquire records that the Packages of triple read from upstream at at went
@@ -836,26 +902,6 @@ func (idx *aptPoolIndex) add(key string, st aptPoolStanza) {
 	idx.shadow[key] = append(idx.shadow[key], st)
 	if _, already := idx.conflicts[key]; !already && prev.sha256 != "" && st.sha256 != "" && prev.sha256 != st.sha256 {
 		idx.conflicts[key] = aptPoolConflict{codenames: [2]string{prev.codename, st.codename}, digests: [2]string{prev.sha256, st.sha256}}
-	}
-}
-
-// carry adds every paragraph prev read for codename, when prev indexed it
-// under the archive it belongs to now.
-func (idx *aptPoolIndex) carry(prev *aptPoolIndex, codename string) {
-	if prev == nil || prev.archives[codename] != idx.archives[codename] {
-		return
-	}
-	for k := range prev.indexed {
-		if strings.HasPrefix(k, codename+"/") {
-			idx.acquire(k, prev.acquired[k])
-		}
-	}
-	for k, first := range prev.byKey {
-		for _, st := range append([]aptPoolStanza{first}, prev.shadow[k]...) {
-			if st.codename == codename {
-				idx.add(k, st)
-			}
-		}
 	}
 }
 
@@ -955,7 +1001,8 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, prev *aptPoolIndex) *aptPoolIndex {
 	idx := &aptPoolIndex{ident: s.aptPoolIndexIdent(codenames), byKey: map[string]aptPoolStanza{},
 		shadow: map[string][]aptPoolStanza{}, conflicts: map[string]aptPoolConflict{}, archives: map[string]string{},
-		indexed: map[string]bool{}, acquired: map[string]time.Time{}, at: time.Now(), ttl: s.cache.MetadataTTL}
+		indexed: map[string]bool{}, acquired: map[string]time.Time{}, documents: map[string]map[string]aptPoolStanza{},
+		at: time.Now(), ttl: s.cache.MetadataTTL}
 	if idx.ttl <= 0 {
 		idx.ttl = aptRouteTTL
 	}
@@ -1039,8 +1086,7 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *a
 				}
 				continue
 			}
-			idx.acquire(triple, read.at)
-			if err := aptPoolStanzas(read.body, archive, codename, idx.add); err != nil {
+			if err := aptPoolStanzas(read.body, archive, codename, idx.read(triple, read.at)); err != nil {
 				return fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
 			}
 		}
@@ -1108,17 +1154,6 @@ type aptServedCodename struct {
 type aptServedTriple struct {
 	stanzas map[string]aptPoolStanza
 	at      time.Time
-}
-
-// newest is when the newest Packages served for c was read from upstream.
-func (c *aptServedCodename) newest() time.Time {
-	var newest time.Time
-	for _, t := range c.triples {
-		if t.at.After(newest) {
-			newest = t.at
-		}
-	}
-	return newest
 }
 
 // entry is codename's record under archive, created or reset as needed. The
@@ -1214,35 +1249,27 @@ func (sv *aptServedIndexes) forget(codename string, idx *aptPoolIndex) {
 }
 
 // carryInto adds to idx the paragraphs of codename that prev and the served
-// files hold, for a build that could not read codename. Whichever of the two
-// holds the Packages read from upstream more recently answers for a path both
-// name, prev on a tie; each adds the triples only it read. Both are ordered by
-// when bodega read upstream, never by when a cached copy was delivered, so a
-// replay of an older file cannot displace what the last pool read found.
+// files hold, for a build that could not read codename. Each triple is
+// decided on its own: the served file replaces prev's document for that
+// triple only when bodega read it from upstream later, and a triple only one
+// side holds comes from that side. Both are ordered by when bodega read
+// upstream, never by when a cached copy was delivered, so a replay of an
+// older file cannot displace what the last pool read found, and a fresh read
+// of one architecture lends no standing to another's replay.
 func (sv *aptServedIndexes) carryInto(idx, prev *aptPoolIndex, codename string) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
-	c := sv.byCodename[codename]
-	if c == nil || c.archive != idx.archives[codename] {
-		idx.carry(prev, codename)
-		return
-	}
-	servedFirst := prev == nil || prev.archives[codename] != idx.archives[codename] || c.newest().After(prev.acquiredFor(codename))
-	if !servedFirst {
-		idx.carry(prev, codename)
-	}
-	for triple, t := range c.triples {
-		if !servedFirst && prev.indexed[triple] {
-			continue
-		}
-		idx.acquire(triple, t.at)
-		for k, st := range t.stanzas {
-			idx.add(k, st)
+	archive := idx.archives[codename]
+	docs := prev.documentsOf(codename, archive)
+	if c := sv.byCodename[codename]; c != nil && c.archive == archive {
+		for triple, t := range c.triples {
+			if held, ok := docs[triple]; ok && !t.at.After(held.at) {
+				continue
+			}
+			docs[triple] = aptPoolDocument{triple: triple, stanzas: t.stanzas, at: t.at}
 		}
 	}
-	if servedFirst {
-		idx.carry(prev, codename)
-	}
+	idx.carryDocuments(docs)
 }
 
 // retainAptServedIndex keeps what a client was served from a mirrored
