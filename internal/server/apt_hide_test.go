@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -196,8 +197,8 @@ func TestMirroredHidePoolRefusesAnEpochVersion(t *testing.T) {
 		"Version: " + epochVersion,
 		"Architecture: amd64",
 		"Filename: " + epochDeb,
-		"Size: 42",
-		"SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
+		"Size: " + strconv.Itoa(len("\x21<arch>\nepochpkg bytes")),
+		"SHA256: " + sha256Hex("\x21<arch>\nepochpkg bytes"),
 		"Description: fixture package with an epoch",
 		"", "",
 	}, "\n")

@@ -129,6 +129,10 @@ type resolvedUpstream struct {
 	// indexURL is the document that listed the digest, for the refusal.
 	indexURL string
 	filename string
+	// check, when set, holds the spooled bytes to what the resolver's index
+	// lists by their digest and size, and returns the refusal, already
+	// recorded, when they differ.
+	check func(ctx context.Context, sha256 string, size int64) *refusal
 }
 
 // indexedResolver is an upstreamResolver whose answer comes from an index that
@@ -162,8 +166,13 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 	}
 
 	ctx := r.Context()
+	hooks := fillHooksFor(ctx)
 
-	status, err := store.Head(ctx, s3Key)
+	var status *storage.ObjectInfo
+	var err error
+	if !hooks.fetchOnly {
+		status, err = store.Head(ctx, s3Key)
+	}
 	if err != nil {
 		s.logFor(r.Context()).Error("s3 head check failed", "key", s3Key, "error", err)
 		// Fall through to upstream fetch if proxy enabled.
@@ -482,6 +491,12 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 		f.write(w, r)
 		return
 	}
+	if resolved.check != nil {
+		if f := resolved.check(ctx, spool.sha256, spool.size); f != nil {
+			f.write(w, r)
+			return
+		}
+	}
 	pinDigest, err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable)
 	if err != nil {
 		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
@@ -505,6 +520,9 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 	// never looks at.
 	if store != nil {
 		s.fillCache(ctx, store, s3Key, spool.path(), up.url, spool.sha256, spool.size)
+	}
+	if hooks.published != nil {
+		hooks.published()
 	}
 
 	// After the store write and before the body: by here the fetch has been
@@ -578,7 +596,7 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 		up.body = struct {
 			io.Reader
 			io.Closer
-		}{obs.wrap(ctx, up.body, up.contentLength), up.body}
+		}{obs.wrap(ctx, up.body, up.contentLength, time.Now()), up.body}
 	}
 	spool, err := s.spoolUpstream(up)
 	if err != nil {
@@ -736,8 +754,37 @@ func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstream
 // read cannot learn it from the response.
 type inputObserverCtxKey struct{}
 
+// acquired is when bodega read the object from upstream, and zero for a cached
+// object: delivering a copy observes nothing new about upstream, so a reader
+// ordering observations by it must not rank a replay above a fresh read.
 type inputObserver struct {
-	observe func(ctx context.Context, raw []byte)
+	observe func(ctx context.Context, raw []byte, acquired time.Time)
+}
+
+// fillHooks is what a caller holding a key's fill lock tells the proxy about
+// that fill.
+//
+// fetchOnly is set by a caller that settled the cache under the lock and holds
+// every copy of the key to a check the proxy does not know: each cache exit
+// below serves what a Head found, so the proxy skips the Head and fetches.
+//
+// published runs once a fill has stored its bytes and pin, before the body is
+// sent, so the caller can release the lock there: a slow client downloading
+// the fill must not hold up readers of the entry it completed.
+type fillHooks struct {
+	fetchOnly bool
+	published func()
+}
+
+type fillHooksCtxKey struct{}
+
+func withFillHooks(r *http.Request, h fillHooks) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), fillHooksCtxKey{}, h))
+}
+
+func fillHooksFor(ctx context.Context) fillHooks {
+	h, _ := ctx.Value(fillHooksCtxKey{}).(fillHooks)
+	return h
 }
 
 func withInputObserver(r *http.Request, obs *inputObserver) *http.Request {
@@ -755,9 +802,9 @@ func inputObserverFor(ctx context.Context) *inputObserver {
 // wrap returns body as a reader that reports the whole object to the observer
 // when it is read to its end. want is the declared length, negative when
 // nobody declared one.
-func (o *inputObserver) wrap(ctx context.Context, body io.Reader, want int64) *observedInput {
+func (o *inputObserver) wrap(ctx context.Context, body io.Reader, want int64, acquired time.Time) *observedInput {
 	ctx = context.WithoutCancel(ctx)
-	return &observedInput{r: body, want: want, observe: func(raw []byte) { o.observe(ctx, raw) }}
+	return &observedInput{r: body, want: want, observe: func(raw []byte) { o.observe(ctx, raw, acquired) }}
 }
 
 // observedInput hands an object to its observer inside the Read that

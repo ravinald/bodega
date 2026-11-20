@@ -6778,11 +6778,50 @@ With any apt rule present, an archive not on the list is never contacted: the ch
 
 A pool request carries no codename. apt chose which archive to trust when it read a `Packages` file during `apt update`, and that decision is not recoverable from `GET /apt/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` — the request looks identical whichever suite produced it.
 
-So bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the answer is remembered for an hour keyed on the object key. A path none of them has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
+So bodega reads the archive's own indexes first. It keeps an index of every `Packages` paragraph the archive's mirrored codenames publish, rebuilt every `metadata_ttl`, and resolves a pool path in this order:
+
+1. **Two codenames disagree.** When paragraphs of two codenames in the request's archive list the path with different `SHA256` values, the request is refused with `502` before any upstream is asked. The default archive counts as an archive here. Each index build that finds such paths logs one `ERROR` line per pair of codenames, with how many paths they disagree on.
+2. **A paragraph names the path.** bodega fetches it from the upstream roots of that paragraph's codename, in the order `apt_upstreams` lists them, and no other. The bytes are cached, pinned and served only when their size and `SHA256` equal the paragraph's. A mismatch is refused with `502`, recorded as a `checksum_mismatch` audit row under the incident the body names, and nothing is stored or pinned, so the next request asks upstream again.
+3. **No paragraph names the path.** bodega probes. Every upstream of the request's archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the bytes are pinned on first fetch.
+
+A rebuild that cannot read a codename's `Release` or `Packages` keeps every paragraph the last successful read of that codename found, and every paragraph of a `Packages` file bodega served a client for it, logs a `WARN` naming what it could not read, and retries within a minute. A `404` for a `Packages` the `Release` still lists, and that bodega read before, counts as a failed read; a `404` for one it has never read is an architecture that root does not serve. A served `Packages` file counts when a `Release` or `InRelease` served for the same codename lists its `SHA256`, which is the order `apt update` reads them in, so the first `.deb` an `apt install` asks for after an update is judged by what that update was told even when the index build behind it fails. Where the two disagree about a path, the newer read answers. A path either read named is still judged by it, so an archive outage never turns a known mismatch into a first-fetch pin. Only a codename bodega has neither read nor served once since it started lands its paths in the probe.
+
+Every rebuild, one that reads everything included, weighs each `Packages` document (one codename, component and architecture) on its own. It holds up to three copies: what this build read, the copy the last index used, and the file last served to a client. The copy bodega fetched from upstream most recently answers for the whole document. bodega's metadata cache keeps the time each copy was fetched, so a rebuild that replays an older cached copy cannot replace a newer one an earlier build or a client read already found. A complete read drops a document its `Release` no longer lists.
+
+Either way the root that answered is remembered for an hour, keyed on the object key. A path none of them has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
+
+A cached `.deb` is held to the same index. It is served only while its pin is the `SHA256` of the paragraph naming its path, its length is that paragraph's `Size`, and the `SHA256` bodega read off the stored object is the paragraph's too. A pin belongs to the key, not to the bytes: a second bodega sharing the object store with its own audit database can replace the object without touching this one's pin. So bodega reads each cached object once per process and remembers the digest against the identity the store reports for it (`ETag`, or size and modification time), and reads it again whenever the store reports a different object at the key. A copy with no pin, which is what `bodega pkg checksum clear` leaves, is hashed and pinned when it matches. Any other copy is removed with its pin, a `WARN` names both digests and both sizes, and the path is fetched again under the rules above. A request that waited behind another request's fetch of the same path checks what that fetch stored against its own paragraph before serving it. A server that cached the wrong distribution's build before it read the index corrects itself on the next request for each path, with no `bodega pkg checksum clear` needed. A host whose profile refuses a vendor archive is not refused over where the copy being replaced came from: the request is judged against the paragraph's codename, and refused before anything is removed only when the profile refuses every root of that codename.
+
+When bodega cannot finish that repair (the object store refuses the delete, or the audit database cannot be read), it serves nothing for the path and keeps the pin, so the next request tries the repair again:
+
+```text
+bodega refused apt/pkgconf@2.5.1-4 (checksum, incident 3f2a9c1e7b04): bodega could not remove the cached build the paragraph disagrees with for pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb, whose Packages paragraph in resolute lists sha256 dd63b86146a24e96a9a76e6ccf29f10805309cb39db91ef12dce3128ad3afe39, so it serves nothing for it: object store delete unavailable.
+Next step: retry; if it persists, give an operator incident 3f2a9c1e7b04, whose ERROR line in the server log names the step that failed.
+```
+
+The server log carries the same incident on an `ERROR` line naming the step that failed. Fix the store or database it names; the next request finishes the repair.
+
+A paragraph that does not match what its upstream serves answers:
+
+```text
+bodega refused apt/pkgconf@2.5.1-4 (checksum, incident 3f2a9c1e7b04): pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb from http://archive.ubuntu.com/ubuntu is 64410 bytes with sha256 ed8886ef4a8229928e8da31f4be3087ed235172a6bef5ee9ed3a3e1223f0a164, but the Packages paragraph of resolute that names it lists 63542 bytes with sha256 dd63b86146a24e96a9a76e6ccf29f10805309cb39db91ef12dce3128ad3afe39; nothing was cached or pinned.
+Next step: retry once the archive's pool and index agree again, since the next request asks upstream again; if it persists, give an operator incident 3f2a9c1e7b04, whose audit row holds both digests.
+```
+
+Inside one distribution this is a mirror caught between syncs, and the retry is the fix. When it persists, check the path against the archive by hand (`curl -sI` on the URL the body names) and read the audit row for the incident: a `Size` that differs as well as the digest usually means a proxy or mirror between bodega and the archive is serving another file at that path.
+
+Two codenames disagreeing answers:
+
+```text
+bodega refused apt/pkgconf@2.5.1-4 (checksum, incident 3f2a9c1e7b04): pool/main/p/pkgconf/pkgconf_2.5.1-4_amd64.deb is listed by mirrored codename resolute with sha256 dd63b86146a24e96a9a76e6ccf29f10805309cb39db91ef12dce3128ad3afe39 and by trixie with sha256 ed8886ef4a8229928e8da31f4be3087ed235172a6bef5ee9ed3a3e1223f0a164, and both are in the default archive, which shares one pool between them, so bodega cannot tell which build this client expects and fetches neither.
+Next step: an operator separates the two distributions with apt_archives, which gives each its own /apt/{archive}/ root, and points each host's sources at its own; incident 3f2a9c1e7b04.
+```
+
+The operator's step is the one the body names: declare [`apt_archives`](#apt_archives) so each distribution gets its own root and pool, then point each host's `sources.list` entries at `/apt/{archive}/`. Until then, neither distribution's hosts can fetch that path through bodega.
 
 The request's archive is the URL root it arrived under. `GET /apt/debian/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` asks the upstreams of the codenames [`apt_archives`](#apt_archives) lists under `debian` and stores the object at `packages/apt/debian/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb`. `GET /apt/pool/...` asks the upstreams of the codenames in no archive and stores under `packages/apt/pool/...`.
 
-The consequence to know: **if two upstreams of one archive publish different bytes at one pool path, bodega serves whichever answered the probe first.** Inside one distribution that does not happen, since its security and updates hosts share the pool namespace deliberately. Across distributions it does: Ubuntu rebuilds packages it syncs from Debian under the same version and filename. Mirror two distributions as two archives in `apt_archives`, never as codenames sharing the default one.
+The consequence to know: **two distributions in one archive share one pool, and every path they both publish differently is refused.** Inside one distribution that does not happen, since its security and updates hosts share the pool namespace deliberately. Across distributions it does: Ubuntu rebuilds packages it syncs from Debian under the same version and filename. Mirror two distributions as two archives in `apt_archives`, never as codenames sharing the default one.
 
 #### Versions in the discovery log lose the epoch
 

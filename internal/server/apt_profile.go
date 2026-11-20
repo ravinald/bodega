@@ -300,6 +300,8 @@ type aptIndexRead struct {
 	// notPublished is set when the fetch 404d, which is the archive saying it
 	// does not carry that architecture rather than that its index is wrong.
 	notPublished bool
+	// at is when bodega read body from upstream, which a cached copy keeps.
+	at time.Time
 }
 
 // aptFilteredPackages filters one profile's view of every component and
@@ -397,7 +399,7 @@ func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstr
 	if read, ok := cache[key]; ok {
 		return read, nil
 	}
-	body, err := s.aptUpstreamPackages(ctx, base, comp.index[arch], arch, release)
+	body, at, err := s.aptUpstreamPackages(ctx, base, comp.index[arch], arch, release)
 	var read aptIndexRead
 	switch {
 	case errors.Is(err, errUpstreamNotFound):
@@ -407,7 +409,7 @@ func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstr
 	case err != nil:
 		return aptIndexRead{}, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", base, component, arch, err)
 	default:
-		read = aptIndexRead{body: body}
+		read = aptIndexRead{body: body, at: at}
 	}
 	cache[key] = read
 	return read, nil
@@ -615,19 +617,20 @@ func (s *Server) aptUpstreamRelease(ctx context.Context, base string) (map[strin
 // catches the failure a mirror produces on its own: a Packages body from one
 // sync beside a Release from the next, which would have bodega sign an index
 // whose stanzas name .deb digests the pool no longer has.
-func (s *Server) aptUpstreamPackages(ctx context.Context, base, rest, arch string, release map[string]string) ([]byte, error) {
+func (s *Server) aptUpstreamPackages(ctx context.Context, base, rest, arch string, release map[string]string) ([]byte, time.Time, error) {
 	want := aptReleaseDigests(release)[rest]
-	body, err := s.aptUpstreamFetch(ctx, base, rest)
+	body, at, err := s.aptUpstreamFetchAt(ctx, base, rest)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if want != "" {
 		if got := sha256.Sum256(body); hex.EncodeToString(got[:]) != want {
-			return nil, fmt.Errorf("the %s served for %s/%s does not match the SHA256 its own Release publishes: the archive's index and its digest list are from different syncs, and signing it would vouch for stanzas naming artifacts the pool no longer has",
+			return nil, time.Time{}, fmt.Errorf("the %s served for %s/%s does not match the SHA256 its own Release publishes: the archive's index and its digest list are from different syncs, and signing it would vouch for stanzas naming artifacts the pool no longer has",
 				rest, base, arch)
 		}
 	}
-	return aptDecompressIndex(base, rest, body)
+	out, err := aptDecompressIndex(base, rest, body)
+	return out, at, err
 }
 
 // aptDecompressIndex decompresses one Packages file of base by the
@@ -679,34 +682,42 @@ func aptDecompressIndex(base, rest string, body []byte) ([]byte, error) {
 // gate holds the evidence before any of them can fail a digest check or a
 // parse.
 func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byte, error) {
+	body, _, err := s.aptUpstreamFetchAt(ctx, base, rest)
+	return body, err
+}
+
+// aptUpstreamFetchAt is aptUpstreamFetch with when the body was read from
+// upstream, which for a cached body is the read that cached it.
+func (s *Server) aptUpstreamFetchAt(ctx context.Context, base, rest string) ([]byte, time.Time, error) {
 	key := base + "/" + rest
-	if body, ok := s.aptUpstreamCached(key); ok {
-		s.observeAptMirrorDists(ctx, base, rest, body)
-		return body, nil
+	if doc, ok := s.aptUpstreamCachedDoc(key); ok {
+		s.observeAptMirrorDists(ctx, base, rest, doc.body)
+		return doc.body, doc.at, nil
 	}
 	ups := s.cfg.AptUpstreams[base]
 	if len(ups) == 0 {
-		return nil, fmt.Errorf("no archive is configured for %q", base)
+		return nil, time.Time{}, fmt.Errorf("no archive is configured for %q", base)
 	}
 	url := ups[0].URL + "/dists/" + base + "/" + rest
 	if s.policy != nil {
 		_, violation, err := s.upstreamPolicyVerdict(ctx, manifest.TypeApt, url)
 		if err != nil {
-			return nil, fmt.Errorf("policy check for %s: %w", url, err)
+			return nil, time.Time{}, fmt.Errorf("policy check for %s: %w", url, err)
 		}
 		if violation {
-			return nil, fmt.Errorf("%s is off the apt allow-list, so no filtered index can be generated from it: bodega policy add apt <host>", url)
+			return nil, time.Time{}, fmt.Errorf("%s is off the apt allow-list, so no filtered index can be generated from it: bodega policy add apt <host>", url)
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, aptProfileFetchTimeout)
 	defer cancel()
 	body, _, err := fetchUpstream(ctx, url)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	s.aptUpstreamIdx.Store(key, aptUpstreamDoc{body: body, at: time.Now()})
+	at := time.Now()
+	s.aptUpstreamIdx.Store(key, aptUpstreamDoc{body: body, at: at})
 	s.observeAptMirrorDists(ctx, base, rest, body)
-	return body, nil
+	return body, at, nil
 }
 
 // aptUpstreamDoc is one cached upstream index document and when it was read.
@@ -725,19 +736,25 @@ type aptUpstreamDoc struct {
 // that republishes daily is the cost this bounds, and the staleness it trades
 // for is bounded by the same setting an operator already tuned for the mirror.
 func (s *Server) aptUpstreamCached(key string) ([]byte, bool) {
+	doc, ok := s.aptUpstreamCachedDoc(key)
+	return doc.body, ok
+}
+
+// aptUpstreamCachedDoc is aptUpstreamCached with when the body was read.
+func (s *Server) aptUpstreamCachedDoc(key string) (aptUpstreamDoc, bool) {
 	ttl := s.cache.MetadataTTL
 	if ttl <= 0 {
-		return nil, false
+		return aptUpstreamDoc{}, false
 	}
 	v, ok := s.aptUpstreamIdx.Load(key)
 	if !ok {
-		return nil, false
+		return aptUpstreamDoc{}, false
 	}
 	doc, ok := v.(aptUpstreamDoc)
 	if !ok || time.Since(doc.at) >= ttl {
-		return nil, false
+		return aptUpstreamDoc{}, false
 	}
-	return doc.body, true
+	return doc, true
 }
 
 // aptPackagesPath is the Release-relative path of one component and

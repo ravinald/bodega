@@ -441,9 +441,11 @@ func TestScopedProfileVendorRefusalSurvivesAnArchiveThatDoesNotAnswer(t *testing
 	}
 
 	// No origin recorded: the probe places neither file, and the profile's
-	// filtered index is what tells the base's .deb from the vendor's.
-	overwriteCached(t, s, vendorGrafanaDeb, "grafana bytes, uploaded")
-	overwriteCached(t, s, profileNginxDeb, "nginx bytes, uploaded")
+	// filtered index is what tells the base's .deb from the vendor's. Each is
+	// rewritten with the build its paragraph lists, since a cached .deb its
+	// paragraph disagrees with is dropped before any profile could admit it.
+	overwriteCached(t, s, vendorGrafanaDeb, "grafana bytes")
+	overwriteCached(t, s, profileNginxDeb, aptProfilePool()[profileNginxDeb])
 	s.aptRoutes = aptRouteCache{}
 	code, body = clientGet(t, s, scoped.token, grafana)
 	if code != http.StatusForbidden {
@@ -454,7 +456,7 @@ func TestScopedProfileVendorRefusalSurvivesAnArchiveThatDoesNotAnswer(t *testing
 			t.Errorf("unrecorded-origin refusal lacks %q:\n%s", want, body)
 		}
 	}
-	if code, body := clientGet(t, s, scoped.token, nginx); code != http.StatusOK || body != "nginx bytes, uploaded" {
+	if code, body := clientGet(t, s, scoped.token, nginx); code != http.StatusOK || body != aptProfilePool()[profileNginxDeb] {
 		t.Errorf("scoped %s with no recorded origin = %d: %s", nginx, code, body)
 	}
 

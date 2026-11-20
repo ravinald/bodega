@@ -265,9 +265,17 @@ type Server struct {
 	// unable to answer for a mirrored .deb, so a fleet's installs log the gap
 	// once rather than once per artifact.
 	aptOSVUnchecked sync.Map
-	// aptPoolIdx maps each mirrored pool path to its Packages paragraph, which
-	// is where the OSV gate reads the epoch the pool filename drops.
+	// aptPoolIdx maps each mirrored pool object to its Packages paragraph,
+	// which is where the OSV gate reads the epoch the pool filename drops and
+	// where a pool fetch learns the root, size and SHA256 it must have.
 	aptPoolIdx aptPoolIndexCache
+	// aptServed holds the paragraphs of every listed Packages file a client
+	// was served, so a pool index build that cannot read an index still knows
+	// what apt was told to expect.
+	aptServed aptServedIndexes
+	// aptMeasured holds the SHA256 bodega read off each cached pool object,
+	// against the store's identity for that object.
+	aptMeasured aptMeasuredDigests
 
 	// reloadSignals, when set, is a SIGHUP channel the caller registered
 	// before New. Start otherwise registers its own.
@@ -2440,7 +2448,7 @@ func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, s3Key strin
 	if want <= 0 {
 		want = -1
 	}
-	in := obs.wrap(r.Context(), result.Body, want)
+	in := obs.wrap(r.Context(), result.Body, want, time.Time{})
 	if _, err := io.Copy(w, in); err != nil {
 		_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
 	}

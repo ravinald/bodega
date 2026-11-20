@@ -72,8 +72,8 @@ func aptProfilePackages() string {
 		}
 		lines = append(lines,
 			"Filename: "+poolPath,
-			"Size: 42",
-			"SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
+			"Size: "+strconv.Itoa(len(aptProfilePool()[poolPath])),
+			"SHA256: "+sha256Hex(aptProfilePool()[poolPath]),
 			"Description: "+desc,
 			" a continuation line the filter must not reflow",
 			" .",
@@ -1169,8 +1169,10 @@ func aptProfileAddPocket(t *testing.T, s *Server, archive *fixtureArchive, pocke
 	for rel, body := range fixtureDistsArch(t, kr, aptProfilePocketPackages(), "amd64") {
 		archive.setObject(strings.Replace(rel, "dists/"+mirroredCodename+"/", "dists/"+pocket+"/", 1), body)
 	}
-	archive.setObject(pocketNginxDeb, "\x21<arch>\nnginx pocket bytes")
-	archive.setObject(pocketHtopDeb, "\x21<arch>\nhtop pocket bytes")
+	// The pocket's paragraphs are the base's with the versions rewritten, so
+	// they list the base's digests, and its .debs are those bytes.
+	archive.setObject(pocketNginxDeb, aptProfilePool()[profileNginxDeb])
+	archive.setObject(pocketHtopDeb, aptProfilePool()[profileHtopDeb])
 	s.cfg.AptUpstreams[pocket] = []config.AptUpstream{{URL: archive.URL()}}
 }
 
@@ -1213,8 +1215,10 @@ func aptProfileAddDebianPocket(t *testing.T, s *Server, archive *fixtureArchive,
 		"Architectures: amd64",
 		"SHA256:",
 	}, append(digests, "")...), "\n"))
-	archive.setObject(pocketNginxDeb, "\x21<arch>\nnginx pocket bytes")
-	archive.setObject(pocketHtopDeb, "\x21<arch>\nhtop pocket bytes")
+	// The pocket's paragraphs are the base's with the versions rewritten, so
+	// they list the base's digests, and its .debs are those bytes.
+	archive.setObject(pocketNginxDeb, aptProfilePool()[profileNginxDeb])
+	archive.setObject(pocketHtopDeb, aptProfilePool()[profileHtopDeb])
 	s.cfg.AptUpstreams[pocket] = []config.AptUpstream{{URL: archive.URL()}}
 }
 
@@ -1423,8 +1427,8 @@ func aptProfileAddUniverse(t *testing.T, archive *fixtureArchive) {
 	stanza := func(pkg, source, version, poolPath string) string {
 		return strings.Join([]string{
 			"Package: " + pkg, "Source: " + source, "Version: " + version, "Architecture: amd64",
-			"Filename: " + poolPath, "Size: 42",
-			"SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
+			"Filename: " + poolPath, "Size: " + strconv.Itoa(len("\x21<arch>\n"+pkg+" bytes")),
+			"SHA256: " + sha256Hex("\x21<arch>\n"+pkg+" bytes"),
 			"Description: fixture universe package", "", "",
 		}, "\n")
 	}
