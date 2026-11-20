@@ -233,7 +233,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, arc
 			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
 				return false
 			}
-			return s.aptMirrorHitGate(w, r, poolPath)
+			return s.aptMirrorHitGate(w, r, key)
 		}, func(obj cachedObject) {
 			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
 			s.recordAptPoolHit(r, poolPath, key, obj)
@@ -622,29 +622,31 @@ func aptPoolConflictRefusal(archive, poolPath, name string, c aptPoolConflict) *
 	return f
 }
 
-// aptMirrorOSV is the OSV gate's verdict on one .deb a mirrored codename
-// serves, and false when the apt advisory action is unset or ignore, which
-// leaves the fetch exactly as ungated as it was before the gate covered apt.
+// aptMirrorOSV is the OSV gate's verdict on the mirrored .deb at key, and
+// false when the apt advisory action is unset or ignore, which leaves the
+// fetch exactly as ungated as it was before the gate covered apt.
 //
 // The question is the one a manifest entry is asked: the source package and
 // version, read from the mirrored Packages paragraph whose Filename is the
-// pool path, in the release the mirrored codename belongs to. Not from the
-// filename: the archive pool drops the epoch, OSV's Ubuntu and Debian ranges
-// carry it, and openssh's 9.6p1-3ubuntu13.20 compared as epoch 0 sorts below
-// a fix at 1:9.6p1-3ubuntu13.3, so every patched build of a package with an
-// epoch would read as vulnerable. A pool
-// path names no codename, so the release comes from apt_upstreams, and it is
-// only placeable while the mirrored codenames are one release (resolute with
-// its pockets). Two releases share a pool, and a noble revision checked
-// against resolute's ranges sits below every resolute fix and reads
-// vulnerable; that is aptAmbiguousSuiteReason's rule, reached from the pool.
+// pool path, in the release of the codename that paragraph belongs to. Not
+// from the filename: the archive pool drops the epoch, OSV's Ubuntu and Debian
+// ranges carry it, and openssh's 9.6p1-3ubuntu13.20 compared as epoch 0 sorts
+// below a fix at 1:9.6p1-3ubuntu13.3, so every patched build of a package
+// with an epoch would read as vulnerable.
+//
+// The paragraphs are those of the key's archive alone, since another archive's
+// paragraph at the same path describes another distribution's build. Where
+// codenames of two releases list the path with one digest, the bytes are one
+// file installed by hosts of both, so it is checked against each release and
+// the worst verdict answers; a noble revision checked against resolute's
+// ranges alone would sit below every resolute fix and read vulnerable.
 //
 // Whatever cannot be answered comes back not evaluated, never warn: the
 // fetch is served, the admission row says why it went unchecked, and the log
 // says so once per release. A warn per artifact would bury the advisory warns
 // beside it, and a refusal would stop every install on a host whose release
 // nobody has synced yet.
-func (s *Server) aptMirrorOSV(ctx context.Context, poolPath string) (policy.Result, bool) {
+func (s *Server) aptMirrorOSV(ctx context.Context, key string) (policy.Result, bool) {
 	if s.auditDB == nil {
 		return policy.Result{}, false
 	}
@@ -654,44 +656,84 @@ func (s *Server) aptMirrorOSV(ctx context.Context, poolPath string) (policy.Resu
 	case err == nil && p.Action != policy.ActionWarn && p.Action != policy.ActionBlock:
 		return policy.Result{}, false
 	}
+	_, poolPath, _ := manifest.SplitAptKey(key)
 	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
 	if name == "" {
 		return policy.Result{}, false
 	}
-	codename, release, why := s.aptMirrorRelease()
-	if why != "" {
-		return s.aptMirrorUnchecked(release, why), true
-	}
-	if _, err := policy.SharedOSVDatabase(s.cfg.ResolveOSVDBDir()).Meta(release); err != nil && !s.cfg.OSVAPIFallback {
-		return s.aptMirrorUnchecked(release, fmt.Sprintf(
-			"no synced OSV export for %s, the release mirrored codename %s belongs to (%v); run 'bodega policy osv sync apt'",
-			release, codename, err)), true
-	}
-	stanza, why := s.aptMirrorStanza(ctx, poolPath)
+	stanzas, why := s.aptMirrorStanzas(ctx, key)
 	if why != "" {
 		return policy.Result{Check: audit.CheckOSV, Action: policy.ActionNotEvaluated, Reason: "not run: " + why}, true
 	}
-	ve := manifest.VersionEntry{Version: stanza.version, SourcePackage: stanza.source,
-		CaptureSuite: codename, Mode: manifest.ModeProxy}
-	res := admit.OSVChecker(s.cfg, s.auditDB).Check(ctx, &manifest.PackageManifest{Type: manifest.TypeApt, Name: name}, &ve)
-	if res.Action == policy.ActionWarn && res.Details["vulns"] == nil && res.Details["malware"] == nil {
-		return s.aptMirrorUnchecked(release, res.Reason), true
+	var worst policy.Result
+	checked := map[string]bool{}
+	for _, st := range stanzas {
+		release := policy.AptOSVEcosystem(st.codename)
+		if release == "" {
+			worst = aptWorseOSV(worst, s.aptMirrorUnchecked(st.codename,
+				fmt.Sprintf("mirrored codename %s names no release OSV publishes an Ubuntu or Debian export for", st.codename)))
+			continue
+		}
+		if checked[release] {
+			continue
+		}
+		checked[release] = true
+		if _, err := policy.SharedOSVDatabase(s.cfg.ResolveOSVDBDir()).Meta(release); err != nil && !s.cfg.OSVAPIFallback {
+			worst = aptWorseOSV(worst, s.aptMirrorUnchecked(release, fmt.Sprintf(
+				"no synced OSV export for %s, the release mirrored codename %s belongs to (%v); run 'bodega policy osv sync apt'",
+				release, st.codename, err)))
+			continue
+		}
+		ve := manifest.VersionEntry{Version: st.version, SourcePackage: st.source,
+			CaptureSuite: st.codename, Mode: manifest.ModeProxy}
+		res := admit.OSVChecker(s.cfg, s.auditDB).Check(ctx, &manifest.PackageManifest{Type: manifest.TypeApt, Name: name}, &ve)
+		if res.Action == policy.ActionWarn && res.Details["vulns"] == nil && res.Details["malware"] == nil {
+			res = s.aptMirrorUnchecked(release, res.Reason)
+		}
+		worst = aptWorseOSV(worst, res)
 	}
-	return res, true
+	return worst, true
 }
 
-// aptMirrorAge is the age gate's verdict on one .deb a mirrored codename
-// serves, and false when no apt age policy is set or it is ignore.
+// aptWorseOSV keeps whichever of two OSV verdicts on one .deb weighs more: a
+// block over a warn over a release that went unchecked over a pass. An
+// unchecked release outranks a clean one because a pass would claim the
+// unchecked release's hosts were covered too. A tie keeps held, so the release
+// checked first names the verdict.
+func aptWorseOSV(held, next policy.Result) policy.Result {
+	rank := func(r policy.Result) int {
+		switch r.Action {
+		case policy.ActionBlock:
+			return 4
+		case policy.ActionWarn:
+			return 3
+		case policy.ActionNotEvaluated:
+			return 2
+		case "":
+			return 0
+		}
+		return 1
+	}
+	if rank(next) > rank(held) {
+		return next
+	}
+	return held
+}
+
+// aptMirrorAge is the age gate's verdict on the mirrored .deb at key, and
+// false when no apt age policy is set or it is ignore.
 //
 // The date is the one the audit database derives for the source version the
-// mirrored paragraph names, for the epoch reason aptMirrorOSV gives. A path the
-// current index no longer lists is looked up by the source version an earlier
-// index listed it under, so an upgrade rotating it out keeps it gated. A path
-// no index bodega read has named, a version nothing recorded, or one an index
-// listed that no recorded Release publishes yet, comes back not evaluated
-// with the reason, the way aptMirrorOSV treats an index it
-// cannot read.
-func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Result, bool) {
+// mirrored paragraph names, for the epoch reason aptMirrorOSV gives, from the
+// indexes of the key's codenames alone: another archive listing the same
+// source version publishes another distribution's build of it, on its own
+// date. A path the current index no longer lists is looked up by the source
+// version an earlier index of the archive listed it under, so an upgrade
+// rotating it out keeps it gated. A path no index bodega read has named, a
+// version nothing recorded, or one an index listed that no recorded Release
+// publishes yet, comes back not evaluated with the reason, the way
+// aptMirrorOSV treats an index it cannot read.
+func (s *Server) aptMirrorAge(ctx context.Context, key string) (policy.Result, bool) {
 	if s.auditDB == nil {
 		return policy.Result{}, false
 	}
@@ -701,27 +743,30 @@ func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Resu
 	case err == nil && p.Action == policy.ActionIgnore:
 		return policy.Result{}, false
 	}
+	archive, poolPath, _ := manifest.SplitAptKey(key)
 	name, version := manifest.AptDebIdentity(path.Base(poolPath))
 	if name == "" {
 		return policy.Result{}, false
 	}
 	ve := manifest.VersionEntry{Version: version, Mode: manifest.ModeProxy, Metadata: map[string]string{}}
-	stanza, why := s.aptMirrorStanza(ctx, poolPath)
-	if why != "" {
-		if e, ok, err := s.auditDB.GetAptPoolPath(ctx, poolPath); err != nil {
-			why += "; " + err.Error()
-		} else if ok {
-			stanza, why = aptPoolStanza{source: e.Source, version: e.Version}, ""
-		}
+	var stanza aptPoolStanza
+	stanzas, why := s.aptMirrorStanzas(ctx, key)
+	if why == "" {
+		stanza = stanzas[0]
+	} else if e, ok, err := s.auditDB.GetAptPoolPath(ctx, archive, poolPath); err != nil {
+		why += "; " + err.Error()
+	} else if ok {
+		stanza, why = aptPoolStanza{source: e.Source, version: e.Version}, ""
 	}
+	codenames := s.aptArchiveCodenames(archive)
 	if why != "" {
 		ve.Metadata[policy.AptDateErrorKey] = why
-	} else if d, ok, err := s.auditDB.GetAptVersionDate(ctx, stanza.source, stanza.version); err != nil {
+	} else if d, ok, err := s.auditDB.GetAptVersionDate(ctx, codenames, stanza.source, stanza.version); err != nil {
 		ve.Metadata[policy.AptDateErrorKey] = err.Error()
 	} else if !ok {
 		ve.Metadata[policy.AptDateErrorKey] = fmt.Sprintf(
-			"bodega holds no record of a mirrored index listing source %s %s; it records one each time it reads the mirrored Packages, so this one has failed to read or to record since it was listed",
-			stanza.source, stanza.version)
+			"bodega holds no record of an index of %s listing source %s %s; it records one each time it reads the mirrored Packages, so this one has failed to read or to record since it was listed",
+			strings.Join(codenames, " "), stanza.source, stanza.version)
 	} else if d.DatedBy == audit.AptDatedByNothing {
 		ve.Metadata[policy.AptDateErrorKey] = fmt.Sprintf(
 			"bodega read an index of %s listing source %s %s, and has recorded no Release publishing that index; the version is dated when bodega next reads a Release that does",
@@ -734,6 +779,18 @@ func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Resu
 		}
 	}
 	return policy.NewAgeChecker(s.auditDB).Check(ctx, &manifest.PackageManifest{Type: manifest.TypeApt, Name: name}, &ve), true
+}
+
+// aptArchiveCodenames is the mirrored codenames of one archive, sorted; ""
+// is the default archive.
+func (s *Server) aptArchiveCodenames(archive string) []string {
+	var out []string
+	for _, c := range s.cfg.MirroredAptCodenames() {
+		if s.cfg.AptArchiveOf(c) == archive {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // aptPoolIndexRetry is how soon a pool index that could not read every
@@ -953,36 +1010,30 @@ func (s *Server) aptPoolIndexNow(ctx context.Context) *aptPoolIndex {
 	return idx
 }
 
-// aptMirrorStanza is the mirrored paragraph for one pool path, or why there is
+// aptMirrorStanzas is every mirrored paragraph of key's archive naming its
+// pool path with the digest the first one lists, that first, or why there is
 // none. A path no paragraph names is not answered from its filename instead,
 // for the epoch reason aptMirrorOSV gives: the caller records it unchecked.
-//
-// A pool path names no archive, so this is the paragraph of the first
-// mirrored codename, in sorted order, that lists the path in any archive.
-func (s *Server) aptMirrorStanza(ctx context.Context, poolPath string) (aptPoolStanza, string) {
+// Paragraphs listing another digest are a conflict, which the pool refuses
+// before any gate asks.
+func (s *Server) aptMirrorStanzas(ctx context.Context, key string) ([]aptPoolStanza, string) {
 	idx := s.aptPoolIndexNow(ctx)
-	codenames := s.cfg.MirroredAptCodenames()
-	var found *aptPoolStanza
-	seen := map[string]bool{}
-	for _, c := range codenames {
-		archive := s.cfg.AptArchiveOf(c)
-		if seen[archive] {
-			continue
+	if st, ok := idx.byKey[key]; ok {
+		out := []aptPoolStanza{st}
+		for _, other := range idx.shadow[key] {
+			if other.sha256 == st.sha256 {
+				out = append(out, other)
+			}
 		}
-		seen[archive] = true
-		if st, ok := idx.byKey[manifest.AptArchiveKey(archive, poolPath)]; ok && (found == nil || st.codename < found.codename) {
-			found = &st
-		}
+		return out, ""
 	}
-	if found != nil {
-		return *found, ""
-	}
+	archive, poolPath, _ := manifest.SplitAptKey(key)
 	why := fmt.Sprintf("no Packages paragraph of mirrored %s, as read at %s, has Filename %s, and the filename's version carries no epoch to compare",
-		strings.Join(codenames, " "), idx.at.UTC().Format(time.RFC3339), poolPath)
+		strings.Join(s.aptArchiveCodenames(archive), " "), idx.at.UTC().Format(time.RFC3339), poolPath)
 	if len(idx.failed) > 0 {
 		why += "; unreadable: " + strings.Join(idx.failed, "; ")
 	}
-	return aptPoolStanza{}, why
+	return nil, why
 }
 
 // aptPoolParagraph is what the index says about one pool object: the
@@ -1528,7 +1579,7 @@ func aptDecompressSniffed(codename, rest string, raw []byte) ([]byte, error) {
 // built from it.
 func (s *Server) recordAptIndexEntries(ctx context.Context, codename, label, sum string, entries []audit.AptIndexEntry) error {
 	ctx = context.WithoutCancel(ctx)
-	if err := s.auditDB.RecordAptIndexMembers(ctx, codename, sum, entries); err != nil {
+	if err := s.auditDB.RecordAptIndexMembers(ctx, s.cfg.AptArchiveOf(codename), codename, sum, entries); err != nil {
 		s.logger.Warn("could not record which versions a mirrored apt index listed, so the age gate leaves the new ones unchecked until the next read or index rebuild retries",
 			"codename", codename, "index", label, "error", err)
 		return err
@@ -1650,37 +1701,6 @@ func aptSourceVersion(fields map[string]string) string {
 	return strings.TrimSpace(fields["Version"])
 }
 
-// aptMirrorRelease is the one release every mirrored codename belongs to, a
-// codename of it for the lookup to name, and why there is none when there is
-// not. release is also the key the unchecked log is deduplicated on.
-func (s *Server) aptMirrorRelease() (codename, release, why string) {
-	byRelease := map[string]string{}
-	var releases []string
-	for _, c := range s.cfg.MirroredAptCodenames() {
-		rel := policy.AptOSVEcosystem(c)
-		if rel == "" {
-			rel = c
-		}
-		if _, ok := byRelease[rel]; !ok {
-			byRelease[rel] = c
-			releases = append(releases, rel)
-		}
-	}
-	switch {
-	case len(releases) > 1:
-		return "", "mirrored releases " + strings.Join(releases, ", "), fmt.Sprintf(
-			"this bodega mirrors %d releases (%s) from one pool, and a pool path names none of them, so nothing places this .deb in one release's advisories",
-			len(releases), strings.Join(releases, ", "))
-	case len(releases) == 0:
-		return "", "no mirrored release", "no codename is mirrored"
-	}
-	rel := releases[0]
-	if policy.AptOSVEcosystem(byRelease[rel]) == "" {
-		return "", rel, fmt.Sprintf("mirrored codename %s names no release OSV publishes an Ubuntu or Debian export for", rel)
-	}
-	return byRelease[rel], rel, ""
-}
-
 // aptMirrorUnchecked is the not-evaluated verdict for a mirrored .deb the gate
 // cannot answer for, logged the first time each release produces one.
 func (s *Server) aptMirrorUnchecked(release, reason string) policy.Result {
@@ -1704,8 +1724,9 @@ func (s *Server) aptMirrorUnchecked(release, reason string) policy.Result {
 // The age gate is not run here. A version's age only grows, so the fill's
 // verdict stands for the bytes it admitted, as an oci blob takes its tag's,
 // and a hit costs no index read for it.
-func (s *Server) aptMirrorHitGate(w http.ResponseWriter, r *http.Request, poolPath string) bool {
-	res, on := s.aptMirrorOSV(r.Context(), poolPath)
+func (s *Server) aptMirrorHitGate(w http.ResponseWriter, r *http.Request, key string) bool {
+	res, on := s.aptMirrorOSV(r.Context(), key)
+	_, poolPath, _ := manifest.SplitAptKey(key)
 	if !on || (res.Action != policy.ActionWarn && res.Action != policy.ActionBlock) {
 		return true
 	}

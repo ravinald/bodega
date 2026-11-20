@@ -1026,7 +1026,8 @@ func (s *Server) aptAdmitCachedDeb(w http.ResponseWriter, r *http.Request, p *en
 
 	if s.auditDB != nil {
 		if origin := s.cachedOrigin(r, key, obj); origin != "" {
-			for _, root := range s.cfg.AptPoolUpstreams() {
+			archive, _, _ := manifest.SplitAptKey(key)
+			for _, root := range s.cfg.AptPoolUpstreamsIn(archive) {
 				if strings.HasPrefix(origin, root+"/") {
 					return !refuse(root)
 				}
@@ -1041,7 +1042,7 @@ func (s *Server) aptAdmitCachedDeb(w http.ResponseWriter, r *http.Request, p *en
 	if base != "" {
 		return !refuse(base)
 	}
-	if s.aptProfileIndexLists(p, poolPath) {
+	if s.aptProfileIndexLists(p, key) {
 		return true
 	}
 
@@ -1069,18 +1070,21 @@ func (s *Server) aptAdmitCachedDeb(w http.ResponseWriter, r *http.Request, p *en
 }
 
 // aptProfileIndexLists reports whether a filtered codename the current
-// snapshot serves to p names poolPath as a Filename. It scans every Packages
-// body of those codenames, which is why it runs only once the recorded origin
-// and the probe have both failed to place the file.
-func (s *Server) aptProfileIndexLists(p *entitle.Profile, poolPath string) bool {
+// snapshot serves to p, under the archive key belongs to, names its pool path
+// as a Filename. Another archive's filtered codename listing the same path
+// lists another distribution's build of it. It scans every Packages body of
+// those codenames, which is why it runs only once the recorded origin and the
+// probe have both failed to place the file.
+func (s *Server) aptProfileIndexLists(p *entitle.Profile, key string) bool {
 	snap := s.aptSnap.Load()
 	if snap == nil {
 		return false
 	}
+	archive, poolPath, _ := manifest.SplitAptKey(key)
 	line := []byte("\nFilename: " + poolPath + "\n")
 	for codename, profile := range snap.profileSuites {
 		idx := snap.suites[codename]
-		if profile != p.Name() || idx == nil {
+		if profile != p.Name() || idx == nil || s.cfg.AptArchiveOf(snap.profileBases[codename]) != archive {
 			continue
 		}
 		for _, arches := range idx.packages {

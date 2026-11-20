@@ -25,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -675,10 +676,10 @@ func TestReviewE30WarmRebuildRetriesAgeEvidence(t *testing.T) {
 	publish(hideStanza("htop", "1.0-1", "amd64")+hideStanza("nginx", "1.24-1", "amd64"), now.Add(-time.Hour))
 	failedObservation := buildFrom(t, s, first)
 	poolPath := "pool/main/n/nginx/nginx_1.24-1_amd64.deb"
-	if _, why := s.aptMirrorStanza(t.Context(), poolPath); why != "" {
+	if _, why := s.aptMirrorStanzas(t.Context(), manifest.AptKey(poolPath)); why != "" {
 		t.Fatal(why)
 	}
-	if _, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "nginx", "1.24-1"); err != nil || ok {
+	if _, ok, err := s.auditDB.GetAptVersionDate(t.Context(), s.aptArchiveCodenames(""), "nginx", "1.24-1"); err != nil || ok {
 		t.Fatalf("failed-write setup: recorded=%v err=%v, want no date", ok, err)
 	}
 	if _, err := db.Exec("DROP TRIGGER review_e30_fail_observation"); err != nil {
@@ -686,7 +687,7 @@ func TestReviewE30WarmRebuildRetriesAgeEvidence(t *testing.T) {
 	}
 
 	buildFrom(t, s, failedObservation)
-	if result, ran := s.aptMirrorAge(t.Context(), poolPath); !ran || result.Action != policy.ActionBlock {
+	if result, ran := s.aptMirrorAge(t.Context(), manifest.AptKey(poolPath)); !ran || result.Action != policy.ActionBlock {
 		t.Errorf("age gate after database recovery and warm rebuild: ran=%v action=%s reason=%s; want block for a one-hour-old version under the seven-day policy", ran, result.Action, result.Reason)
 	}
 }
@@ -791,7 +792,7 @@ func TestReviewE30DelayedReadKeepsSnapshotEvidence(t *testing.T) {
 	publish(hideStanza("htop", "1.0-1", "amd64")+hideStanza("nginx", "1.24-1", "amd64"), now.Add(-time.Hour))
 	failedObservation := buildFrom(t, s, nil)
 	poolPath := "pool/main/n/nginx/nginx_1.24-1_amd64.deb"
-	if _, why := s.aptMirrorStanza(t.Context(), poolPath); why != "" {
+	if _, why := s.aptMirrorStanzas(t.Context(), manifest.AptKey(poolPath)); why != "" {
 		t.Fatal(why)
 	}
 	release()
@@ -803,7 +804,7 @@ func TestReviewE30DelayedReadKeepsSnapshotEvidence(t *testing.T) {
 	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), gzipFixture(older)) {
 		t.Fatalf("delayed request = %d, want the older upstream Packages", response.Code)
 	}
-	if _, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "nginx", "1.24-1"); err != nil || ok {
+	if _, ok, err := s.auditDB.GetAptVersionDate(t.Context(), s.aptArchiveCodenames(""), "nginx", "1.24-1"); err != nil || ok {
 		t.Fatalf("failed-write setup: recorded=%v err=%v, want no date", ok, err)
 	}
 	if _, err := db.Exec("DROP TRIGGER review_e30_fail_observation"); err != nil {
@@ -811,7 +812,62 @@ func TestReviewE30DelayedReadKeepsSnapshotEvidence(t *testing.T) {
 	}
 
 	buildFrom(t, s, failedObservation)
-	if result, ran := s.aptMirrorAge(t.Context(), poolPath); !ran || result.Action != policy.ActionBlock {
+	if result, ran := s.aptMirrorAge(t.Context(), manifest.AptKey(poolPath)); !ran || result.Action != policy.ActionBlock {
 		t.Errorf("age gate after delayed read, database recovery and warm rebuild: ran=%v action=%s reason=%s; want block for a one-hour-old version under the seven-day policy", ran, result.Action, result.Reason)
+	}
+}
+
+// F120 requirement 4: Ubuntu and Debian both list htop 1.0-1 at one pool
+// path. The hide the command records reaches both: each archive's pool refuses
+// it, and each rebuilt index, the mirrored codenames' and a profile's filtered
+// codename over resolute, is served without it at its own archive's root.
+func TestMirroredHideReachesEveryArchiveListingTheVersion(t *testing.T) {
+	s, _ := hideGroupServer(t, map[string]map[string]string{
+		"resolute": {"amd64": hideStanza("htop", "1.0-1", "amd64") + hideStanza("nginx", "1.24-1", "amd64")},
+		"trixie":   {"amd64": hideStanza("htop", "1.0-1", "amd64") + hideStanza("vim", "9.1-1", "amd64")},
+	})
+	s.cfg.AptArchives = map[string][]string{"ubuntu": {"resolute"}, "debian": {"trixie"}}
+	aptProfileBindBase(t, s, "web", "resolute", audit.ExpansionBlock, "htop", "nginx")
+	ctx := t.Context()
+	codenames, err := s.locateMirroredAptVersion(ctx, "htop", "1.0-1")
+	if err != nil || !slices.Equal(codenames, []string{"resolute", "trixie"}) {
+		t.Fatalf("locate htop 1.0-1 = %v %v, want both archives' codenames", codenames, err)
+	}
+	if err := s.auditDB.InsertAptMirrorHide(ctx, audit.AptMirrorHide{
+		Name: "htop", Version: "1.0-1", Codenames: codenames, HiddenBy: "tester",
+	}); err != nil {
+		t.Fatalf("record the hide: %v", err)
+	}
+	s.rebuildAptSnapshot(ctx)
+
+	ring, err := openpgp.ReadArmoredKeyRing(strings.NewReader(string(s.aptSign.Load().pub())))
+	if err != nil {
+		t.Fatalf("read bodega's published key: %v", err)
+	}
+	const htopDeb = "pool/main/h/htop/htop_1.0-1_amd64.deb"
+	for archive, codename := range map[string]string{"ubuntu": "resolute", "debian": "trixie"} {
+		root := "/apt/" + archive + "/"
+		code, body := mirrorGet(t, s, root+"dists/"+codename+"/main/binary-amd64/Packages")
+		if code != http.StatusOK || strings.Contains(string(body), "Package: htop") || !strings.Contains(string(body), "Package: ") {
+			t.Errorf("GET %s's rewritten Packages at %s = %d, want 200 without htop:\n%s", codename, root, code, body)
+		}
+		code, inRelease := mirrorGet(t, s, root+"dists/"+codename+"/InRelease")
+		block, _ := clearsign.Decode(inRelease)
+		if code != http.StatusOK || block == nil {
+			t.Fatalf("GET %s's InRelease at %s = %d, want bodega's clearsigned rewrite", codename, root, code)
+		}
+		if _, err := openpgp.CheckDetachedSignature(ring, bytesReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+			t.Errorf("%s's rewritten InRelease does not verify against bodega's key: %v", codename, err)
+		}
+		if got := aptReleaseDigests(mustParseRelease(t, block.Plaintext))["main/binary-amd64/Packages"]; got != sha256Hex(string(body)) {
+			t.Errorf("%s's Release names %s for the Packages it serves, which hashes to %s", codename, got, sha256Hex(string(body)))
+		}
+		if code, body := mirrorGet(t, s, root+htopDeb); code != http.StatusForbidden {
+			t.Errorf("GET %s%s = %d, want 403 for the hidden version:\n%s", root, htopDeb, code, body)
+		}
+	}
+	code, filtered := mirrorGet(t, s, "/apt/ubuntu/dists/resolute-web/main/binary-amd64/Packages")
+	if code != http.StatusOK || strings.Contains(string(filtered), "Package: htop") || !strings.Contains(string(filtered), "Package: nginx") {
+		t.Errorf("GET the filtered resolute-web Packages at /apt/ubuntu/ = %d, want 200 carrying nginx without the hidden htop:\n%s", code, filtered)
 	}
 }

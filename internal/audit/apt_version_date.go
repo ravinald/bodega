@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -219,13 +220,14 @@ func preferAptCompression(found []AptReleaseIndex, prefer []string) AptReleaseIn
 
 // RecordAptIndexMembers records what the Packages file of codename whose
 // SHA256 is sum lists: the digest as read, each source version as one it
-// listed, and a source version for each pool Filename with no identity yet.
+// listed, and a source version for each pool Filename with no identity yet in
+// archive, the apt archive codename belongs to ("" for the default).
 // It needs no Release. Where a recorded Release publishes sum, each version
 // keeps the earlier of that Release's Date: and any date it has; where none
 // does, the versions stay undated until RecordAptRelease records one.
 //
 // A digest names its bytes, so recording one a second time changes nothing.
-func (a *DB) RecordAptIndexMembers(ctx context.Context, codename, sum string, entries []AptIndexEntry) error {
+func (a *DB) RecordAptIndexMembers(ctx context.Context, archive, codename, sum string, entries []AptIndexEntry) error {
 	if a.readOnly {
 		return errors.New("audit db is read-only")
 	}
@@ -246,7 +248,7 @@ func (a *DB) RecordAptIndexMembers(ctx context.Context, codename, sum string, en
 		return fmt.Errorf("read back the %s Packages index %s: %w", codename, sum, err)
 	}
 	paths, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO apt_pool_paths
-		(pool_path, source, version, codename) VALUES (?, ?, ?, ?)`)
+		(archive, pool_path, source, version, codename) VALUES (?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -267,7 +269,7 @@ func (a *DB) RecordAptIndexMembers(ctx context.Context, codename, sum string, en
 			continue
 		}
 		if e.Filename != "" {
-			if _, err := paths.ExecContext(ctx, e.Filename, e.Source, e.Version, codename); err != nil {
+			if _, err := paths.ExecContext(ctx, archive, e.Filename, e.Source, e.Version, codename); err != nil {
 				return fmt.Errorf("record the identity of %s: %w", e.Filename, err)
 			}
 		}
@@ -290,11 +292,13 @@ func (a *DB) RecordAptIndexMembers(ctx context.Context, codename, sum string, en
 	return tx.Commit()
 }
 
-// GetAptPoolPath returns the source package version a mirrored index listed
-// poolPath under, with ok false when no index bodega read has listed it.
-func (a *DB) GetAptPoolPath(ctx context.Context, poolPath string) (AptIndexEntry, bool, error) {
+// GetAptPoolPath returns the source package version an index of archive
+// ("" for the default) listed poolPath under, with ok false when no index of
+// it bodega read has listed the path. Another archive's row for the same path
+// is another distribution's build and never answers.
+func (a *DB) GetAptPoolPath(ctx context.Context, archive, poolPath string) (AptIndexEntry, bool, error) {
 	e := AptIndexEntry{Filename: poolPath}
-	err := a.db.QueryRowContext(ctx, `SELECT source, version FROM apt_pool_paths WHERE pool_path = ?`, poolPath).
+	err := a.db.QueryRowContext(ctx, `SELECT source, version FROM apt_pool_paths WHERE archive = ? AND pool_path = ?`, archive, poolPath).
 		Scan(&e.Source, &e.Version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AptIndexEntry{}, false, nil
@@ -305,21 +309,30 @@ func (a *DB) GetAptPoolPath(ctx context.Context, poolPath string) (AptIndexEntry
 	return e, true, nil
 }
 
-// GetAptVersionDate returns the date of one source package version, with ok
-// false when no index bodega read has listed it. A version listed under
-// several codenames predates bodega when any codename's baseline listed it,
-// and otherwise takes the earliest Release that did. One that indexes bodega
-// read listed, none of them published by a recorded Release, comes back
-// AptDatedByNothing.
-func (a *DB) GetAptVersionDate(ctx context.Context, source, version string) (AptVersionDate, bool, error) {
+// GetAptVersionDate returns the date of one source package version as the
+// indexes of codenames recorded it, with ok false when none of them has
+// listed it. codenames is one archive's: another archive listing the same
+// source version publishes another distribution's build, on a date of its
+// own. A version listed under several of codenames predates bodega when any
+// one's baseline listed it, and otherwise takes the earliest Release that
+// did. One that indexes bodega read listed, none of them published by a
+// recorded Release, comes back AptDatedByNothing.
+func (a *DB) GetAptVersionDate(ctx context.Context, codenames []string, source, version string) (AptVersionDate, bool, error) {
+	if len(codenames) == 0 {
+		return AptVersionDate{}, false, nil
+	}
 	d := AptVersionDate{Source: source, Version: version}
 	var published, recorded string
 	var predates bool
+	args := []any{source, version}
+	for _, c := range codenames {
+		args = append(args, c)
+	}
 	err := a.db.QueryRowContext(ctx, `SELECT v.codename, v.published_at, v.recorded_at,
 			v.published_at != '' AND v.published_at <= COALESCE(b.release_date, '') AS predates
 		FROM apt_version_dates v LEFT JOIN apt_codename_baseline b ON b.codename = v.codename
-		WHERE v.source = ? AND v.version = ?
-		ORDER BY v.published_at = '', predates DESC, v.published_at LIMIT 1`, source, version).
+		WHERE v.source = ? AND v.version = ? AND v.codename IN (?`+strings.Repeat(", ?", len(codenames)-1)+`)
+		ORDER BY v.published_at = '', predates DESC, v.published_at LIMIT 1`, args...).
 		Scan(&d.Codename, &published, &recorded, &predates)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AptVersionDate{}, false, nil

@@ -2106,11 +2106,10 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	case fill.typ == manifest.TypeApt && fill.version != "":
 		// Only a mirrored .deb reaches here with a version: bodega's own pool
 		// is served from storage, and a dists/ key names none.
-		_, poolPath, _ := manifest.SplitAptKey(s3Key)
-		if res, on := s.aptMirrorAge(r.Context(), poolPath); on {
+		if res, on := s.aptMirrorAge(r.Context(), s3Key); on {
 			checkers = append(checkers, verdict{res})
 		}
-		if res, on := s.aptMirrorOSV(r.Context(), poolPath); on {
+		if res, on := s.aptMirrorOSV(r.Context(), s3Key); on {
 			checkers = append(checkers, verdict{res})
 		}
 	}
