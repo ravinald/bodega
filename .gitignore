@@ -24,10 +24,13 @@ CLAUDE.md
 .idea/
 .vscode/
 # BEGIN attic — managed by `attic`, do not edit between markers
+.agents
 .drover.toml
 AGENTS.md
+DROVER.md
 docs-internal
 local.mk
+skills-lock.json
 test/e2e/hosts.env
 test/e2e/local
 # END attic
