@@ -740,7 +740,7 @@ func (s *Server) aptStanzas(r *http.Request, suites []string, mirrored bool) apt
 	}
 	var groups []*group
 	for _, suite := range suites {
-		archive := s.cfg.AptArchiveOf(suite)
+		archive := s.aptSuiteArchive(suite)
 		components := s.aptServedComponents([]string{suite})
 		if mirrored {
 			components = aptsources.MirroredComponentList(s.cfg.AptComponentsFor(suite))

@@ -280,19 +280,45 @@ func TestAptMirrorOSV_UnsyncedReleaseIsServedAndReported(t *testing.T) {
 	}
 }
 
-// TestAptMirrorOSV_TwoMirroredReleasesAreNotGuessed pins the refusal to place
-// a pool path: noble and resolute share a pool, and a noble revision checked
-// against resolute's ranges sits below every resolute fix.
-func TestAptMirrorOSV_TwoMirroredReleasesAreNotGuessed(t *testing.T) {
-	s, _ := mirrorOSVServer(t, policy.ActionBlock, true)
-	list := s.cfg.AptUpstreams["resolute"]
-	s.cfg.AptUpstreams["noble"] = list
+// F120 requirement 1: noble and resolute share the pool of archive ubuntu,
+// and the gate places each path in the release of the codename whose
+// paragraph names it. The advisory is resolute's: noble's own build sits below
+// resolute's fix and would read vulnerable checked against resolute's ranges,
+// and a build both list with one digest is installed by hosts of both, so
+// resolute's verdict on it stands whatever noble's is.
+func TestAptMirrorOSV_EachPathIsCheckedInItsOwnRelease(t *testing.T) {
+	const (
+		nobleOwn = "pool/universe/p/php8.5/php8.5-fpm_8.5.0-1ubuntu0.24.04_amd64.deb"
+		shared   = "pool/universe/p/php8.5/php8.5-fpm_8.5.3-0ubuntu1_amd64.deb"
+	)
+	sharedDeb := mirrorOSVDeb{shared, "php8.5-fpm", "php8.5", "8.5.3-0ubuntu1", "shared deb"}
+	objects := mirrorOSVDists("resolute",
+		mirrorOSVDeb{mirrorOSVAdvised, "php8.5-fpm", "php8.5", "8.5.4-0ubuntu1", "advised deb"}, sharedDeb)
+	maps.Copy(objects, mirrorOSVDists("noble",
+		mirrorOSVDeb{nobleOwn, "php8.5-fpm", "php8.5", "8.5.0-1ubuntu0.24.04", "noble deb"}, sharedDeb))
+	s, logs := mirrorOSVServerFor(t, objects, policy.ActionBlock, "noble", "resolute")
+	s.cfg.AptArchives = map[string][]string{"ubuntu": {"noble", "resolute"}}
+	syncMirrorOSV(t, s.cfg.OSVDBDir, "Ubuntu:26.04:LTS", "php8.5", "8.5.4-0ubuntu2")
+	syncMirrorOSV(t, s.cfg.OSVDBDir, "Ubuntu:24.04:LTS", "unrelated", "1.0-1")
 
-	if code, body := mirrorOSVGet(t, s, mirrorOSVAdvised); code != http.StatusOK {
-		t.Fatalf("an unplaceable .deb is served unchecked, not refused; got %d (%s)", code, body)
+	for _, p := range []string{mirrorOSVAdvised, shared} {
+		code, body := mirrorOSVGet(t, s, "ubuntu/"+p)
+		if code != http.StatusForbidden || !strings.Contains(body, mirrorOSVAdvisory) {
+			t.Errorf("%s, vulnerable in resolute = %d %q, want 403 naming %s", p, code, body, mirrorOSVAdvisory)
+		}
 	}
-	if c := osvCheckOf(t, s, "8.5.4-0ubuntu1"); c.Status != audit.CheckNotEvaluated || !strings.Contains(c.Detail, "2 releases") {
-		t.Errorf("osv check = %+v, want not_evaluated naming the two releases", c)
+	if c := osvCheckOf(t, s, "8.5.3-0ubuntu1"); c.Status != audit.CheckBlock || !strings.Contains(c.Detail, "Ubuntu:26.04:LTS") {
+		t.Errorf("osv check on the build both list = %+v, want block against resolute's release", c)
+	}
+
+	if code, body := mirrorOSVGet(t, s, "ubuntu/"+nobleOwn); code != http.StatusOK || body != "noble deb" {
+		t.Fatalf("noble's own build = %d %q, want 200: checked in noble, not against resolute's fix", code, body)
+	}
+	if c := osvCheckOf(t, s, "8.5.0-1ubuntu0.24.04"); c.Status != audit.CheckPass {
+		t.Errorf("osv check on noble's own build = %+v, want a pass", c)
+	}
+	if strings.Contains(logs.String(), "served unchecked by the OSV gate") {
+		t.Errorf("a server mirroring two synced releases logged a gap:\n%s", logs.String())
 	}
 }
 

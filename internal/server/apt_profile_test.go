@@ -1595,3 +1595,53 @@ func TestReloadEnforcesAProfileChangeBeforeTheAptRebuild(t *testing.T) {
 		t.Error("the rebuild never published, so the held upstream was not what it was waiting on")
 	}
 }
+
+// F120 requirement 3: a profile over a codename in a named archive is served
+// its filtered index at that archive's root, which is where the pool paths its
+// paragraphs name resolve, and the pool there refuses and serves exactly as
+// the default layout does.
+func TestAProfileOverANamedArchiveIsServedAtTheArchiveRoot(t *testing.T) {
+	pinIncident(t)
+	refusal := func(archive string) (string, *Server, *profileFixture) {
+		s, _ := aptProfileServer(t)
+		root := "/apt/"
+		if archive != "" {
+			s.cfg.AptArchives = map[string][]string{archive: {mirroredCodename}}
+			root += archive + "/"
+		}
+		f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+		code, body := f.get(t, root+profileHtopDeb)
+		if code != http.StatusForbidden || !strings.Contains(body, entitle.RefusalMembership) {
+			t.Fatalf("GET %s%s outside the profile = %d, want 403 naming the membership rule:\n%s", root, profileHtopDeb, code, body)
+		}
+		return body, s, f
+	}
+	want, _, _ := refusal("")
+	got, _, f := refusal("ubuntu")
+	if got != want {
+		t.Errorf("the refusal under archive ubuntu differs from the default layout's:\n got: %s\nwant: %s", got, want)
+	}
+
+	code, index := f.get(t, "/apt/ubuntu/dists/fixture-web/main/binary-amd64/Packages")
+	if code != http.StatusOK || !strings.Contains(index, "Filename: "+profileNginxDeb) || strings.Contains(index, "Package: htop") {
+		t.Fatalf("GET the filtered Packages at the archive root = %d, want 200 carrying nginx alone:\n%s", code, index)
+	}
+	if code, body := f.get(t, "/apt/dists/fixture-web/main/binary-amd64/Packages"); code != http.StatusNotFound || !strings.Contains(body, "/apt/ubuntu/dists/fixture-web/") {
+		t.Errorf("GET the filtered Packages at the default root = %d %q, want 404 naming the archive root", code, body)
+	}
+	if code, body := f.get(t, "/apt/ubuntu/"+profileNginxDeb); code != http.StatusOK || body != aptProfilePool()[profileNginxDeb] {
+		t.Errorf("GET a listed .deb under the archive = %d %q, want 200 and the archive's bytes", code, body)
+	}
+	_, status := f.get(t, "/api/v1/status")
+	var payload struct {
+		Apt struct {
+			Host *aptsources.Sources `json:"host"`
+		} `json:"apt"`
+	}
+	if err := json.Unmarshal([]byte(status), &payload); err != nil {
+		t.Fatalf("parse status: %v", err)
+	}
+	if host := payload.Apt.Host; host == nil || !strings.Contains(host.Deb822, "/apt/ubuntu/") {
+		t.Errorf("the host's stanza does not point at the archive root:\n%+v", host)
+	}
+}

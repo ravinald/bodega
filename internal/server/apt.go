@@ -162,7 +162,7 @@ func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, 
 	// A codename answers under its own archive's root and nowhere else. The
 	// body names where it is, because the request is a sources entry written
 	// before the codename moved into an archive, and the fix is one URI.
-	if home := s.cfg.AptArchiveOf(parts[0]); home != archive {
+	if home := s.aptSuiteArchive(parts[0]); home != archive {
 		switch {
 		case home != "":
 			http.Error(w, fmt.Sprintf("apt codename %q is in archive %q: it is served at /apt/%s/dists/%s/", parts[0], home, home, parts[0]), http.StatusNotFound)
@@ -461,6 +461,11 @@ type aptSnapshot struct {
 	// a query per profile to a question the rebuild already answered.
 	profileSuites map[string]string
 
+	// profileBases maps a filtered codename to the mirrored suite it filters.
+	// Its Packages name that suite's pool paths, so it is served under the
+	// root of that suite's archive, where those paths resolve.
+	profileBases map[string]string
+
 	// poolStorage maps a pool path to the backend name its version entry
 	// records, with an empty record stored as the default. A present entry
 	// and an absent one have to be distinguishable: present-but-empty means
@@ -623,8 +628,10 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 		snap.suites[ps.codename] = ps.index
 		if snap.profileSuites == nil {
 			snap.profileSuites = map[string]string{}
+			snap.profileBases = map[string]string{}
 		}
 		snap.profileSuites[ps.codename] = ps.profile
+		snap.profileBases[ps.codename] = ps.base
 	}
 	rewrites, reusable := s.aptMirrorRewrites(ctx, snap.hidden, date, snap.validUntil)
 	snap.mirrorIndexes = reusable
@@ -1285,11 +1292,28 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	for _, codename := range out.Filtered {
 		one := st
 		one.Suites = []string{codename}
+		one.Archive = s.aptSuiteArchive(codename)
 		one.Components = s.aptServedComponents(one.Suites)
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	out.Profile, out.Host = s.aptHostSources(r, out)
 	return out
+}
+
+// aptSuiteArchive is the archive a served codename answers under: a mirrored
+// codename's own, and for a profile's filtered codename the archive of the
+// suite it filters, because the Filename of every paragraph it carries is a
+// pool path of that archive. Everything else is the default archive.
+func (s *Server) aptSuiteArchive(codename string) string {
+	if archive := s.cfg.AptArchiveOf(codename); archive != "" {
+		return archive
+	}
+	if snap := s.aptSnap.Load(); snap != nil {
+		if base, ok := snap.profileBases[codename]; ok {
+			return s.cfg.AptArchiveOf(base)
+		}
+	}
+	return ""
 }
 
 // aptFilteredSuites names the filtered codenames the loaded snapshot carries,
