@@ -449,3 +449,117 @@ func TestReviewB196FreshOtherArchitectureCannotPromoteCachedReplay(t *testing.T)
 		t.Errorf("last pool-read bytes replaced: %q %v", stored, err)
 	}
 }
+
+func TestReviewB196PoolCacheReplayCannotUndoRetainedAuthority(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprintf("partial=%v", partial), func(t *testing.T) {
+			const old = "previous distribution build"
+			const armDeb = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_arm64.deb"
+			const armPath = "main/binary-arm64/Packages.gz"
+			const otherPath = "main/binary-s390x/Packages.gz"
+			base := "dists/" + mirroredCodename + "/"
+			kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+			if err != nil {
+				t.Fatal(err)
+			}
+			objects := func(armBody string) map[string]string {
+				t.Helper()
+				all := map[string]string{}
+				var release string
+				for _, arch := range []string{"amd64", "arm64", "s390x"} {
+					deb, body := fixtureDeb, fixtureDebBody
+					if arch == "arm64" {
+						deb, body = armDeb, armBody
+					}
+					if arch == "s390x" {
+						deb, body = strings.Replace(fixtureDeb, "amd64", "s390x", 1), "s390x package"
+					}
+					docs := fixtureDistsFor(t, kr, mirroredCodename,
+						strings.ReplaceAll(fixturePackages(deb, body), "Architecture: amd64", "Architecture: "+arch), arch)
+					_, hashes, ok := strings.Cut(docs[base+"Release"], "\nSHA256:\n")
+					if !ok {
+						t.Fatal("missing hashes")
+					}
+					if release == "" {
+						release = strings.Replace(docs[base+"Release"], "Architectures: amd64", "Architectures: amd64 arm64 s390x", 1)
+					} else {
+						release += hashes
+					}
+					for k, v := range docs {
+						all[k] = v
+					}
+					all[deb] = body
+				}
+				all[base+"Release"] = release
+				signed, err := kr.ClearSign([]byte(release))
+				if err != nil {
+					t.Fatal(err)
+				}
+				all[base+"InRelease"] = string(signed)
+				return all
+			}
+			archive := newFixtureArchive(t, objects(old))
+			var failAMD, failOther atomic.Bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				rel := strings.TrimPrefix(r.URL.Path, "/ubuntu/")
+				if (rel == base+packagesPath+".gz" && failAMD.Load()) || (rel == base+otherPath && failOther.Load()) {
+					http.Error(w, "temporary index outage", http.StatusBadGateway)
+					return
+				}
+				archive.ts.Config.Handler.ServeHTTP(w, r)
+			}))
+			t.Cleanup(upstream.Close)
+			s := mirrorServer(t, archive)
+			s.cfg.AptUpstreams[mirroredCodename][0].URL = upstream.URL + "/ubuntu"
+			expirePool := func() {
+				s.aptPoolIdx.mu.Lock()
+				s.aptPoolIdx.idx.at = time.Time{}
+				s.aptPoolIdx.mu.Unlock()
+			}
+			if code, body := mirrorGet(t, s, "/apt/"+armDeb); code != http.StatusOK || string(body) != old {
+				t.Fatalf("initial pool build = %d %q", code, body)
+			}
+			key := manifest.AptKey(armDeb)
+			for rel, data := range objects(fixtureDebBody) {
+				archive.setObject(rel, data)
+			}
+			for _, rel := range []string{"Release", armPath} {
+				if code, body := mirrorGet(t, s, "/apt/"+base+rel); code != http.StatusOK {
+					t.Fatalf("fresh metadata %s = %d %q", rel, code, body)
+				}
+			}
+			// Expire just one document, as independently acquired metadata entries do.
+			s.aptUpstreamIdx.Delete(mirroredCodename + "/" + packagesPath + ".gz")
+			failAMD.Store(true)
+			expirePool()
+			if code, body := mirrorGet(t, s, "/apt/"+armDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+				t.Fatalf("retained newer paragraph was not established = %d %q", code, body)
+			}
+			want, conflict := s.aptPoolParagraph(t.Context(), key)
+			if want == nil || conflict != nil || want.sha256 != sha256Of(fixtureDebBody) {
+				t.Fatal("pool index did not establish newer retained authority")
+			}
+			reads := archive.count(base + armPath)
+			failAMD.Store(false)
+			if partial {
+				s.aptUpstreamIdx.Delete(mirroredCodename + "/" + otherPath)
+				failOther.Store(true)
+			}
+			archive.setObject(armDeb, old)
+			expirePool()
+			code, body := mirrorGet(t, s, "/apt/"+armDeb)
+			if archive.count(base+armPath) != reads {
+				t.Fatal("arm64 replay fetched upstream")
+			}
+			if code != http.StatusBadGateway && (code != http.StatusOK || string(body) != fixtureDebBody) {
+				t.Errorf("cached pool-reader document undid newer retained authority: got %d %q, want %q or 502", code, body, fixtureDebBody)
+			}
+			if pin, err := s.auditDB.GetChecksum(t.Context(), key); err != nil || (pin != nil && pin.Value != "" && pin.Value != sha256Of(fixtureDebBody)) {
+				t.Errorf("newer pool pin replaced: %+v %v", pin, err)
+			}
+			if stored, err := s.typeStore(manifest.TypeApt).Get(t.Context(), key); err != nil || (len(stored) > 0 && string(stored) != fixtureDebBody) {
+				t.Errorf("newer cached bytes replaced: %q %v", stored, err)
+			}
+		})
+	}
+}

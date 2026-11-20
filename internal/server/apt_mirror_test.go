@@ -3400,3 +3400,88 @@ func TestUsageDocumentsPoolResolution(t *testing.T) {
 		}
 	}
 }
+
+// Every rebuild, complete or not, picks one Packages document per triple out
+// of the build's own read (a cache replay included), the previous index and
+// the file last served to a client, by when bodega read each from upstream,
+// and files that document's paragraphs under that document's read time.
+func TestPoolIndexChoosesEachDocumentByUpstreamRead(t *testing.T) {
+	const triple = mirroredCodename + "/main/amd64"
+	const other = mirroredCodename + "/main/arm64"
+	key := manifest.AptKey(fixtureDeb)
+	older := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	oldest := older.Add(-time.Hour)
+	doc := func(tr, sum string, at time.Time) aptPoolDocument {
+		return aptPoolDocument{triple: tr, at: at,
+			stanzas: map[string]aptPoolStanza{key: {sha256: sum, size: 1, codename: mirroredCodename}}}
+	}
+	emptyIndex := func() *aptPoolIndex {
+		return &aptPoolIndex{byKey: map[string]aptPoolStanza{}, shadow: map[string][]aptPoolStanza{},
+			conflicts: map[string]aptPoolConflict{}, archives: map[string]string{mirroredCodename: ""},
+			indexed: map[string]bool{}, acquired: map[string]time.Time{}, documents: map[string]map[string]aptPoolStanza{}}
+	}
+	type source struct {
+		current, prev, served *aptPoolDocument
+	}
+	ptr := func(d aptPoolDocument) *aptPoolDocument { return &d }
+	cases := []struct {
+		name string
+		src  source
+		want string
+		at   time.Time
+	}{
+		{"current cache replay vs newer previous index", source{current: ptr(doc(triple, "cur", older)), prev: ptr(doc(triple, "prev", newer))}, "prev", newer},
+		{"current read vs older previous index", source{current: ptr(doc(triple, "cur", newer)), prev: ptr(doc(triple, "prev", older))}, "cur", newer},
+		{"current cache replay vs newer served", source{current: ptr(doc(triple, "cur", older)), served: ptr(doc(triple, "served", newer))}, "served", newer},
+		{"current read vs older served", source{current: ptr(doc(triple, "cur", newer)), served: ptr(doc(triple, "served", older))}, "cur", newer},
+		{"previous index vs newer served", source{current: ptr(doc(triple, "cur", oldest)), prev: ptr(doc(triple, "prev", older)), served: ptr(doc(triple, "served", newer))}, "served", newer},
+		{"previous index vs older served", source{current: ptr(doc(triple, "cur", oldest)), prev: ptr(doc(triple, "prev", newer)), served: ptr(doc(triple, "served", older))}, "prev", newer},
+		{"previous index vs served replay with no read time", source{current: ptr(doc(triple, "cur", oldest)), prev: ptr(doc(triple, "prev", older)), served: ptr(doc(triple, "served", time.Time{}))}, "prev", older},
+		{"broken newer current vs whole older previous index", source{current: func() *aptPoolDocument { d := doc(triple, "cur", newer); d.broken = true; return &d }(), prev: ptr(doc(triple, "prev", older))}, "prev", older},
+	}
+	for _, complete := range []bool{true, false} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("complete=%v/%s", complete, tc.name), func(t *testing.T) {
+				var prev *aptPoolIndex
+				if tc.src.prev != nil {
+					prev = emptyIndex()
+					prev.carryDocuments(map[string]aptPoolDocument{triple: *tc.src.prev})
+				}
+				served := &aptServedIndexes{}
+				if tc.src.served != nil {
+					served.record(mirroredCodename, "", triple, tc.src.served.stanzas, tc.src.served.at)
+				}
+				current := map[string]aptPoolDocument{triple: *tc.src.current}
+				// A parse break fails the build, so a broken read is never part of a complete one.
+				idx := emptyIndex()
+				idx.carryDocuments(served.choose(prev, mirroredCodename, "", current, complete && !tc.src.current.broken))
+				if got := idx.byKey[key].sha256; got != tc.want {
+					t.Errorf("paragraph came from %q, want %q", got, tc.want)
+				}
+				if got := idx.acquired[triple]; !got.Equal(tc.at) {
+					t.Errorf("document filed as read at %v, want %v, the read time of the copy whose paragraphs it holds", got, tc.at)
+				}
+			})
+		}
+	}
+
+	t.Run("complete read drops a triple its Release no longer lists", func(t *testing.T) {
+		prev := emptyIndex()
+		prev.carryDocuments(map[string]aptPoolDocument{other: doc(other, "prev", newer)})
+		idx := emptyIndex()
+		idx.carryDocuments((&aptServedIndexes{}).choose(prev, mirroredCodename, "", map[string]aptPoolDocument{}, true))
+		if idx.indexed[other] {
+			t.Error("a complete read kept a document its Release no longer lists")
+		}
+	})
+	t.Run("failed read keeps every triple it could not reach", func(t *testing.T) {
+		prev := emptyIndex()
+		prev.carryDocuments(map[string]aptPoolDocument{other: doc(other, "prev", older)})
+		idx := emptyIndex()
+		idx.carryDocuments((&aptServedIndexes{}).choose(prev, mirroredCodename, "", map[string]aptPoolDocument{triple: doc(triple, "cur", newer)}, false))
+		if !idx.indexed[other] || !idx.acquired[other].Equal(older) {
+			t.Error("a failed read lost a document only the previous index held, or restamped it")
+		}
+	})
+}

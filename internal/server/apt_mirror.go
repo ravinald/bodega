@@ -804,11 +804,24 @@ type aptPoolIndex struct {
 }
 
 // aptPoolDocument is the paragraphs of one Packages, for one triple, and when
-// bodega read it from upstream.
+// bodega read it from upstream. broken marks a document whose parse stopped
+// partway, which holds only the paragraphs before the break.
 type aptPoolDocument struct {
 	triple  string
 	stanzas map[string]aptPoolStanza
 	at      time.Time
+	broken  bool
+}
+
+// supersedes reports whether d should answer for its triple in place of held.
+// A whole document outranks a broken one, since the paths past the break
+// would otherwise lose the paragraph the whole one gives them; between two of
+// the same kind the later upstream read wins, and a tie keeps held.
+func (d aptPoolDocument) supersedes(held aptPoolDocument) bool {
+	if d.broken != held.broken {
+		return !d.broken
+	}
+	return d.at.After(held.at)
 }
 
 // read records one Packages of triple read from upstream at at and returns
@@ -1008,11 +1021,14 @@ func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, 
 	}
 	reads := map[string]aptIndexRead{}
 	for _, c := range codenames {
-		idx.archives[c] = s.cfg.AptArchiveOf(c)
-		if err := s.indexAptPool(ctx, c, idx, prev, reads); err != nil {
+		archive := s.cfg.AptArchiveOf(c)
+		idx.archives[c] = archive
+		current, err := s.indexAptPool(ctx, c, prev, reads)
+		if err != nil {
 			idx.failed = append(idx.failed, err.Error())
-			s.aptServed.carryInto(idx, prev, c)
-		} else {
+		}
+		idx.carryDocuments(s.aptServed.choose(prev, c, archive, current, err == nil))
+		if err == nil {
 			s.aptServed.forget(c, idx)
 		}
 	}
@@ -1054,22 +1070,24 @@ func aptArchiveLabel(archive string) string {
 	return "archive " + archive
 }
 
-// indexAptPool adds one codename's paragraphs to idx. A parse break keeps what came before it, since each entry is a
-// paragraph that did parse and a path missing past the break goes unchecked
-// rather than misjudged.
+// indexAptPool reads one codename's Packages and returns each as a document by
+// triple, for choose to weigh against the copies prev and the served files
+// hold. A parse break keeps what came before it as a broken document, since
+// each entry is a paragraph that did parse.
 //
 // A 404 for a Packages prev read a body for is returned as an error once the
 // rest are read, so the caller carries prev's paragraphs: the Release still
 // lists that document, and a mirror mid-sync answering 404 for it says
 // nothing about whether the paths it named are still published.
-func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *aptPoolIndex, reads map[string]aptIndexRead) error {
+func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoolIndex, reads map[string]aptIndexRead) (map[string]aptPoolDocument, error) {
+	docs := map[string]aptPoolDocument{}
 	release, err := s.aptUpstreamRelease(ctx, codename)
 	if err != nil {
-		return fmt.Errorf("read the Release for %s: %w", codename, err)
+		return docs, fmt.Errorf("read the Release for %s: %w", codename, err)
 	}
 	layout, err := s.aptUpstreamComponents(codename, release)
 	if err != nil {
-		return err
+		return docs, err
 	}
 	archive := s.cfg.AptArchiveOf(codename)
 	var vanished []string
@@ -1077,7 +1095,7 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *a
 		for _, arch := range comp.arches {
 			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, reads)
 			if err != nil {
-				return err
+				return docs, err
 			}
 			triple := codename + "/" + comp.name + "/" + arch
 			if read.notPublished {
@@ -1086,15 +1104,23 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, idx, prev *a
 				}
 				continue
 			}
-			if err := aptPoolStanzas(read.body, archive, codename, idx.read(triple, read.at)); err != nil {
-				return fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, err)
+			doc := aptPoolDocument{triple: triple, stanzas: map[string]aptPoolStanza{}, at: read.at}
+			parseErr := aptPoolStanzas(read.body, archive, codename, func(key string, st aptPoolStanza) {
+				if _, seen := doc.stanzas[key]; !seen {
+					doc.stanzas[key] = st
+				}
+			})
+			doc.broken = parseErr != nil
+			docs[triple] = doc
+			if parseErr != nil {
+				return docs, fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, parseErr)
 			}
 		}
 	}
 	if len(vanished) > 0 {
-		return fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
+		return docs, fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
 	}
-	return nil
+	return docs, nil
 }
 
 // aptPoolStanzas hands add each paragraph of one decompressed Packages file of
@@ -1248,28 +1274,43 @@ func (sv *aptServedIndexes) forget(codename string, idx *aptPoolIndex) {
 	}
 }
 
-// carryInto adds to idx the paragraphs of codename that prev and the served
-// files hold, for a build that could not read codename. Each triple is
-// decided on its own: the served file replaces prev's document for that
-// triple only when bodega read it from upstream later, and a triple only one
-// side holds comes from that side. Both are ordered by when bodega read
-// upstream, never by when a cached copy was delivered, so a replay of an
-// older file cannot displace what the last pool read found, and a fresh read
-// of one architecture lends no standing to another's replay.
-func (sv *aptServedIndexes) carryInto(idx, prev *aptPoolIndex, codename string) {
+// choose is, per triple of codename, the one Packages document the pool index
+// takes its paragraphs from, out of three copies: current, what this build
+// read (a cache hit included), prev's, and the newest file served to a
+// client. The copy bodega read from upstream last wins whole, with its own
+// paragraphs and its own read time, because a cached copy is not a newer
+// observation however recently it was delivered: a pool read replaying an
+// older cache entry cannot displace what prev or a client's read found, and
+// one triple's fresh read lends no standing to another's replay.
+//
+// complete says this build read every Packages its Release lists. Then only
+// the triples current holds are kept, since that Release no longer lists the
+// rest; after a failed read every copy stays a candidate, because a failure
+// says nothing about whether a path is still published.
+func (sv *aptServedIndexes) choose(prev *aptPoolIndex, codename, archive string, current map[string]aptPoolDocument, complete bool) map[string]aptPoolDocument {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
-	archive := idx.archives[codename]
-	docs := prev.documentsOf(codename, archive)
-	if c := sv.byCodename[codename]; c != nil && c.archive == archive {
-		for triple, t := range c.triples {
-			if held, ok := docs[triple]; ok && !t.at.After(held.at) {
-				continue
-			}
-			docs[triple] = aptPoolDocument{triple: triple, stanzas: t.stanzas, at: t.at}
+	chosen := map[string]aptPoolDocument{}
+	offer := func(d aptPoolDocument) {
+		if _, read := current[d.triple]; complete && !read {
+			return
+		}
+		if held, ok := chosen[d.triple]; !ok || d.supersedes(held) {
+			chosen[d.triple] = d
 		}
 	}
-	idx.carryDocuments(docs)
+	for _, d := range current {
+		offer(d)
+	}
+	for _, d := range prev.documentsOf(codename, archive) {
+		offer(d)
+	}
+	if c := sv.byCodename[codename]; c != nil && c.archive == archive {
+		for triple, t := range c.triples {
+			offer(aptPoolDocument{triple: triple, stanzas: t.stanzas, at: t.at})
+		}
+	}
+	return chosen
 }
 
 // retainAptServedIndex keeps what a client was served from a mirrored
