@@ -362,6 +362,12 @@ type Config struct {
 	// which is every install that mirrors one distribution.
 	AptArchives map[string][]string `json:"apt_archives,omitempty"`
 
+	// AptArchitectures is the Debian architectures whose mirrored Packages
+	// the pool index reads; nil means DefaultAptArchitectures. A Debian
+	// Release declares nine, and reading all of them held gigabytes for a
+	// fleet using one. "all" is read whenever a Release declares it.
+	AptArchitectures []string `json:"apt_architectures,omitempty"`
+
 	// InventorySources maps an inventory source instance name to its
 	// settings: "type", "enabled" and whatever keys that type takes. Several
 	// instances of one type are allowed, two Falcon tenants for example, so
@@ -1270,6 +1276,36 @@ func validateHelmKeyrings(m map[string]string) error {
 // "non-free-firmware".
 var aptComponentPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
+// aptArchitecturePattern is a Debian architecture name as dpkg spells one.
+var aptArchitecturePattern = regexp.MustCompile(`^[a-z0-9]+$`)
+
+// DefaultAptArchitectures is what the pool index reads when apt_architectures
+// is unset.
+var DefaultAptArchitectures = []string{"amd64", "arm64"}
+
+// AptIndexArchitectures is the architectures the mirrored pool index reads,
+// apt_architectures or its default.
+func (c *Config) AptIndexArchitectures() []string {
+	if c.AptArchitectures == nil {
+		return DefaultAptArchitectures
+	}
+	return c.AptArchitectures
+}
+
+// validateAptArchitectures refuses an apt_architectures list that would index
+// nothing or names something no Release can declare.
+func validateAptArchitectures(arches []string) error {
+	if arches != nil && len(arches) == 0 {
+		return errors.New("invalid apt_architectures []: the pool index would read no architecture's Packages, so no mirrored .deb would be checked against its paragraph; remove the key for the default [\"amd64\", \"arm64\"] or name the architectures your hosts run")
+	}
+	for _, a := range arches {
+		if !aptArchitecturePattern.MatchString(a) {
+			return fmt.Errorf("invalid apt_architectures entry %q: a Debian architecture name matches %s (amd64, arm64, i386, all)", a, aptArchitecturePattern)
+		}
+	}
+	return nil
+}
+
 // aptCodenamePattern is what an apt_upstreams key may look like. It is
 // narrower than upstreamNamespacePattern because the key is a suite name apt
 // itself parses: lowercase, digits and hyphens, which covers every Debian and
@@ -2000,6 +2036,9 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		}
 	}
 	if err := cfg.validateAptArchives(); err != nil {
+		return nil, err
+	}
+	if err := validateAptArchitectures(cfg.AptArchitectures); err != nil {
 		return nil, err
 	}
 
@@ -3007,6 +3046,9 @@ func defaultConfigContent() []byte {
 
   "_comment_apt_archives": "apt_archives: names groups of mirrored codenames whose pool/ is one namespace, e.g. {\"ubuntu\": [\"resolute\", \"resolute-updates\"], \"debian\": [\"trixie\", \"trixie-updates\"]}. A named archive is served at /apt/<archive>/dists/ and /apt/<archive>/pool/ and stored under packages/apt/<archive>/. Needed only when one server mirrors two distributions: Debian and Ubuntu publish different bytes at one pool path. A mirrored codename in no archive stays at /apt/dists/ and /apt/pool/.",
   "apt_archives": {},
+
+  "_comment_apt_architectures": "apt_architectures: the Debian architectures whose mirrored Packages bodega reads to check each .deb it fetches against the paragraph naming it. 'all' is read whenever a Release declares it. A host of an architecture left out still installs: its dists/ files are forwarded unchanged, and its .debs are probed across the archive's roots and pinned on first fetch rather than checked against a paragraph. Each architecture read costs memory for every mirrored pocket.",
+  "apt_architectures": ["amd64", "arm64"],
 
   "_comment_apt_signing": "apt_signing_name / apt_signing_email: the UID stamped on a key made by 'bodega apt key generate'. They name the key, nothing more — the server loads whatever key it finds and never generates one.",
   "apt_signing_name": "",
