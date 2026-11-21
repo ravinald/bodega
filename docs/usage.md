@@ -6691,6 +6691,25 @@ Objects cached under `packages/apt/` before a codename moved into an archive sta
 
 Config load refuses, naming the key and the value: an archive name that does not match `^[a-zA-Z][a-zA-Z0-9_-]*$`; a name bodega already uses as a route or a storage directory (`pool`, `dists`, `keys`, `packages` and the other names `git_upstreams` and `binary_upstreams` refuse as a namespace); a codename `apt_upstreams` does not mirror; a codename listed in two archives; and a generated suite from `apt_suites`, which bodega signs and serves at `/apt/dists/` only.
 
+#### `apt_architectures`
+
+bodega checks each mirrored `.deb` it fetches against the `Packages` paragraph naming it (see [Resolving a pool path](#resolving-a-pool-path)), so it reads and holds those paragraphs in memory.
+A Debian `Release` declares nine architectures, and holding all of them for a few pockets of trixie and bullseye is several gigabytes.
+`apt_architectures` limits the index to the architectures your hosts run:
+
+```json
+"apt_architectures": ["amd64", "arm64"]
+```
+
+The default, when the key is absent, is `["amd64", "arm64"]`.
+`all` is read whenever a `Release` declares it, whether the list names it or not.
+Config load refuses an empty list and any name outside `[a-z0-9]+`, naming the key and the value.
+
+A host of an architecture the list leaves out still updates and installs.
+Its `dists/` files are forwarded unchanged, so `apt-get update` succeeds, and the `.deb` files it fetches are named by no indexed paragraph, so each one is probed across the archive's roots and pinned on first fetch rather than checked against its paragraph.
+Each index build logs one `WARN` naming the mirrored codenames whose `Release` declares architectures the index skipped, and which ones.
+Add an architecture to the list to have its `.deb` files checked.
+
 #### Moving a running server to archives
 
 A server that mirrored one distribution and adds a second moves the first one's codenames under a root of their own. Do it in this order:
@@ -6779,7 +6798,7 @@ With any apt rule present, an archive not on the list is never contacted: the ch
 
 A pool request carries no codename. apt chose which archive to trust when it read a `Packages` file during `apt update`, and that decision is not recoverable from `GET /apt/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` — the request looks identical whichever suite produced it.
 
-So bodega reads the archive's own indexes first. It keeps an index of every `Packages` paragraph the archive's mirrored codenames publish, rebuilt every `metadata_ttl`, and resolves a pool path in this order:
+So bodega reads the archive's own indexes first. It keeps an index of every `Packages` paragraph the archive's mirrored codenames publish for the architectures [`apt_architectures`](#apt_architectures) names, rebuilt every `metadata_ttl`, and resolves a pool path in this order:
 
 1. **Two codenames disagree.** When paragraphs of two codenames in the request's archive list the path with different `SHA256` values, the request is refused with `502` before any upstream is asked. The default archive counts as an archive here. Each index build that finds such paths logs one `ERROR` line per pair of codenames, with how many paths they disagree on.
 2. **A paragraph names the path.** bodega fetches it from the upstream roots of that paragraph's codename, in the order `apt_upstreams` lists them, and no other. The bytes are cached, pinned and served only when their size and `SHA256` equal the paragraph's. A mismatch is refused with `502`, recorded as a `checksum_mismatch` audit row under the incident the body names, and nothing is stored or pinned, so the next request asks upstream again.

@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -45,8 +46,12 @@ func TestDefaultConfigContent(t *testing.T) {
 		// generated config is a namespace every install serves. For
 		// binary_upstreams an empty map is also what keeps the un-namespaced
 		// /binaries/ route serving from storage.
-		"git_upstreams":    map[string]any{},
-		"binary_upstreams": map[string]any{},
+		"git_upstreams":     map[string]any{},
+		"binary_upstreams":  map[string]any{},
+		"apt_architectures": []any{"amd64", "arm64"},
+	}
+	if c, _ := got["_comment_apt_architectures"].(string); !strings.Contains(c, "probed") {
+		t.Errorf("generated config's _comment_apt_architectures = %q, want it to say what a host of an unlisted architecture gets", c)
 	}
 	for k, v := range want {
 		if _, ok := got[k]; !ok {

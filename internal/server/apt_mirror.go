@@ -986,11 +986,19 @@ type aptPoolIndexCache struct {
 // codenames are mirrored and the archive each belongs to. An index built
 // under another one is rebuilt rather than read.
 func (s *Server) aptPoolIndexIdent(codenames []string) string {
-	parts := make([]string, len(codenames))
+	parts := make([]string, len(codenames), len(codenames)+1)
 	for i, c := range codenames {
 		parts[i] = c + "=" + s.cfg.AptArchiveOf(c)
 	}
+	parts = append(parts, "arches="+strings.Join(s.cfg.AptIndexArchitectures(), ","))
 	return strings.Join(parts, " ")
+}
+
+// aptIndexesArch reports whether the pool index reads arch's Packages:
+// apt_architectures names it, or it is "all", whose paragraphs every
+// architecture's client installs.
+func (s *Server) aptIndexesArch(arch string) bool {
+	return arch == "all" || slices.Contains(s.cfg.AptIndexArchitectures(), arch)
 }
 
 // aptPoolIndexNow is the current pool index, rebuilt first when it is stale or
@@ -1071,10 +1079,14 @@ func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, 
 		idx.ttl = aptRouteTTL
 	}
 	reads := map[string]aptIndexRead{}
+	var skipped []string
 	for _, c := range codenames {
 		archive := s.cfg.AptArchiveOf(c)
 		idx.archives[c] = archive
-		current, err := s.indexAptPool(ctx, c, prev, reads)
+		current, unread, err := s.indexAptPool(ctx, c, prev, reads)
+		if len(unread) > 0 {
+			skipped = append(skipped, c+": "+strings.Join(unread, " "))
+		}
 		if err != nil {
 			idx.failed = append(idx.failed, err.Error())
 		}
@@ -1087,6 +1099,10 @@ func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, 
 		idx.ttl = min(idx.ttl, aptPoolIndexRetry)
 		s.logger.Warn("bodega could not read every mirrored apt index, so the .debs those indexes name are judged by the last read of them that succeeded, or probed and pinned on first fetch where none has, until it reads them",
 			"failed", strings.Join(idx.failed, "; "), "retry", idx.ttl)
+	}
+	if len(skipped) > 0 {
+		s.logger.Warn("mirrored apt Releases declare architectures apt_architectures leaves out, so the pool index does not read their Packages: a host of one of them still installs, with each .deb it fetches probed and pinned on first fetch rather than checked against the paragraph naming it. Add the architecture to apt_architectures to check its .debs",
+			"skipped", strings.Join(skipped, "; "), "apt_architectures", strings.Join(s.cfg.AptIndexArchitectures(), " "))
 	}
 	s.logAptPoolConflicts(idx)
 	return idx
@@ -1123,32 +1139,43 @@ func aptArchiveLabel(archive string) string {
 
 // indexAptPool reads one codename's Packages and returns each as a document by
 // triple, for choose to weigh against the copies prev and the served files
-// hold. A parse break keeps what came before it as a broken document, since
-// each entry is a paragraph that did parse.
+// hold, and the architectures its Release publishes that apt_architectures
+// leaves unread. A parse break keeps what came before it as a broken
+// document, since each entry is a paragraph that did parse.
+//
+// Each body is dropped from reads once parsed, so a build holds one
+// decompressed Packages at a time rather than every one it read.
 //
 // A 404 for a Packages prev read a body for is returned as an error once the
 // rest are read, so the caller carries prev's paragraphs: the Release still
 // lists that document, and a mirror mid-sync answering 404 for it says
 // nothing about whether the paths it named are still published.
-func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoolIndex, reads map[string]aptIndexRead) (map[string]aptPoolDocument, error) {
+func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoolIndex, reads map[string]aptIndexRead) (map[string]aptPoolDocument, []string, error) {
 	docs := map[string]aptPoolDocument{}
 	release, err := s.aptUpstreamRelease(ctx, codename)
 	if err != nil {
-		return docs, fmt.Errorf("read the Release for %s: %w", codename, err)
+		return docs, nil, fmt.Errorf("read the Release for %s: %w", codename, err)
 	}
 	layout, err := s.aptUpstreamComponents(codename, release)
 	if err != nil {
-		return docs, err
+		return docs, nil, err
 	}
 	archive := s.cfg.AptArchiveOf(codename)
-	var vanished []string
+	var vanished, skipped []string
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
+			if !s.aptIndexesArch(arch) {
+				if !slices.Contains(skipped, arch) {
+					skipped = append(skipped, arch)
+				}
+				continue
+			}
 			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, reads)
 			if err != nil {
-				return docs, err
+				return docs, skipped, err
 			}
 			triple := codename + "/" + comp.name + "/" + arch
+			delete(reads, triple)
 			if read.notPublished {
 				if (prev != nil && prev.indexed[triple]) || s.aptServed.indexed(codename, archive, triple) {
 					vanished = append(vanished, triple)
@@ -1164,19 +1191,24 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoo
 			doc.broken = parseErr != nil
 			docs[triple] = doc
 			if parseErr != nil {
-				return docs, fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, parseErr)
+				return docs, skipped, fmt.Errorf("parse the Packages for %s/%s/%s: %w", codename, comp.name, arch, parseErr)
 			}
 		}
 	}
+	sort.Strings(skipped)
 	if len(vanished) > 0 {
-		return docs, fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
+		return docs, skipped, fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
 	}
-	return docs, nil
+	return docs, skipped, nil
 }
 
 // aptPoolStanzas hands add each paragraph of one decompressed Packages file of
 // codename that names a Filename, keyed as an object of archive. A parse break
 // returns the error after the paragraphs before it.
+//
+// Every field is cloned so a stanza owns its strings: the index outlives the
+// body by a metadata_ttl, and a stanza holding a substring of whatever the
+// parser handed it would keep that whole allocation alive with it.
 func aptPoolStanzas(body []byte, archive, codename string, add func(key string, st aptPoolStanza)) error {
 	return deb822.ParseStreamRaw(bytes.NewReader(body), func(_ []byte, fields map[string]string) error {
 		filename := strings.TrimSpace(fields["Filename"])
@@ -1187,8 +1219,9 @@ func aptPoolStanzas(body []byte, archive, codename string, add func(key string, 
 		if err != nil {
 			size = -1
 		}
-		add(manifest.AptArchiveKey(archive, filename), aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields),
-			sha256: strings.ToLower(strings.TrimSpace(fields["SHA256"])), size: size, codename: codename})
+		add(manifest.AptArchiveKey(archive, filename), aptPoolStanza{source: strings.Clone(deb822.SourceName(fields)),
+			version: strings.Clone(aptSourceVersion(fields)), sha256: strings.Clone(strings.ToLower(strings.TrimSpace(fields["SHA256"]))),
+			size: size, codename: codename})
 		return nil
 	})
 }
@@ -1369,7 +1402,8 @@ func (sv *aptServedIndexes) choose(prev *aptPoolIndex, codename, archive string,
 // digests a Release or InRelease lists, and the paragraphs of a Packages file
 // one of those Releases lists, read whole. A Packages file no served Release
 // lists, nor a Release the age gate recorded, is not authority and is skipped,
-// as is one that does not parse whole.
+// as is one that does not parse whole, and one of an architecture
+// apt_architectures leaves out, which the pool index does not read either.
 func (s *Server) retainAptServedIndex(ctx context.Context, codename, rest string, raw []byte, acquired time.Time) {
 	archive := s.cfg.AptArchiveOf(codename)
 	if rest == "Release" || rest == "InRelease" {
@@ -1398,7 +1432,7 @@ func (s *Server) retainAptServedIndex(ctx context.Context, codename, rest string
 		}
 	}
 	component, arch, ok := aptPackagesIndexPath(rel)
-	if !ok {
+	if !ok || !s.aptIndexesArch(arch) {
 		return
 	}
 	body, err := aptDecompressSniffed(codename, rest, raw)
