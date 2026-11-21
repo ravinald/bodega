@@ -273,6 +273,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"helm_keyrings": map[string]string{"https://charts.example.com/": "/etc/bodega/charts-example.gpg"},
 		// Load requires a bare hostname and stores it lowercased.
 		"private_upstream_hosts": []string{"registry.example.internal", "10.0.0.5"},
+		// Load requires Debian architecture names.
+		"apt_architectures": []string{"amd64", "riscv64"},
 	}
 
 	v := reflect.ValueOf(cfg).Elem()

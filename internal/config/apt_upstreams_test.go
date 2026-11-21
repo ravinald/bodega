@@ -406,3 +406,49 @@ func TestNoAptArchivesIsUnchanged(t *testing.T) {
 		t.Errorf("AptPoolUpstreamsIn(\"\") = %q, want every configured root %q", got, want)
 	}
 }
+
+// B198 requirement 1: apt_architectures limits the architectures the pool
+// index reads, defaults to amd64 and arm64, and refuses a list that would
+// read nothing or names no Debian architecture.
+func TestAptArchitectures(t *testing.T) {
+	writeAptConfig(t, map[string]any{"apt_codename": "local", "apt_upstreams": aptTwoDistros()})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatalf("Load without apt_architectures: %v", err)
+	}
+	if got := strings.Join(cfg.AptIndexArchitectures(), " "); got != "amd64 arm64" {
+		t.Errorf("AptIndexArchitectures() unset = %q, want %q", got, "amd64 arm64")
+	}
+
+	writeAptConfig(t, map[string]any{"apt_codename": "local", "apt_upstreams": aptTwoDistros(), "apt_architectures": []string{"amd64", "i386"}})
+	if cfg, err = loadApt(t); err != nil {
+		t.Fatalf("Load with apt_architectures: %v", err)
+	}
+	if got := strings.Join(cfg.AptIndexArchitectures(), " "); got != "amd64 i386" {
+		t.Errorf("AptIndexArchitectures() = %q, want the configured list", got)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		arches []string
+		wantIn []string
+	}{
+		{"empty list indexes nothing", []string{}, []string{"apt_architectures", "[]"}},
+		{"upper case", []string{"amd64", "ARM64"}, []string{"apt_architectures", `"ARM64"`}},
+		{"punctuation", []string{"x86_64"}, []string{"apt_architectures", `"x86_64"`}},
+		{"blank entry", []string{""}, []string{"apt_architectures", `""`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeAptConfig(t, map[string]any{"apt_codename": "local", "apt_upstreams": aptTwoDistros(), "apt_architectures": tc.arches})
+			_, err := loadApt(t)
+			if err == nil {
+				t.Fatalf("Load accepted apt_architectures %q", tc.arches)
+			}
+			for _, want := range tc.wantIn {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+		})
+	}
+}

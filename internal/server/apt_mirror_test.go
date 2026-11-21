@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -3577,6 +3578,176 @@ func TestUsageDocumentsArchiveScopedGates(t *testing.T) {
 	} {
 		if !strings.Contains(osv, want) {
 			t.Errorf("the OSV gate's limits do not say %q", want)
+		}
+	}
+}
+
+// archesArchive serves one codename whose Release declares each of arches
+// under every component in packages, with a gzipped Packages per
+// component/arch, and the objects in extra. It is the layout Debian
+// publishes, where one pocket carries an index per declared architecture.
+func archesArchive(t testing.TB, codename string, arches []string, packages map[string]string, extra map[string]string) *fixtureArchive {
+	t.Helper()
+	objects := map[string]string{}
+	var digests, components []string
+	for _, rel := range slices.Sorted(maps.Keys(packages)) {
+		gz := gzipFixture(packages[rel])
+		sum := sha256.Sum256(gz)
+		digests = append(digests, fmt.Sprintf(" %s %d %s.gz", hex.EncodeToString(sum[:]), len(gz), rel))
+		objects["dists/"+codename+"/"+rel+".gz"] = string(gz)
+		if comp, _, ok := strings.Cut(rel, "/binary-"); ok && !slices.Contains(components, comp) {
+			components = append(components, comp)
+		}
+	}
+	objects["dists/"+codename+"/Release"] = strings.Join(append([]string{
+		"Origin: Debian",
+		"Codename: " + codename,
+		"Components: " + strings.Join(components, " "),
+		"Architectures: " + strings.Join(arches, " "),
+		"SHA256:",
+	}, append(digests, "")...), "\n")
+	maps.Copy(objects, extra)
+	return newFixtureArchive(t, objects)
+}
+
+// generatedPackages is n paragraphs for component and arch, each the size of
+// a real one: a Description of several lines is most of an Ubuntu paragraph.
+func generatedPackages(component, arch string, n int) string {
+	var b strings.Builder
+	for i := range n {
+		name := fmt.Sprintf("pkg-%s-%d", component, i)
+		fmt.Fprintf(&b, "Package: %s\nSource: src-%s-%d (1:%d.0-1)\nVersion: 1:%d.0-1\nArchitecture: %s\nMaintainer: Fixture Maintainers <fixture@example.invalid>\nInstalled-Size: %d\nDepends: libc6 (>= 2.38), libssl3t64 (>= 3.0.0), zlib1g (>= 1:1.2.0)\nSection: %s/net\nPriority: optional\nFilename: pool/%s/p/%s/%s_%d.0-1_%s.deb\nSize: %d\nSHA256: %064x\nDescription: generated package %d for the pool index heap test\n This paragraph is sized like one an archive publishes, so a stanza that\n kept a slice of it would keep the whole paragraph alive with it.\n .\n It carries no meaning beyond its length and its Filename.\n\n",
+			name, component, i/3, i, i, arch, 100+i, component, component, name, name, i, arch, 4096+i, i, i)
+	}
+	return b.String()
+}
+
+// B198 requirement 3: the index holds the fields of each paragraph and
+// nothing of the Packages body they came from, so what a build keeps is
+// bounded by the paragraphs rather than by the bytes upstream published.
+func TestPoolIndexKeepsNoPackagesBody(t *testing.T) {
+	const perTriple = 50_000
+	// Built inside the call so no plain body outlives the fixture, which
+	// keeps only the gzipped form.
+	archive := archesArchive(t, mirroredCodename, []string{"amd64", "arm64"}, func() map[string]string {
+		packages := map[string]string{}
+		for _, comp := range []string{"main", "universe"} {
+			for _, arch := range []string{"amd64", "arm64"} {
+				packages[comp+"/binary-"+arch+"/Packages"] = generatedPackages(comp, arch, perTriple)
+			}
+		}
+		return packages
+	}(), nil)
+	s := mirrorServer(t, archive)
+	// The audit trail records every paragraph it reads into SQLite, which is
+	// its own cost and not the index's.
+	db := s.auditDB
+	s.auditDB = nil
+	defer func() { s.auditDB = db }()
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	idx := s.buildAptPoolIndex(t.Context(), []string{mirroredCodename})
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	if len(idx.failed) > 0 {
+		t.Fatalf("build failed: %v", idx.failed)
+	}
+	if got := len(idx.byKey); got != 4*perTriple {
+		t.Fatalf("index holds %d paths, want %d", got, 4*perTriple)
+	}
+	grewMB := (float64(after.HeapAlloc) - float64(before.HeapAlloc)) / (1 << 20)
+	t.Logf("live heap grew %.1f MB across a build of %d paragraphs over 4 triples", grewMB, len(idx.byKey))
+	if grewMB > 150 {
+		t.Errorf("live heap grew %.1f MB, want at most 150 MB", grewMB)
+	}
+	runtime.KeepAlive(idx)
+}
+
+// B198 requirement 2: a host of an architecture apt_architectures leaves out
+// still updates and installs. Its dists/ files forward unchanged, its .deb is
+// served on the probe-and-pin path because no indexed paragraph names it,
+// and every build says once which architectures it skipped.
+func TestPoolServesAnArchitectureTheIndexSkips(t *testing.T) {
+	const armDeb = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_arm64.deb"
+	const armBody = "\x21<arch>\nfixture nginx arm64 bytes"
+	archive := archesArchive(t, mirroredCodename, []string{"amd64", "arm64"}, map[string]string{
+		"main/binary-amd64/Packages": fixturePackages(fixtureDeb, fixtureDebBody),
+		"main/binary-arm64/Packages": fixturePackages(armDeb, armBody),
+	}, map[string]string{fixtureDeb: fixtureDebBody, armDeb: armBody})
+	s := mirrorServer(t, archive)
+	s.cfg.AptArchitectures = []string{"amd64"}
+	var logged syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	armPackages := "dists/" + mirroredCodename + "/main/binary-arm64/Packages.gz"
+	want, _ := archive.object(armPackages)
+	if code, body := mirrorGet(t, s, "/apt/"+armPackages); code != http.StatusOK || string(body) != want {
+		t.Fatalf("GET the arm64 Packages = %d (%d bytes), want 200 and upstream's bytes", code, len(body))
+	}
+	if code, body := mirrorGet(t, s, "/apt/"+armDeb); code != http.StatusOK || string(body) != armBody {
+		t.Fatalf("GET the arm64 .deb = %d %q, want 200 and its bytes", code, body)
+	}
+	idx := s.aptPoolIndexNow(t.Context())
+	if _, named := idx.byKey[manifest.AptKey(armDeb)]; named {
+		t.Errorf("the index names %s, which only the arm64 Packages lists", armDeb)
+	}
+	if _, named := idx.byKey[manifest.AptKey(fixtureDeb)]; !named {
+		t.Errorf("the index does not name %s, which the amd64 Packages lists", fixtureDeb)
+	}
+
+	// A second build, as metadata_ttl expiring would start.
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	if code, body := mirrorGet(t, s, "/apt/"+armDeb); code != http.StatusOK || string(body) != armBody {
+		t.Fatalf("GET the arm64 .deb from the cache = %d %q, want 200 and its bytes", code, body)
+	}
+
+	var warns []string
+	for line := range strings.Lines(logged.String()) {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "apt_architectures") {
+			warns = append(warns, line)
+		}
+	}
+	if len(warns) != 2 {
+		t.Fatalf("WARN lines naming skipped architectures = %d over 2 builds, want one per build:\n%s", len(warns), strings.Join(warns, ""))
+	}
+	if !strings.Contains(warns[0], `skipped="`+mirroredCodename+`: arm64"`) {
+		t.Errorf("WARN does not name the codename and the architecture it skipped: %s", warns[0])
+	}
+}
+
+func TestReviewB198WarnsWhenAnIndexedPackagesReadFails(t *testing.T) {
+	archive := archesArchive(t, mirroredCodename, []string{"amd64", "arm64"}, map[string]string{
+		"main/binary-amd64/Packages": fixturePackages(fixtureDeb, fixtureDebBody),
+		"main/binary-arm64/Packages": fixturePackages(fallbackDeb, fallbackDebBody),
+	}, nil)
+	archive.setObject("dists/"+mirroredCodename+"/main/binary-amd64/Packages.gz", "mirror is between syncs")
+	s := mirrorServer(t, archive)
+	s.cfg.AptArchitectures = []string{"amd64"}
+	var logged syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	for range 2 {
+		idx := s.buildAptPoolIndex(t.Context(), []string{mirroredCodename})
+		if len(idx.failed) == 0 {
+			t.Fatal("fixture must fail reading amd64 after reading its Release")
+		}
+	}
+	var warns []string
+	for line := range strings.Lines(logged.String()) {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "apt_architectures") {
+			warns = append(warns, line)
+		}
+	}
+	if len(warns) != 2 {
+		t.Fatalf("skipped-architecture WARNs = %d over 2 builds, want 2; logs:\n%s", len(warns), logged.String())
+	}
+	for _, line := range warns {
+		if !strings.Contains(line, `skipped="fixture: arm64"`) {
+			t.Errorf("WARN omitted declared arm64: %s", line)
 		}
 	}
 }
