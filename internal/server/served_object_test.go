@@ -21,6 +21,23 @@ func assertServed(t *testing.T, ev audit.StoredEvent, wantKey, wantDigest string
 	}
 }
 
+// oneServeFetch returns the single row match selects. Rows are found by their
+// fields because QueryEvents orders by a millisecond timestamp, and two
+// requests inside one millisecond come back in either order.
+func oneServeFetch(t *testing.T, events []audit.StoredEvent, what string, match func(audit.StoredEvent) bool) audit.StoredEvent {
+	t.Helper()
+	var found []audit.StoredEvent
+	for _, ev := range events {
+		if match(ev) {
+			found = append(found, ev)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("serve_fetch rows for %s = %d, want 1 (%v)", what, len(found), eventIdentities(events))
+	}
+	return found[0]
+}
+
 // A mirrored .deb is served twice: the miss hands over the digest the fill
 // computed, and the hit reads the checksums row that fill pinned. Both rows
 // have to name the same bytes, or a host's report matches one fetch and not
@@ -104,19 +121,14 @@ func TestServeFetchRecordsNpmTarballAndNotPackument(t *testing.T) {
 	if status, body := getStatusAndBody(t, s, "/npm/widget/-/widget-1.0.0.tgz"); status != http.StatusOK {
 		t.Fatalf("GET tarball = %d: %s", status, body)
 	}
-	tgz := waitForServeFetch(t, s, 1)[0]
-	if tgz.PkgVersion != "1.0.0" {
-		t.Fatalf("first row is %s/%s@%s, want the tarball", tgz.PkgType, tgz.PkgName, tgz.PkgVersion)
-	}
-	assertServed(t, tgz, key, sha256Hex(tarball))
-
+	waitForServeFetch(t, s, 1)
 	if status, body := getStatusAndBody(t, s, "/npm/widget"); status != http.StatusOK {
 		t.Fatalf("GET packument = %d: %s", status, body)
 	}
-	packument := waitForServeFetch(t, s, 2)[0]
-	if packument.PkgVersion != "" {
-		t.Fatalf("newest row is %s/%s@%s, want the packument", packument.PkgType, packument.PkgName, packument.PkgVersion)
-	}
+	events := waitForServeFetch(t, s, 2)
+	tgz := oneServeFetch(t, events, "the tarball", func(ev audit.StoredEvent) bool { return ev.PkgVersion == "1.0.0" })
+	assertServed(t, tgz, key, sha256Hex(tarball))
+	packument := oneServeFetch(t, events, "the packument", func(ev audit.StoredEvent) bool { return ev.PkgVersion == "" })
 	assertServed(t, packument, "", "")
 }
 
@@ -160,12 +172,18 @@ func TestServeFetchRecordsFreeBSDPackage(t *testing.T) {
 	if status, body := getStatusAndBody(t, s, freeBSDURL("latest", freeBSDHashedPath)); status != http.StatusOK {
 		t.Fatalf("GET package = %d: %s", status, body)
 	}
-	assertServed(t, waitForServeFetch(t, s, 1)[0], key, sha256Hex(pkgBody))
+	// Both rows carry the same type, name and version, so the package row is
+	// known by its ID while it is the only row.
+	pkgID := waitForServeFetch(t, s, 1)[0].ID
 
 	if status, body := getStatusAndBody(t, s, freeBSDURL("latest", manifest.FreeBSDMetaFile)); status != http.StatusOK {
 		t.Fatalf("GET meta.conf = %d: %s", status, body)
 	}
-	assertServed(t, waitForServeFetch(t, s, 2)[0], "", "")
+	events := waitForServeFetch(t, s, 2)
+	pkg := oneServeFetch(t, events, "the package", func(ev audit.StoredEvent) bool { return ev.ID == pkgID })
+	assertServed(t, pkg, key, sha256Hex(pkgBody))
+	meta := oneServeFetch(t, events, "meta.conf", func(ev audit.StoredEvent) bool { return ev.ID != pkgID })
+	assertServed(t, meta, "", "")
 }
 
 // A key with no recorded sha256 is served with its key and no digest; the
