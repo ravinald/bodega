@@ -3719,3 +3719,35 @@ func TestPoolServesAnArchitectureTheIndexSkips(t *testing.T) {
 		t.Errorf("WARN does not name the codename and the architecture it skipped: %s", warns[0])
 	}
 }
+
+func TestReviewB198WarnsWhenAnIndexedPackagesReadFails(t *testing.T) {
+	archive := archesArchive(t, mirroredCodename, []string{"amd64", "arm64"}, map[string]string{
+		"main/binary-amd64/Packages": fixturePackages(fixtureDeb, fixtureDebBody),
+		"main/binary-arm64/Packages": fixturePackages(fallbackDeb, fallbackDebBody),
+	}, nil)
+	archive.setObject("dists/"+mirroredCodename+"/main/binary-amd64/Packages.gz", "mirror is between syncs")
+	s := mirrorServer(t, archive)
+	s.cfg.AptArchitectures = []string{"amd64"}
+	var logged syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	for range 2 {
+		idx := s.buildAptPoolIndex(t.Context(), []string{mirroredCodename})
+		if len(idx.failed) == 0 {
+			t.Fatal("fixture must fail reading amd64 after reading its Release")
+		}
+	}
+	var warns []string
+	for line := range strings.Lines(logged.String()) {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "apt_architectures") {
+			warns = append(warns, line)
+		}
+	}
+	if len(warns) != 2 {
+		t.Fatalf("skipped-architecture WARNs = %d over 2 builds, want 2; logs:\n%s", len(warns), logged.String())
+	}
+	for _, line := range warns {
+		if !strings.Contains(line, `skipped="fixture: arm64"`) {
+			t.Errorf("WARN omitted declared arm64: %s", line)
+		}
+	}
+}

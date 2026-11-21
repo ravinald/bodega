@@ -1161,13 +1161,11 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoo
 		return docs, nil, err
 	}
 	archive := s.cfg.AptArchiveOf(codename)
-	var vanished, skipped []string
+	skipped := s.aptSkippedArches(layout)
+	var vanished []string
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
 			if !s.aptIndexesArch(arch) {
-				if !slices.Contains(skipped, arch) {
-					skipped = append(skipped, arch)
-				}
 				continue
 			}
 			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, reads)
@@ -1195,11 +1193,27 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoo
 			}
 		}
 	}
-	sort.Strings(skipped)
 	if len(vanished) > 0 {
 		return docs, skipped, fmt.Errorf("the Release lists the Packages for %s, which bodega read before, but upstream answered 404 for it", strings.Join(vanished, " "))
 	}
 	return docs, skipped, nil
+}
+
+// aptSkippedArches is every architecture layout publishes that
+// apt_architectures leaves out, sorted. It comes from the Release alone, before
+// any Packages is fetched, so a build that fails reading one still reports
+// what configuration excluded.
+func (s *Server) aptSkippedArches(layout []aptUpstreamComponent) []string {
+	var skipped []string
+	for _, comp := range layout {
+		for _, arch := range comp.arches {
+			if !s.aptIndexesArch(arch) && !slices.Contains(skipped, arch) {
+				skipped = append(skipped, arch)
+			}
+		}
+	}
+	sort.Strings(skipped)
+	return skipped
 }
 
 // aptPoolStanzas hands add each paragraph of one decompressed Packages file of
