@@ -71,9 +71,30 @@ const (
 // aptRoute is one pool path's resolved archive and the moment it resolved. An
 // empty URL is a negative result and is deliberately cacheable: "no configured
 // archive has this path" is the answer that costs the most to recompute.
+//
+// A negative carries the roots it was resolved over, because it is only an
+// answer about them. The index can send the same key through a different list
+// of roots than the request that recorded the miss, and a root nobody asked
+// has not said the path is absent.
 type aptRoute struct {
-	url string
-	at  time.Time
+	url   string
+	among []string
+	at    time.Time
+}
+
+// answers reports whether a remembered route settles a request over
+// candidates without probing: a positive one when its root is among them, a
+// negative one when every candidate was among the roots that said "not here".
+func (rt aptRoute) answers(candidates []string) bool {
+	if rt.url != "" {
+		return slices.Contains(candidates, rt.url)
+	}
+	for _, c := range candidates {
+		if !slices.Contains(rt.among, c) {
+			return false
+		}
+	}
+	return true
 }
 
 // aptRouteCache maps a pool object's key to the upstream root that answered
@@ -98,22 +119,29 @@ type aptRouteCache struct {
 // get returns the remembered archive for a pool path, and whether the answer
 // is still fresh. A fresh answer with an empty URL means "no archive has it".
 func (c *aptRouteCache) get(key string) (string, bool) {
+	rt, fresh := c.lookup(key)
+	return rt.url, fresh
+}
+
+func (c *aptRouteCache) lookup(key string) (aptRoute, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rt, ok := c.routes[key]
 	if !ok || time.Since(rt.at) > aptRouteTTL {
-		return "", false
+		return aptRoute{}, false
 	}
-	return rt.url, true
+	return rt, true
 }
 
-func (c *aptRouteCache) put(key, upstreamURL string) {
+// put remembers a route. A negative one (an empty upstreamURL) names in among
+// the roots that answered absent; with none named it answers no request.
+func (c *aptRouteCache) put(key, upstreamURL string, among ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.routes == nil || len(c.routes) >= aptRouteCacheMax {
 		c.routes = make(map[string]aptRoute, aptRouteCacheMax/8)
 	}
-	c.routes[key] = aptRoute{url: upstreamURL, at: time.Now()}
+	c.routes[key] = aptRoute{url: upstreamURL, among: slices.Clone(among), at: time.Now()}
 }
 
 // handleAptMirrorDists proxies one path under a mirrored codename's dists/
@@ -1906,18 +1934,47 @@ func (s *Server) serveAptMirror(w http.ResponseWriter, r *http.Request, store st
 // The probe writes no discovery row. proxyOrCache writes one for the fetch
 // that follows, and recording here as well would count one client download as
 // one row per configured archive.
+//
+// An archive that could not be asked leaves the answer empty without a 502,
+// because this serves a cached object's admission, which has the profile's
+// filtered index to fall back on and the cached bytes to serve.
 func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, key string) (string, bool) {
 	archive, _, _ := manifest.SplitAptKey(key)
-	return s.aptResolvePoolUpstreamAmong(w, r, key, s.cfg.AptPoolUpstreamsIn(archive))
+	base, _, ok := s.aptLocatePoolUpstream(w, r, key, s.cfg.AptPoolUpstreamsIn(archive))
+	return base, ok
 }
 
 // aptResolvePoolUpstreamAmong is aptResolvePoolUpstream over the candidates
 // given, in the order given. A remembered route outside them is not used: it
 // was resolved over a wider list before the index narrowed it, and may be the
-// other distribution's root.
+// other distribution's root. A remembered miss is used only when every
+// candidate was among the roots that answered it.
+//
+// Only an archive that answered 404 or 410 has said a path is absent. A probe
+// that errored said nothing, so when one did and no archive had the path the
+// client gets 502 and nothing is remembered: an archive slow during a cold
+// index build is not an hour of 404s. A client that hung up mid-probe gets
+// nothing written, and its abandoned probes are not a verdict either.
 func (s *Server) aptResolvePoolUpstreamAmong(w http.ResponseWriter, r *http.Request, key string, candidates []string) (string, bool) {
-	if cached, fresh := s.aptRoutes.get(key); fresh && (cached == "" || slices.Contains(candidates, cached)) {
-		return cached, true
+	base, failed, ok := s.aptLocatePoolUpstream(w, r, key, candidates)
+	if !ok || base != "" || len(failed) == 0 {
+		return base, ok
+	}
+	_, poolPath, _ := manifest.SplitAptKey(key)
+	s.logger.Error("apt pool path unresolved: an archive could not be asked",
+		"pool_path", poolPath, "failed", strings.Join(failed, "; "),
+		"archives", strings.Join(candidates, " "))
+	http.Error(w, "could not reach an upstream archive to resolve "+poolPath, http.StatusBadGateway)
+	return "", false
+}
+
+// aptLocatePoolUpstream is the probe behind aptResolvePoolUpstreamAmong. With
+// no archive having the path it returns an empty root and, in failed, each
+// candidate whose probe errored with its error; a miss is remembered only when
+// failed is empty. ok=false means it wrote the response or the client is gone.
+func (s *Server) aptLocatePoolUpstream(w http.ResponseWriter, r *http.Request, key string, candidates []string) (string, []string, bool) {
+	if rt, fresh := s.aptRoutes.lookup(key); fresh && rt.answers(candidates) {
+		return rt.url, nil, true
 	}
 	_, poolPath, _ := manifest.SplitAptKey(key)
 
@@ -1930,7 +1987,7 @@ func (s *Server) aptResolvePoolUpstreamAmong(w http.ResponseWriter, r *http.Requ
 	verdictCtx, cancel := auditContext(r)
 	defer cancel()
 	name, version := manifest.AptDebIdentity(path.Base(poolPath))
-	var refused []string
+	var refused, failed []string
 	// One refusal, and so one incident, across every candidate row: the
 	// client made one request and gets one answer.
 	f := allowListRefusal(manifest.TypeApt, "", name, version)
@@ -1941,7 +1998,7 @@ func (s *Server) aptResolvePoolUpstreamAmong(w http.ResponseWriter, r *http.Requ
 			if err != nil {
 				s.logger.Error("policy check failed", "error", err)
 				http.Error(w, "policy check failed", http.StatusInternalServerError)
-				return "", false
+				return "", nil, false
 			}
 			if violation {
 				// Recorded here rather than left to the fetch, because for
@@ -1958,14 +2015,20 @@ func (s *Server) aptResolvePoolUpstreamAmong(w http.ResponseWriter, r *http.Requ
 		}
 		found, err := s.aptProbe(ctx, candidate)
 		if err != nil {
+			if ctx.Err() != nil {
+				s.logger.Debug("apt pool probe abandoned: the client went away",
+					"pool_path", poolPath, "upstream", candidate, "error", err)
+				return "", nil, false
+			}
 			s.logger.Warn("apt pool probe failed; trying the next archive",
 				"pool_path", poolPath, "upstream", candidate, "error", err)
+			failed = append(failed, base+": "+err.Error())
 			continue
 		}
 		if found {
 			s.aptRoutes.put(key, base)
 			s.logger.Debug("apt pool path resolved", "pool_path", poolPath, "upstream", base)
-			return base, true
+			return base, nil, true
 		}
 	}
 
@@ -1981,16 +2044,20 @@ func (s *Server) aptResolvePoolUpstreamAmong(w http.ResponseWriter, r *http.Requ
 			Check: admit.QueueAllowList, Pattern: queuePattern(manifest.TypeApt, first, first, name),
 			Detail: f.reason, Incident: f.incident})
 		f.write(w, r)
-		return "", false
+		return "", nil, false
+	}
+
+	if len(failed) > 0 {
+		return "", failed, true
 	}
 
 	// Negative result, remembered. apt retries a failed download, and without
 	// this every retry would fan back out across every configured archive.
-	s.aptRoutes.put(key, "")
+	s.aptRoutes.put(key, "", candidates...)
 	s.logger.Info("apt pool path is in no configured archive",
 		"pool_path", poolPath, "package", name, "version", version,
 		"archives", strings.Join(candidates, " "))
-	return "", true
+	return "", nil, true
 }
 
 // aptProbe reports whether an archive has a path, using HEAD so resolving one

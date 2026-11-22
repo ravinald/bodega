@@ -60,6 +60,22 @@ type fixtureArchive struct {
 	// gate, while set, parks every GET until it is closed: an upstream slow
 	// enough that a rebuild reading it is still running when the test looks.
 	gate chan struct{}
+	// head, while set, answers every HEAD in place of the archive.
+	head http.HandlerFunc
+}
+
+// answerHead hands every HEAD from here on to fn, or back to the archive when
+// fn is nil.
+func (a *fixtureArchive) answerHead(fn http.HandlerFunc) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.head = fn
+}
+
+func (a *fixtureArchive) headHandler() http.HandlerFunc {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.head
 }
 
 // hold parks every GET from here on until release is called.
@@ -122,6 +138,10 @@ func newFixtureArchive(t testing.TB, objects map[string]string) *fixtureArchive 
 	t.Helper()
 	a := &fixtureArchive{objects: objects}
 	a.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fn := a.headHandler(); fn != nil && r.Method == http.MethodHead {
+			fn(w, r)
+			return
+		}
 		rel := strings.TrimPrefix(r.URL.Path, "/ubuntu/")
 		body, ok := a.object(rel)
 		if !ok {
@@ -529,6 +549,110 @@ func TestPoolFallsBackToTheSecondArchive(t *testing.T) {
 	}
 	if url, fresh := s.aptRoutes.get(manifest.AptKey(missing)); !fresh || url != "" {
 		t.Errorf("route cache holds %q/%v for a path no archive has; the next retry re-probes everything", url, fresh)
+	}
+}
+
+// An archive that errors on the probe has not said the path is absent. The
+// client gets 502, the log at Error says why, and nothing is remembered, so the
+// path answers as soon as the archive does.
+func TestPoolProbeErrorIsNotRememberedAsAbsent(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	var logged syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
+	archive.answerHead(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusBadGateway {
+		t.Fatalf("pool fetch with the archive failing = %d, want 502", code)
+	}
+	if !strings.Contains(string(body), fixtureDeb) {
+		t.Errorf("502 body %q does not name the pool path", body)
+	}
+	if _, fresh := s.aptRoutes.get(manifest.AptKey(fixtureDeb)); fresh {
+		t.Error("a probe that errored left a route behind")
+	}
+	line := logged.String()
+	for _, want := range []string{"level=ERROR", fixtureDeb, archive.URL(), "probe returned 500"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("Error log %q lacks %q", line, want)
+		}
+	}
+
+	archive.answerHead(nil)
+	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("pool fetch once the archive answers = %d %q, want 200 and its bytes", code, body)
+	}
+}
+
+// writeWatcher records whether a handler wrote anything to its client.
+type writeWatcher struct {
+	header http.Header
+	wrote  bool
+}
+
+func (ww *writeWatcher) Header() http.Header         { return ww.header }
+func (ww *writeWatcher) WriteHeader(int)             { ww.wrote = true }
+func (ww *writeWatcher) Write(b []byte) (int, error) { ww.wrote = true; return len(b), nil }
+
+// A client that hangs up while bodega is probing leaves no verdict: its
+// abandoned probe is not an archive saying "not here", and the next client
+// gets the file.
+func TestPoolProbeCanceledByTheClientLeavesNoRoute(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	probing := make(chan struct{})
+	var once sync.Once
+	archive.answerHead(func(_ http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(probing) })
+		<-r.Context().Done()
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/apt/"+fixtureDeb, nil)
+	ww := &writeWatcher{header: http.Header{}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Handler().ServeHTTP(ww, req)
+	}()
+	<-probing
+	cancel()
+	<-done
+
+	if ww.wrote {
+		t.Error("the handler wrote to a client that had gone away")
+	}
+	if _, fresh := s.aptRoutes.get(manifest.AptKey(fixtureDeb)); fresh {
+		t.Error("a canceled probe left a route behind")
+	}
+	archive.answerHead(nil)
+	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("pool fetch after the canceled one = %d %q, want 200 and the archive's bytes", code, body)
+	}
+}
+
+// A miss is an answer about the roots that were asked. One recorded over a
+// single root does not answer a request that adds a root holding the path.
+func TestPoolNegativeRouteDoesNotAnswerAWiderList(t *testing.T) {
+	first := newFixtureArchive(t, map[string]string{})
+	second := newFixtureArchive(t, map[string]string{fallbackDeb: fallbackDebBody})
+	s := mirrorServer(t, first, second)
+	key := manifest.AptKey(fallbackDeb)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/apt/"+fallbackDeb, nil)
+	if base, ok := s.aptResolvePoolUpstreamAmong(httptest.NewRecorder(), req, key, []string{first.URL()}); !ok || base != "" {
+		t.Fatalf("resolve over the first root = %q/%v, want a miss", base, ok)
+	}
+	if url, fresh := s.aptRoutes.get(key); !fresh || url != "" {
+		t.Fatalf("route after the narrow miss = %q/%v, want a fresh negative", url, fresh)
+	}
+
+	code, body := mirrorGet(t, s, "/apt/"+fallbackDeb)
+	if code != http.StatusOK || string(body) != fallbackDebBody {
+		t.Fatalf("pool fetch over both roots = %d %q, want 200 and the second archive's bytes", code, body)
 	}
 }
 
