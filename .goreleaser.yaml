@@ -60,7 +60,7 @@ nfpms:
     package_name: bodega
     vendor: bodega
     homepage: https://github.com/ravinald/bodega
-    maintainer: Ravi Pina <ravi@cow.org>
+    maintainer: bodega <bodega-maintainer@cow.org>
     description: Self-hosted package repository manager
     license: Apache-2.0
     formats: [deb, rpm]

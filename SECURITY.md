@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report it privately through [GitHub's vulnerability reporting](https://github.com/ravinald/bodega/security/advisories/new),
-or email **ravi@cow.org** with details. Acknowledgement within 72 hours, with
+or email **bodega-security@cow.org** with details. Acknowledgement within 72 hours, with
 an estimated remediation timeline to follow. Please do not file public issues
 for security problems.
 
