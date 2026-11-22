@@ -1,6 +1,6 @@
 # Contributing
 
-Bodega is a package repository that other machines trust to hand them software. Every change is a security change, so the gate is not a formality and the review reads the diff against what it lets through.
+Bodega is a package repository that other machines trust to hand them software. Every change is a security change, so the gate is not a formality and the review reads the diff against what it lets through. [Threat model](docs/threat-model.md) says what bodega verifies and where that stops; a change that moves either line updates it in the same pull request.
 
 ## Building
 
@@ -60,6 +60,10 @@ Keep the subject terse and let the diff carry the rest. A commit body earns its 
 
 Examples in documentation and help text use fictional names. A real package, company, or host appears only when something on the wire has to resolve to it: registry hosts, tool names, and actual `go.mod` dependencies. `cmd/bodega/example_names_test.go` enforces that, and also resolves every relative link in the Markdown, because nothing else does.
 
+## License
+
+bodega is licensed under the terms in [`LICENSE`](LICENSE), which cover every file in the repository unless a file says otherwise. A contribution is licensed under those same terms, as [GitHub's terms of service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#6-contributions-under-repository-license) provide for any repository carrying a license, and you keep the copyright in what you wrote. There is no contributor license agreement and no sign-off to add.
+
 ## Reporting a vulnerability
 
-Do not open an issue. [`SECURITY.md`](SECURITY.md) has the disclosure address and the response commitment.
+Do not open an issue. Report it privately through [GitHub's vulnerability reporting](https://github.com/ravinald/bodega/security/advisories/new), or by email; [`SECURITY.md`](SECURITY.md) has the address and the response commitment.
