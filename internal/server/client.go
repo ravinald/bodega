@@ -270,12 +270,12 @@ func (s *Server) aptSuiteParam(key string) string {
 }
 
 // aptSourceKey is the apt_upstreams key a rendered sources block serves, or
-// its suite when no key mirrors it.
+// the key its (archive, suite) pair is held under when no key mirrors it.
 func (s *Server) aptSourceKey(src aptsources.Sources) string {
 	if key, ok := s.cfg.AptSuiteAt(src.Archive, src.Suite); ok {
 		return key
 	}
-	return src.Suite
+	return config.AptSuiteKey(src.Archive, src.Suite)
 }
 
 // checkAptArchives refuses a named archive this server cannot configure: one

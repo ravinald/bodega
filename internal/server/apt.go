@@ -1453,6 +1453,8 @@ func (s *Server) aptHostSources(r *http.Request, out aptStatus) (string, *aptsou
 // A missing pocket is reported rather than skipped. A stanza naming the base
 // and -updates without -security installs cleanly, and the host stops
 // receiving security fixes with nothing on it reporting that.
+// A pocket aptPocketsOf cannot place is missing too: the snapshot filters no
+// codename for it, and a stanza without it is incomplete in the same way.
 func (s *Server) aptProfileHostSuites(p *entitle.Profile) (suites, missing []string) {
 	base, _ := p.AptScope()
 	if base == "" {
@@ -1464,14 +1466,15 @@ func (s *Server) aptProfileHostSuites(p *entitle.Profile) (suites, missing []str
 	} else {
 		return nil, nil
 	}
-	for _, pocket := range s.aptMirroredPockets(base) {
+	pockets, unresolved := s.aptPocketsOf(base)
+	for _, pocket := range pockets {
 		if key := s.aptProfileKey(pocket, p.Name()); byKey[key] == p.Name() {
 			suites = append(suites, key)
 		} else {
 			missing = append(missing, pocket)
 		}
 	}
-	return suites, missing
+	return suites, append(missing, unresolved...)
 }
 
 // aptProfileKey is the key the snapshot holds profile's filtered codename

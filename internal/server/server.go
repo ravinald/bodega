@@ -1377,6 +1377,9 @@ func (s *Server) clientFiles(r *http.Request, t string, pm *manifest.PackageMani
 // when it names none: an entry with no suites of its own is in the default.
 // Picking from the status blocks keeps the mirrored and filtered codenames'
 // trust forms, which a stanza rendered here from the suite alone would lose.
+// A block is matched on the key it is served under, never its rendered
+// codename: a vendor archive's noble is not where a package published to the
+// default archive's noble lives.
 func (s *Server) aptSourcesForPackage(r *http.Request, pm *manifest.PackageManifest) []aptsources.Sources {
 	blocks := s.aptStatusFor(r).Sources
 	want := map[string]bool{}
@@ -1390,7 +1393,7 @@ func (s *Server) aptSourcesForPackage(r *http.Request, pm *manifest.PackageManif
 	}
 	var out []aptsources.Sources
 	for _, b := range blocks {
-		if want[b.Suite] {
+		if want[s.aptSourceKey(b)] {
 			out = append(out, b)
 		}
 	}

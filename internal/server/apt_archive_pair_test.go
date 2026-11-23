@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -490,4 +491,83 @@ func TestReviewF122VendorAdditionKeepsProfileSecurity(t *testing.T) {
 		}
 	}
 	t.Fatalf("no main source or refusal: %+v", after)
+}
+
+func TestReviewF122StatusKeepsSplitSecurity(t *testing.T) {
+	s, _, _ := noblePairServer(t)
+	s.cfg.PublicURL = "http://bodega.example.com:8080"
+	vendor := s.cfg.AptUpstreams[vendorNoble]
+	delete(s.cfg.AptUpstreams, vendorNoble)
+	kr, err := aptsign.Generate("security", "security@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	security := newFixtureArchive(t, fixtureDistsFor(t, kr, "noble-security", fixturePackages(fixtureDeb, fixtureDebBody), "amd64"))
+	s.cfg.AptUpstreams["noble-security"] = []config.AptUpstream{{URL: security.URL()}}
+	s.cfg.AptArchives = map[string][]string{"security": {"noble-security"}}
+	f := aptProfileBindBase(t, s, "web", "noble", audit.ExpansionBlock, "nginx")
+	read := func() *aptStatus {
+		t.Helper()
+		code, body := f.get(t, "/api/v1/status")
+		if code != http.StatusOK {
+			t.Fatalf("status = %d %s", code, body)
+		}
+		var status struct {
+			Apt aptStatus `json:"apt"`
+		}
+		if err := json.Unmarshal([]byte(body), &status); err != nil {
+			t.Fatal(err)
+		}
+		return &status.Apt
+	}
+	want := "URIs: http://bodega.example.com:8080/apt/security/\nSuites: noble-security-web\n"
+	before := read()
+	if before.Host == nil || !strings.Contains(before.Host.Deb822, want) {
+		t.Fatalf("before adding vendor: %+v; want security stanza", before.Host)
+	}
+	s.cfg.AptUpstreams[vendorNoble] = vendor
+	s.rebuildAptSnapshot(context.Background())
+	after := read()
+	if after.Host != nil && !strings.Contains(after.Host.Deb822, want) {
+		t.Fatalf("status still recommends a host stanza after silently removing its security pocket:\n%s\nwant the complete stanza or no host recommendation", after.Host.Deb822)
+	}
+}
+
+func TestReviewF122PackageSourcesKeepGeneratedArchive(t *testing.T) {
+	s, _, _ := pairVendorServer(t)
+	vendor := s.cfg.AptUpstreams[vendorNoble]
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{}
+	s.cfg.AptCodename = "noble"
+	s.cfg.AptSuites = []string{"noble"}
+	pm := &manifest.PackageManifest{Type: manifest.TypeApt, Name: "local-widget",
+		Versions: []manifest.VersionEntry{{Version: "1.0", Suites: []string{"noble"}}}}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	read := func() []clientconf.File {
+		t.Helper()
+		code, body := mirrorGet(t, s, "/api/v1/packages/apt/local-widget")
+		if code != http.StatusOK {
+			t.Fatalf("package API = %d %s", code, body)
+		}
+		var payload packageResponse
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.ClientConfig
+	}
+	want := "URIs: http://bodega.example.com:8080/apt/\nSuites: noble\n"
+	before := read()
+	if len(before) != 1 || !strings.Contains(before[0].Content, want) {
+		t.Fatalf("before adding vendor: %+v; want generated noble alone", before)
+	}
+	s.cfg.AptUpstreams[vendorNoble] = vendor
+	after := read()
+	var content strings.Builder
+	for _, file := range after {
+		content.WriteString(file.Content)
+	}
+	if len(after) != 1 || !strings.Contains(after[0].Content, want) {
+		t.Fatalf("package API added another publisher's source for a package published only to generated noble:\n%s", content.String())
+	}
 }
