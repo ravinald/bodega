@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -569,5 +571,116 @@ func TestReviewF122PackageSourcesKeepGeneratedArchive(t *testing.T) {
 	}
 	if len(after) != 1 || !strings.Contains(after[0].Content, want) {
 		t.Fatalf("package API added another publisher's source for a package published only to generated noble:\n%s", content.String())
+	}
+}
+
+// pocketStanza is one Packages paragraph for pkg at version, whose pool
+// object body is the version itself.
+func pocketStanza(pkg, version string) string {
+	body := pkg + " " + version
+	sum := sha256.Sum256([]byte(body))
+	return strings.Join([]string{
+		"Package: " + pkg,
+		"Version: " + version,
+		"Architecture: amd64",
+		"Filename: pool/main/" + pkg[:1] + "/" + pkg + "/" + pkg + "_" + version + "_amd64.deb",
+		"Size: " + strconv.Itoa(len(body)),
+		"SHA256: " + hex.EncodeToString(sum[:]),
+		"",
+		"",
+	}, "\n")
+}
+
+// aptIndexVersions lists the Version of every paragraph naming pkg in the
+// Packages served at path.
+func aptIndexVersions(t *testing.T, s *Server, path, pkg string) []string {
+	t.Helper()
+	code, body := mirrorGet(t, s, path)
+	if code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200:\n%s", path, code, body)
+	}
+	var out []string
+	for _, para := range strings.Split(string(body), "\n\n") {
+		if !strings.Contains(para+"\n", "Package: "+pkg+"\n") {
+			continue
+		}
+		for _, line := range strings.Split(para, "\n") {
+			if v, ok := strings.CutPrefix(line, "Version: "); ok {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+// The release pocket named after the distribution codename keeps its own
+// build of a package that its -updates pocket carries a newer build of, with
+// a vendor's suite of the same codename mirrored beside it: unfiltered, while
+// a hide on another package rewrites the group, and after a hide on the
+// release build is lifted.
+func TestAptReleasePocketKeepsItsBuildBesideUpdates(t *testing.T) {
+	s, _, _ := noblePairServer(t)
+	kr, err := aptsign.Generate("ubuntu", "ubuntu@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate ubuntu key: %v", err)
+	}
+	objects := fixtureDistsFor(t, kr, "noble", pocketStanza("php-fpm", "8.5.4-0ubuntu1")+pocketStanza("zlib", "1.3-1"), "amd64")
+	maps.Copy(objects, fixtureDistsFor(t, kr, "noble-updates", pocketStanza("php-fpm", "8.5.4-0ubuntu1.6"), "amd64"))
+	ubuntu := newFixtureArchive(t, objects)
+	s.cfg.AptUpstreams["noble"] = []config.AptUpstream{{URL: ubuntu.URL()}}
+	s.cfg.AptUpstreams["noble-updates"] = []config.AptUpstream{{URL: ubuntu.URL()}}
+	ctx := t.Context()
+
+	check := func(stage string) {
+		t.Helper()
+		if got := aptIndexVersions(t, s, "/apt/dists/noble/"+packagesPath, "php-fpm"); !slices.Equal(got, []string{"8.5.4-0ubuntu1"}) {
+			t.Errorf("%s: noble lists php-fpm %v, want the release build 8.5.4-0ubuntu1", stage, got)
+		}
+		if got := aptIndexVersions(t, s, "/apt/dists/noble-updates/"+packagesPath, "php-fpm"); !slices.Equal(got, []string{"8.5.4-0ubuntu1.6"}) {
+			t.Errorf("%s: noble-updates lists php-fpm %v, want 8.5.4-0ubuntu1.6", stage, got)
+		}
+	}
+	hide := func(name, version string) {
+		t.Helper()
+		if err := s.auditDB.InsertAptMirrorHide(ctx, audit.AptMirrorHide{
+			Name: name, Version: version, Codenames: []string{"noble"}, HiddenBy: "tester",
+		}); err != nil {
+			t.Fatalf("record the hide on %s %s: %v", name, version, err)
+		}
+		s.rebuildAptSnapshot(ctx)
+	}
+	unhide := func(name, version string) {
+		t.Helper()
+		if _, err := s.auditDB.DeleteAptMirrorHide(ctx, name, version); err != nil {
+			t.Fatalf("remove the hide on %s %s: %v", name, version, err)
+		}
+		s.rebuildAptSnapshot(ctx)
+	}
+
+	s.rebuildAptSnapshot(ctx)
+	check("unfiltered")
+
+	hide("zlib", "1.3-1")
+	if !s.aptMirrorRewritten("noble") || !s.aptMirrorRewritten("noble-updates") {
+		t.Fatalf("a hide in noble rewrote noble=%v noble-updates=%v, want the group", s.aptMirrorRewritten("noble"), s.aptMirrorRewritten("noble-updates"))
+	}
+	check("group rewritten for another package")
+
+	hide("php-fpm", "8.5.4-0ubuntu1")
+	if got := aptIndexVersions(t, s, "/apt/dists/noble/"+packagesPath, "php-fpm"); len(got) != 0 {
+		t.Errorf("noble lists the hidden php-fpm %v", got)
+	}
+	unhide("php-fpm", "8.5.4-0ubuntu1")
+	check("release build unhidden")
+
+	unhide("zlib", "1.3-1")
+	check("no hide left")
+	for _, suite := range []string{"noble", "noble-updates"} {
+		for _, rest := range []string{"InRelease", packagesPath} {
+			want, _ := ubuntu.object("dists/" + suite + "/" + rest)
+			if _, got := mirrorGet(t, s, "/apt/dists/"+suite+"/"+rest); string(got) != want {
+				t.Errorf("with no hide left, %s/%s is not the archive's bytes", suite, rest)
+			}
+		}
 	}
 }

@@ -54,7 +54,10 @@ func TestSIGHUPHandlerDiesWithTheServer(t *testing.T) {
 
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Logf("Start returned %v after cancellation", err)
+		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("Start did not return within 30s of cancellation")
 	}
@@ -123,7 +126,10 @@ func TestReloadInstallsBindingsWhileTheAptBuildIsHeld(t *testing.T) {
 		release()
 		cancel()
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Logf("Start returned %v after cancellation", err)
+			}
 		case <-time.After(30 * time.Second):
 			t.Error("Start did not return within 30s of cancellation")
 		}

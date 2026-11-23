@@ -282,7 +282,9 @@ func TestStartRefusesUnsupportedSpoolLock(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		if !returned {
-			<-done
+			if err := <-done; err != nil {
+				t.Logf("Start returned %v after cancellation", err)
+			}
 		}
 	})
 	waitFor(t, func() bool {
