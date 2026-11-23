@@ -6745,6 +6745,8 @@ apt codename "noble" is mirrored in 2 archives, so it names none of them: write 
 
 So once `tailscale/noble` is configured, `--suite noble` and `codename=noble` are refused on that server; write `--suite /noble` for Ubuntu's.
 A value already stored, such as a profile's base, keeps naming the suite it named when it was written.
+A suite bodega generates from `apt_suites` also sits at the default archive's root, so the same rule covers it on a host's own stanza: with generated `noble` and mirrored `tailscale/noble`, `--suite /noble` and `codename=/noble` select the generated suite, and a bare `noble` is refused.
+`--archive` is refused only when its stanza names the same root and suite as the host's own stanza, since apt would then read two `Signed-By:` values for one archive: `--suite ubuntu/noble --archive tailscale/noble` writes two stanzas, and `--suite tailscale/noble --archive tailscale/noble` is refused.
 
 `{archive}/{codename}` also names a codename listed in `apt_archives`, so `ubuntu/noble` answers for `noble` in `apt_archives.ubuntu`.
 Pockets are read the same way: a base and its `-updates` and `-security` pockets are one choice when they are in one archive, whichever of the two spellings each key uses, and never across archives.

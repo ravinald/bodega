@@ -360,13 +360,18 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 	out := map[string]*aptSuiteIndex{}
 	reusable := map[aptMirrorIndexKey]aptMirrorIndex{}
 	for _, group := range s.aptMirrorGroups() {
-		groupHidden := hidden.in(s.cfg.AptArchiveOf(group[0]))
-		pass := &aptMirrorPass{hidden: groupHidden, hideSet: groupHidden.digest(), reads: reads, prev: prevIndexes}
 		indexes := make(map[string]*aptSuiteIndex, len(group))
 		built := map[aptMirrorIndexKey]aptMirrorIndex{}
 		dropped, refiltered := 0, 0
 		var failed error
 		for _, codename := range group {
+			// A pocket may sit in another archive than its base (Debian's
+			// security archive), and a hide applies per archive, so each
+			// member filters with its own archive's set. The group is still
+			// rewritten and signed as one below, since one client stanza
+			// names every member under a single Signed-By:.
+			memberHidden := hidden.in(s.cfg.AptArchiveOf(codename))
+			pass := &aptMirrorPass{hidden: memberHidden, hideSet: memberHidden.digest(), reads: reads, prev: prevIndexes}
 			idx, d, n, err := s.aptMirrorRewrite(ctx, codename, pass, built, date, validUntil)
 			if err != nil {
 				failed = fmt.Errorf("%s: %w", codename, err)
@@ -385,7 +390,7 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 				out[codename] = idx
 			}
 			if carried != nil {
-				for key, idx := range pass.prev {
+				for key, idx := range prevIndexes {
 					if slices.Contains(group, key.codename) {
 						reusable[key] = idx
 					}

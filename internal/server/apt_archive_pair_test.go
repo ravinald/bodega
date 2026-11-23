@@ -321,3 +321,94 @@ func TestPocketsStayWithTheirOwnBase(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewF122LegacyVendorBesideQualifiedDistribution(t *testing.T) {
+	s, f, vendor := pairVendorServer(t)
+	ubuntu := s.cfg.AptUpstreams["noble"]
+	s.cfg.AptUpstreams["noble"] = s.cfg.AptUpstreams[vendorNoble]
+	delete(s.cfg.AptUpstreams, vendorNoble)
+	s.cfg.AptUpstreams["ubuntu/noble"] = ubuntu
+	s.cfg.AptArchives = map[string][]string{"vendor": {"noble"}}
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=ubuntu/noble&archives=vendor/noble"), manifest.TypeApt)
+	if len(recs) != 3 {
+		t.Fatalf("apt plan = %+v; want distribution stanza, vendor stanza, vendor key", recs)
+	}
+	for _, rec := range recs {
+		if rec.Action != planInstall {
+			t.Fatalf("apt plan = %+v; want all records install", recs)
+		}
+	}
+	if body := fetchRecord(t, s, f.token, recs[0]); !strings.Contains(body, "URIs: http://bodega.example.com:8080/apt/ubuntu/\nSuites: noble\n") {
+		t.Errorf("distribution stanza = %s", body)
+	}
+	if body := fetchRecord(t, s, f.token, recs[1]); !strings.Contains(body, "URIs: http://bodega.example.com:8080/apt/vendor/\nSuites: noble\n") || !strings.Contains(body, "Signed-By: /etc/apt/keyrings/bodega-noble.asc\n") {
+		t.Errorf("vendor stanza = %s", body)
+	}
+	if got := keyFingerprints(t, fetchRecord(t, s, f.token, recs[2])); got[0] != vendor.fingerprint {
+		t.Errorf("vendor key = %v, want %s", got, vendor.fingerprint)
+	}
+}
+
+func TestReviewF122QualifiedDuplicateStanzaRefused(t *testing.T) {
+	s, f, _ := pairVendorServer(t)
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=vendor/noble&archives=vendor/noble"), manifest.TypeApt)
+	for _, rec := range recs {
+		if rec.Action == planRefuse {
+			return
+		}
+	}
+	t.Fatalf("apt plan = %+v; want refusal for two stanzas at the same (archive, codename) with different Signed-By", recs)
+}
+
+func TestReviewF122HideInSeparateSecurityArchive(t *testing.T) {
+	s, _, _ := noblePairServer(t)
+	delete(s.cfg.AptUpstreams, vendorNoble)
+	kr, err := aptsign.Generate("security", "security@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	securityVersion := "1.24.0-2ubuntu7.2"
+	securityDeb := strings.ReplaceAll(fixtureDeb, "1.24.0-2ubuntu7.1", securityVersion)
+	packages := strings.ReplaceAll(fixturePackages(securityDeb, fixtureDebBody), "1.24.0-2ubuntu7.1", securityVersion)
+	objects := fixtureDistsFor(t, kr, "noble-security", packages, "amd64")
+	security := newFixtureArchive(t, objects)
+	s.cfg.AptUpstreams["noble-security"] = []config.AptUpstream{{URL: security.URL()}}
+	s.cfg.AptArchives = map[string][]string{"security": {"noble-security"}}
+	if got := s.aptMirroredPockets("noble"); !slices.Equal(got, []string{"noble-security"}) {
+		t.Fatalf("pockets = %v, want security pocket in its own archive", got)
+	}
+	codenames, err := s.locateMirroredAptVersion(t.Context(), "nginx", securityVersion)
+	if err != nil || !slices.Equal(codenames, []string{"noble-security"}) {
+		t.Fatalf("locate security build = %v, %v; want noble-security alone", codenames, err)
+	}
+	if err := s.auditDB.InsertAptMirrorHide(t.Context(), audit.AptMirrorHide{
+		Name: "nginx", Version: securityVersion, Codenames: codenames, HiddenBy: "tester",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(context.Background())
+	path := "/apt/security/dists/noble-security/" + packagesPath
+	if code, body := mirrorGet(t, s, path); code != http.StatusOK || strings.Contains(string(body), "Package: nginx\n") {
+		t.Errorf("GET %s = %d %s; want 200 with hidden nginx removed", path, code, body)
+	}
+	if code, body := mirrorGet(t, s, "/apt/security/"+securityDeb); code != http.StatusForbidden {
+		t.Errorf("security pool = %d %s; want 403", code, body)
+	}
+}
+
+func TestReviewF122GeneratedDefaultBesideVendor(t *testing.T) {
+	s, f, _ := pairVendorServer(t)
+	vendor := s.cfg.AptUpstreams[vendorNoble]
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{}
+	s.cfg.AptCodename = "noble"
+	s.cfg.AptSuites = []string{"noble"}
+	want := "URIs: http://bodega.example.com:8080/apt/\nSuites: noble\n"
+	if code, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=noble"); code != http.StatusOK || !strings.Contains(body, want) {
+		t.Fatalf("before adding vendor: %d %s; want generated noble", code, body)
+	}
+	s.cfg.AptUpstreams[vendorNoble] = vendor
+	code, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=/noble")
+	if code != http.StatusOK || !strings.Contains(body, want) {
+		t.Fatalf("GET /client/apt?os=linux&codename=/noble = %d %s; want generated noble at the default root", code, body)
+	}
+}

@@ -201,7 +201,7 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 // bare codename mirrored in several named archives is refused here.
 func (s *Server) resolveAptQuery(q clientQuery) (clientQuery, error) {
 	var err error
-	if q.Codename, err = s.cfg.ResolveAptSuite(q.Codename); err != nil {
+	if q.Codename, err = s.resolveAptSourceSuite(q.Codename); err != nil {
 		return q, fmt.Errorf("codename=: %w", err)
 	}
 	q.codenameParam = s.aptSuiteParam(q.Codename)
@@ -222,10 +222,47 @@ func (s *Server) resolveAptQuery(q clientQuery) (clientQuery, error) {
 	return q, nil
 }
 
+// resolveAptSourceSuite is config.ResolveAptSuite for the suite a host's
+// own stanza names, which may also be a generated suite. Generated suites
+// live at the default archive root, so /{codename} names one, and a bare
+// codename both generated and mirrored in a named archive names neither:
+// resolving it to the mirror would move a host that named the generated
+// suite onto a vendor's publisher the moment that vendor is added.
+func (s *Server) resolveAptSourceSuite(name string) (string, error) {
+	codename, rooted := strings.CutPrefix(name, "/")
+	if !s.aptGeneratedSuite(codename) {
+		return s.cfg.ResolveAptSuite(name)
+	}
+	mirrors := s.cfg.AptKeysMirroring(codename)
+	if rooted || len(mirrors) == 0 {
+		return codename, nil
+	}
+	qualified := []string{"/" + codename}
+	for _, key := range mirrors {
+		qualified = append(qualified, s.cfg.AptQualifiedName(key))
+	}
+	return "", fmt.Errorf("apt codename %q is generated at the default archive and mirrored in %d other archives, so it names none of them: write one of %s (/%s is the generated suite, served at /apt/dists/%s/)",
+		codename, len(mirrors), strings.Join(qualified, ", "), codename, codename)
+}
+
+// aptGeneratedSuite reports whether suite is one this server generates
+// rather than mirrors. Load keeps the two sets disjoint.
+func (s *Server) aptGeneratedSuite(suite string) bool {
+	return suite != "" && !strings.Contains(suite, "/") && s.cfg.ServesAptSuite(suite) && !s.cfg.MirrorsAptCodename(suite)
+}
+
 // aptSuiteParam is how a URL names an apt_upstreams key: the key itself when
 // it resolves back to itself, and {archive}/{codename} when the bare codename
-// is mirrored in other archives too.
+// is mirrored in other archives too. A generated suite sharing its codename
+// with a mirror is /{codename}, the spelling resolveAptSourceSuite reads back
+// as the generated one.
 func (s *Server) aptSuiteParam(key string) string {
+	if s.aptGeneratedSuite(key) {
+		if len(s.cfg.AptKeysMirroring(key)) > 0 {
+			return "/" + key
+		}
+		return key
+	}
 	if back, err := s.cfg.ResolveAptSuite(key); err == nil && back == key {
 		return key
 	}
@@ -701,16 +738,26 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			content: ring, url: h.base + aptsources.KeyringRoute,
 		})
 	}
-	return append(out, s.planAptArchives(r, h, aptStanzaSuites(src.Deb822))...)
+	return append(out, s.planAptArchives(r, h, aptStanzaSources(src.Deb822))...)
 }
 
-// aptStanzaSuites reads the suites back out of a rendered block, from every
-// stanza's Suites: line.
-func aptStanzaSuites(deb822 string) []string {
-	var out []string
-	for _, line := range strings.Split(deb822, "\n") {
-		if rest, ok := strings.CutPrefix(line, "Suites: "); ok {
-			out = append(out, strings.Fields(rest)...)
+// aptSourcePair is one archive apt indexes: a URI and a suite read from it.
+// apt keys its per-archive options on this pair, so two stanzas naming one
+// pair with different Signed-By: values conflict, and the same suite under
+// another URI is another archive.
+type aptSourcePair struct{ uri, suite string }
+
+// aptStanzaSources reads every (URI, suite) pair a rendered block names, each
+// URI with the trailing slash apt adds to it. A block bodega rendered always
+// parses; one that does not names no pair.
+func aptStanzaSources(deb822 string) map[aptSourcePair]bool {
+	out := map[aptSourcePair]bool{}
+	entries, _ := clientconf.AptStanzaEntries(deb822)
+	for _, e := range entries {
+		for _, uri := range e.URIs {
+			for _, suite := range e.Suites {
+				out[aptSourcePair{strings.TrimSuffix(uri, "/") + "/", suite}] = true
+			}
 		}
 	}
 	return out
@@ -722,15 +769,24 @@ func aptStanzaSuites(deb822 string) []string {
 // serves, so a key that cannot be fetched or fails its fingerprint check
 // refuses the whole system rather than installing a stanza apt cannot verify.
 //
-// An archive already on the host's own stanza is refused: two stanzas naming
-// one suite with different Signed-By: values stop every "apt update" with
-// "Conflicting values set for option Signed-By".
-func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []string) []planFile {
+// An archive already on the host's own stanza, at the same URI and suite, is
+// refused: two stanzas naming one archive with different Signed-By: values
+// stop every "apt update" with "Conflicting values set for option
+// Signed-By". The same codename under another archive root is another
+// archive, with its own key.
+func (s *Server) planAptArchives(r *http.Request, h *clientHost, onHost map[aptSourcePair]bool) []planFile {
 	var out []planFile
 	for _, c := range h.q.Archives {
-		if slices.Contains(mainSuites, c) {
-			return []planFile{{system: manifest.TypeApt, action: planRefuse,
-				reason: fmt.Sprintf("%s is already on this host's apt stanza, so a second stanza for it would conflict on Signed-By; drop it from archives", c)}}
+		f := s.aptArchiveFile(h, c)
+		pairs := aptStanzaSources(f.Content)
+		for pair := range pairs {
+			if onHost[pair] {
+				return []planFile{{system: manifest.TypeApt, action: planRefuse,
+					reason: fmt.Sprintf("%s (suite %s at %s) is already on this host's apt stanza, so a second stanza for it would conflict on Signed-By; drop it from archives", s.aptSuiteParam(c), pair.suite, pair.uri)}}
+			}
+		}
+		for pair := range pairs {
+			onHost[pair] = true
 		}
 		armored, status := s.aptVendorKey(r, c)
 		if armored == nil {
@@ -739,7 +795,6 @@ func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []st
 		}
 		v, _ := url.ParseQuery(h.q.encode())
 		v.Set("archive", s.aptSuiteParam(c))
-		f := s.aptArchiveFile(h, c)
 		out = append(out,
 			planFile{system: manifest.TypeApt, action: planInstall, path: f.Path(clientconf.OSLinux),
 				content: []byte(f.Content), url: h.base + "/client/" + manifest.TypeApt + "?" + v.Encode()},

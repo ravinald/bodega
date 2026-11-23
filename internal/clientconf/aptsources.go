@@ -217,6 +217,12 @@ func parseAptList(file, text string) ([]AptSourceEntry, error) {
 	return out, nil
 }
 
+// AptStanzaEntries reads a deb822 sources block, one bodega rendered, as
+// LoadAptSources reads a .sources file.
+func AptStanzaEntries(text string) ([]AptSourceEntry, error) {
+	return parseAptDeb822("rendered sources", text)
+}
+
 // parseAptDeb822 is ParseFileDeb822 with Type::ParseStanza, over a reading of
 // the stanzas that takes the forms a sources file is written in: fields as
 // "Name: value", a line opening with a space or tab continuing the field
