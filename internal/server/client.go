@@ -669,6 +669,9 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		if h.q.Codename != "" && h.q.Codename != base {
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and this host reports %s", h.profile.Name(), base, h.q.Codename))
 		}
+		if _, unresolved := s.aptPocketsOf(base); len(unresolved) > 0 {
+			return refuse(fmt.Sprintf("profile %q scopes apt to %s: %s", h.profile.Name(), base, s.aptUnresolvedPocketsReason(base, unresolved)))
+		}
 		suites, missing := s.aptProfileHostSuites(h.profile)
 		if len(suites) == 0 {
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s and no filtered codename answers for it yet; the index rebuild has not produced one", h.profile.Name(), base))
@@ -685,21 +688,27 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			filtered[key] = true
 		}
 		var choices []aptsources.Sources
-		var keys, names []string
+		var keys, names, unplaced []string
 		for _, served := range st.Sources {
 			if served.Suite == "" || filtered[config.AptSuiteKey(served.Archive, served.Suite)] {
 				continue
 			}
 			key := s.aptSourceKey(served)
+			reason := ""
 			if served.Mirrored || s.aptMirrorRewritten(key) {
 				if _, ok := s.aptPocketBase(key); ok {
 					continue
 				}
-				if pockets := s.aptMirroredPockets(key); len(pockets) > 0 {
+				pockets, unresolved := s.aptPocketsOf(key)
+				if len(pockets) > 0 {
 					served = s.aptPocketStanza(r, key, pockets)
+				}
+				if len(unresolved) > 0 {
+					reason = s.aptUnresolvedPocketsReason(key, unresolved)
 				}
 			}
 			choices = append(choices, served)
+			unplaced = append(unplaced, reason)
 			keys = append(keys, key)
 			names = append(names, s.aptSuiteParam(key))
 		}
@@ -712,6 +721,9 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			}
 			for i := range choices {
 				if keys[i] == h.q.Codename {
+					if unplaced[i] != "" {
+						return refuse(unplaced[i])
+					}
 					src = &choices[i]
 				}
 			}
@@ -719,6 +731,9 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 				return skip(fmt.Sprintf("this server serves no apt suite named %s. It serves %s: name one with %s", h.q.Codename, strings.Join(names, ", "), clientconf.AptSuiteRemedy("<suite>")))
 			}
 		case len(choices) == 1:
+			if unplaced[0] != "" {
+				return refuse(unplaced[0])
+			}
 			src = &choices[0]
 		default:
 			return skip(clientconf.AptSuiteChoiceReason(names))
@@ -836,7 +851,17 @@ func (s *Server) aptPocketBase(suite string) (string, bool) {
 }
 
 // aptMirroredPockets lists the apt_upstreams keys of the pockets of base this
-// server mirrors, in clientconf.AptPockets order.
+// server mirrors, in clientconf.AptPockets order. A pocket aptPocketsOf could
+// not place is not among them; a caller building what a host reads asks
+// aptPocketsOf, which names it.
+func (s *Server) aptMirroredPockets(base string) []string {
+	pockets, _ := s.aptPocketsOf(base)
+	return pockets
+}
+
+// aptPocketsOf lists the apt_upstreams keys of the pockets of base this server
+// mirrors, in clientconf.AptPockets order, and separately the mirrored pockets
+// that may be base's but cannot be placed.
 //
 // A pocket is a suite of base's distribution, which is not always base's
 // archive: Debian publishes trixie-security under its own root, so an
@@ -845,17 +870,18 @@ func (s *Server) aptPocketBase(suite string) (string, bool) {
 // base is the one key mirroring its codename and the pocket's archive holds
 // no base of that codename, since otherwise a vendor's noble would claim
 // Ubuntu's noble-security, or Ubuntu's noble a vendor's.
-func (s *Server) aptMirroredPockets(base string) []string {
+//
+// Such a pocket that fails that test is unresolved, not absent. The
+// configuration still serves it and nothing here can say whose it is, so a
+// host plan that dropped it would install a base without its security fixes
+// the moment a vendor of the same codename was added beside it.
+func (s *Server) aptPocketsOf(base string) (pockets, unresolved []string) {
 	archive, codename := s.cfg.AptArchiveOf(base), config.AptCodenameOf(base)
 	sole := len(s.cfg.AptKeysMirroring(codename)) == 1
-	var out []string
 	clientconf.AptPockets(codename, func(pocket string) bool {
 		if key, ok := s.cfg.AptSuiteAt(archive, pocket); ok {
-			out = append(out, key)
+			pockets = append(pockets, key)
 			return true
-		}
-		if !sole {
-			return false
 		}
 		var found []string
 		for _, key := range s.cfg.AptKeysMirroring(pocket) {
@@ -863,13 +889,32 @@ func (s *Server) aptMirroredPockets(base string) []string {
 				found = append(found, key)
 			}
 		}
-		if len(found) != 1 {
+		switch {
+		case len(found) == 0:
 			return false
+		case sole && len(found) == 1:
+			pockets = append(pockets, found[0])
+			return true
 		}
-		out = append(out, found[0])
-		return true
+		unresolved = append(unresolved, found...)
+		return false
 	})
-	return out
+	return pockets, unresolved
+}
+
+// aptUnresolvedPocketsReason refuses a host plan for base over the pockets
+// aptPocketsOf could not place.
+func (s *Server) aptUnresolvedPocketsReason(base string, unresolved []string) string {
+	names := make([]string, len(unresolved))
+	for i, key := range unresolved {
+		names[i] = s.aptSuiteParam(key)
+	}
+	bases := s.cfg.AptKeysMirroring(config.AptCodenameOf(base))
+	for i, key := range bases {
+		bases[i] = s.aptSuiteParam(key)
+	}
+	return fmt.Sprintf("this server mirrors %s under an archive root apart from %s and cannot tell which of %s it is a pocket of, so a host reading %s alone would stop receiving the updates and security fixes it publishes. Move it into the archive of its base in apt_archives",
+		strings.Join(names, ", "), s.aptSuiteParam(base), strings.Join(bases, ", "), s.aptSuiteParam(base))
 }
 
 // aptPocketStanza renders a mirrored base and its pockets as one choice, in

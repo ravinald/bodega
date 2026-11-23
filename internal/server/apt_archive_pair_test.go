@@ -412,3 +412,82 @@ func TestReviewF122GeneratedDefaultBesideVendor(t *testing.T) {
 		t.Fatalf("GET /client/apt?os=linux&codename=/noble = %d %s; want generated noble at the default root", code, body)
 	}
 }
+
+func TestReviewF122VendorAdditionKeepsSplitSecurity(t *testing.T) {
+	s, f, _ := pairVendorServer(t)
+	s.cfg.AptCodename = "house"
+	s.cfg.AptSuites = []string{"house"}
+	vendor := s.cfg.AptUpstreams[vendorNoble]
+	delete(s.cfg.AptUpstreams, vendorNoble)
+	s.cfg.AptUpstreams["noble-security"] = []config.AptUpstream{{URL: "https://security.ubuntu.com/ubuntu"}}
+	s.cfg.AptArchives = map[string][]string{"security": {"noble-security"}}
+	before := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=noble"), manifest.TypeApt)
+	if len(before) != 1 || before[0].Action != planInstall {
+		t.Fatalf("before adding vendor = %+v; want one main source file", before)
+	}
+	wantSecurity := "URIs: http://bodega.example.com:8080/apt/security/\nSuites: noble-security\n"
+	if body := fetchRecord(t, s, f.token, before[0]); !strings.Contains(body, wantSecurity) {
+		t.Fatalf("before adding vendor, security pocket missing: %s", body)
+	}
+	s.cfg.AptUpstreams[vendorNoble] = vendor
+	after := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=/noble&archives=vendor/noble"), manifest.TypeApt)
+	for _, rec := range after {
+		if rec.Action == planRefuse {
+			if !strings.Contains(rec.Reason, "noble-security") {
+				t.Fatalf("refusal does not identify the unresolved pocket: %+v", rec)
+			}
+			return
+		}
+	}
+	for _, rec := range after {
+		if rec.Path == clientconf.AptSourcesPath && rec.Action == planInstall {
+			if body := fetchRecord(t, s, f.token, rec); strings.Contains(body, wantSecurity) {
+				return
+			} else {
+				t.Fatalf("adding vendor/noble silently removes the existing security pocket from the installed main file:\n%s\nwant its security stanza retained, or an explicit refusal", body)
+			}
+		}
+	}
+	t.Fatalf("no main source or refusal: %+v", after)
+}
+
+func TestReviewF122VendorAdditionKeepsProfileSecurity(t *testing.T) {
+	s, _, _ := noblePairServer(t)
+	s.cfg.PublicURL = "http://bodega.example.com:8080"
+	vendor := s.cfg.AptUpstreams[vendorNoble]
+	delete(s.cfg.AptUpstreams, vendorNoble)
+	kr, err := aptsign.Generate("security", "security@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	security := newFixtureArchive(t, fixtureDistsFor(t, kr, "noble-security", fixturePackages(fixtureDeb, fixtureDebBody), "amd64"))
+	s.cfg.AptUpstreams["noble-security"] = []config.AptUpstream{{URL: security.URL()}}
+	s.cfg.AptArchives = map[string][]string{"security": {"noble-security"}}
+	f := aptProfileBindBase(t, s, "web", "noble", audit.ExpansionBlock, "nginx")
+	wantSecurity := "URIs: http://bodega.example.com:8080/apt/security/\nSuites: noble-security-web\n"
+	before := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=noble"), manifest.TypeApt)
+	if len(before) == 0 || before[0].Action != planInstall || !strings.Contains(fetchRecord(t, s, f.token, before[0]), wantSecurity) {
+		t.Fatalf("before adding vendor, filtered security pocket missing: %+v", before)
+	}
+	s.cfg.AptUpstreams[vendorNoble] = vendor
+	s.rebuildAptSnapshot(context.Background())
+	after := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=/noble"), manifest.TypeApt)
+	for _, rec := range after {
+		if rec.Action == planRefuse {
+			if !strings.Contains(rec.Reason, "noble-security") {
+				t.Fatalf("refusal does not identify the unresolved pocket: %+v", rec)
+			}
+			return
+		}
+	}
+	for _, rec := range after {
+		if rec.Path == clientconf.AptSourcesPath && rec.Action == planInstall {
+			if body := fetchRecord(t, s, f.token, rec); strings.Contains(body, wantSecurity) {
+				return
+			} else {
+				t.Fatalf("adding vendor/noble silently removes the existing filtered security pocket:\n%s\nwant its security stanza retained, or an explicit refusal", body)
+			}
+		}
+	}
+	t.Fatalf("no main source or refusal: %+v", after)
+}
