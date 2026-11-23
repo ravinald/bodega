@@ -86,8 +86,8 @@ type aptProfileSuite struct {
 	codename string
 	permit   *entitle.Profile
 	index    *aptSuiteIndex
-	// hidden is every mirrored version an operator hid server-wide, which a
-	// filtered codename drops whatever its profile permits.
+	// hidden is every mirrored version an operator hid in the base's
+	// archive, which a filtered codename drops whatever its profile permits.
 	hidden aptMirrorHides
 }
 
@@ -251,7 +251,7 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 // the difference between a linear cost in profiles and a linear cost in bases.
 // A pocket is a suite like any other here, so a read that fails withdraws that
 // pocket's codename alone, and planApt refuses the host naming the pocket.
-func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, hidden aptMirrorHides, date, validUntil time.Time) (served []aptProfileSuite) {
+func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, hidden aptHidesByArchive, date, validUntil time.Time) (served []aptProfileSuite) {
 	suites := s.aptProfileSuites(views)
 	if len(suites) == 0 {
 		return nil
@@ -260,7 +260,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, 
 	cache := map[string]aptIndexRead{}
 	out := make([]aptProfileSuite, 0, len(suites))
 	for _, ps := range suites {
-		ps.hidden = hidden
+		ps.hidden = hidden.in(s.cfg.AptArchiveOf(ps.base))
 		release, ok := releases[ps.base]
 		if !ok {
 			var err error
@@ -698,7 +698,7 @@ func (s *Server) aptUpstreamFetchAt(ctx context.Context, base, rest string) ([]b
 	if len(ups) == 0 {
 		return nil, time.Time{}, fmt.Errorf("no archive is configured for %q", base)
 	}
-	url := ups[0].URL + "/dists/" + base + "/" + rest
+	url := ups[0].URL + "/dists/" + config.AptCodenameOf(base) + "/" + rest
 	if s.policy != nil {
 		_, violation, err := s.upstreamPolicyVerdict(ctx, manifest.TypeApt, url)
 		if err != nil {

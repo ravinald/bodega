@@ -6691,6 +6691,62 @@ Objects cached under `packages/apt/` before a codename moved into an archive sta
 
 Config load refuses, naming the key and the value: an archive name that does not match `^[a-zA-Z][a-zA-Z0-9_-]*$`; a name bodega already uses as a route or a storage directory (`pool`, `dists`, `keys`, `packages` and the other names `git_upstreams` and `binary_upstreams` refuse as a namespace); a codename `apt_upstreams` does not mirror; a codename listed in two archives; and a generated suite from `apt_suites`, which bodega signs and serves at `/apt/dists/` only.
 
+##### One codename in two archives
+
+Vendors publish their own suite under the distribution's codename: Tailscale's and Docker's Ubuntu repositories each have a `noble`, and every Launchpad PPA does.
+A bare `apt_upstreams` key names one suite per server, so the vendor's `noble` needs a key that names its archive as well: `{archive}/{codename}`.
+
+```json
+"apt_upstreams": {
+  "noble":           [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "noble-updates":   [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "noble-security":  [{"url": "https://security.ubuntu.com/ubuntu"}],
+  "tailscale/noble": [{"url": "https://pkgs.tailscale.com/stable/ubuntu", "components": ["main"],
+                       "signing_key_url": "https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg",
+                       "signing_key_fingerprint": "<the 40 hex digits Tailscale publishes>"}]
+}
+```
+
+`tailscale/noble` is served at `/apt/tailscale/dists/noble/`, its pool at `/apt/tailscale/pool/`, and its objects are stored under `packages/apt/tailscale/`, exactly as a codename listed in `apt_archives.tailscale` would be.
+Ubuntu's `noble` stays at `/apt/dists/noble/`.
+Each `dists/` path is fetched from its own key's upstreams, and each pool's `.deb` is held to the `SHA256` its own `Packages` paragraph lists, so neither publisher's bytes answer for the other's.
+The archive name obeys the rules above, and an archive named only by a qualified key needs no `apt_archives` entry; a qualified key and `apt_archives` can name the same archive, which then shares one pool.
+
+A host reads both, each against its own publisher's key:
+
+```text
+Types: deb
+URIs: https://bodega-host:8080/apt/
+Suites: noble noble-updates noble-security
+Components: main restricted universe multiverse
+
+Types: deb
+URIs: https://bodega-host:8080/apt/tailscale/
+Suites: noble
+Components: main
+Signed-By: /etc/apt/keyrings/bodega-tailscale_noble.asc
+```
+
+`bodega doctor --configure apt --suite noble --archive tailscale/noble --apply` writes the second stanza to `/etc/apt/sources.list.d/bodega-tailscale_noble.sources` and the vendor key, served at `/apt/keys/tailscale/noble.asc`, beside it.
+A host keeping its own sources line points it at the archive's root and keeps its `signed-by`:
+
+```text
+deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://bodega-host:8080/apt/tailscale noble main
+```
+
+Every command and query that names a mirrored codename takes `{archive}/{codename}` too: `bodega profile set --base` and `--archives`, `bodega doctor --suite` and `--archive`, and the `codename=`, `archives=` and `archive=` parameters of `/client/plan`.
+A bare codename names the default archive's suite when there is one, and otherwise the one archive mirroring it.
+Mirrored in two or more named archives and in none of the default, a bare codename names none of them, and is refused with the qualified forms that would:
+
+```text
+apt codename "noble" is mirrored in 2 archives, so it names none of them: write one of tailscale/noble, ubuntu/noble
+```
+
+`{archive}/{codename}` also names a codename listed in `apt_archives`, so `ubuntu/noble` answers for `noble` in `apt_archives.ubuntu`.
+Config load refuses one (archive, codename) pair given twice, naming both spellings: `debian/trixie` beside `trixie` listed in `apt_archives.debian` is refused.
+A hide set with `bodega pkg hide` on a version found only in `tailscale/noble` applies in the `tailscale` archive and leaves Ubuntu's build of the same name and version served.
+The OSV gate checks a mirrored suite against the release its key names, so `tailscale/noble` is recorded as not checked rather than checked against Ubuntu's advisories, which do not cover a vendor's build.
+
 #### `apt_architectures`
 
 bodega checks each mirrored `.deb` it fetches against the `Packages` paragraph naming it (see [Resolving a pool path](#resolving-a-pool-path)), so it reads and holds those paragraphs in memory.

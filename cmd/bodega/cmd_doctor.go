@@ -180,9 +180,14 @@ PGDG) to the apt system: the vendor's key at
 /etc/apt/keyrings/bodega-<codename>.asc and a stanza at
 /etc/apt/sources.list.d/bodega-<codename>.sources whose Signed-By: names it.
 The server serves the key only once it matches the fingerprint the operator
-configured. Repeat it for several.
+configured. Repeat it for several. A vendor whose suite is the
+distribution's codename is mirrored under its own archive and named
+{archive}/{codename}: --archive tailscale/noble writes
+bodega-tailscale_noble.sources, reading noble from /apt/tailscale/ with
+its own key, beside the host's Ubuntu noble.
 
   bodega doctor --configure apt --suite noble --archive stable --url https://bodega.internal
+  bodega doctor --configure apt --suite noble --archive tailscale/noble --url https://bodega.internal
 
 --abi is the pkg ABI the freebsd system is configured for, "pkg config abi"
 on a FreeBSD host by default. The tags the pkg override disables follow the
@@ -399,7 +404,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 	c.Flags().StringVar(&aptSuite, "suite", "",
 		"The apt codename to configure, for an instance serving several and no profile to choose between them")
 	c.Flags().StringSliceVar(&aptArchives, "archive", nil,
-		"A vendor apt archive this server mirrors to configure with its key, by codename (repeatable)")
+		"A vendor apt archive this server mirrors to configure with its key, by codename or {archive}/{codename} (repeatable)")
 	c.Flags().StringVar(&pkgABI, "abi", "",
 		"The pkg ABI to configure for; defaults to what `pkg config abi` reports on this host")
 	c.Flags().IntVar(&pkgRelease, "release", 0,

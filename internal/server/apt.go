@@ -47,9 +47,9 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 // config that has since changed, and apt prints the body's first line.
 func (s *Server) handleAptArchive(w http.ResponseWriter, r *http.Request) {
 	archive := r.PathValue("archive")
-	if _, ok := s.cfg.AptArchives[archive]; !ok {
-		declared := "none; apt_archives is not set, so every codename is under /apt/dists/"
-		if names := s.cfg.AptArchiveNames(); len(names) > 0 {
+	if names := s.cfg.AptArchiveNames(); !slices.Contains(names, archive) {
+		declared := "none; apt_archives is not set and no apt_upstreams key is {archive}/{codename}, so every codename is under /apt/dists/"
+		if len(names) > 0 {
 			declared = strings.Join(names, ", ")
 		}
 		http.Error(w, fmt.Sprintf("apt archive %q is not declared in apt_archives (declared: %s)", archive, declared), http.StatusNotFound)
@@ -74,7 +74,7 @@ func (s *Server) serveAptPool(w http.ResponseWriter, r *http.Request, archive, p
 		return
 	}
 	poolPath := "pool/" + p
-	if s.aptPoolHidden(w, r, poolPath) {
+	if s.aptPoolHidden(w, r, archive, poolPath) {
 		return
 	}
 	// The backstop, and the one route where the profile predicate is not the
@@ -159,28 +159,45 @@ func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, 
 	}
 	parts := strings.Split(distpath, "/")
 
+	// The path names a codename within an archive, and the suite it resolves
+	// to is the apt_upstreams key mirroring that pair. One codename can be
+	// mirrored in several archives, so every lookup below takes the key.
+	suite, mirrored := s.cfg.AptSuiteAt(archive, parts[0])
+	if !mirrored {
+		suite = parts[0]
+	}
+
 	// A codename answers under its own archive's root and nowhere else. The
 	// body names where it is, because the request is a sources entry written
-	// before the codename moved into an archive, and the fix is one URI.
-	if home := s.aptSuiteArchive(parts[0]); home != archive {
-		switch {
-		case home != "":
-			http.Error(w, fmt.Sprintf("apt codename %q is in archive %q: it is served at /apt/%s/dists/%s/", parts[0], home, home, parts[0]), http.StatusNotFound)
-		case s.cfg.MirrorsAptCodename(parts[0]) || s.cfg.ServesAptSuite(parts[0]):
-			http.Error(w, fmt.Sprintf("apt codename %q is not in archive %q: it is served at /apt/dists/%s/", parts[0], archive, parts[0]), http.StatusNotFound)
-		default:
-			http.Error(w, fmt.Sprintf("apt archive %q has no codename %q (it has: %s)", archive, parts[0], strings.Join(s.cfg.AptArchives[archive], ", ")), http.StatusNotFound)
+	// before the codename moved into an archive, and the fix is one URI. A
+	// name served nowhere in the default archive falls through to the
+	// generated suites' own 404.
+	if !mirrored && !s.aptServesUnmirroredAt(archive, suite) {
+		homes := s.aptArchivesServing(parts[0])
+		roots := make([]string, len(homes))
+		for i, home := range homes {
+			roots[i] = aptDistsRoot(home, parts[0])
 		}
-		return
+		switch {
+		case len(homes) == 1 && homes[0] != "":
+			http.Error(w, fmt.Sprintf("apt codename %q is in archive %q: it is served at %s", parts[0], homes[0], roots[0]), http.StatusNotFound)
+			return
+		case len(homes) > 0:
+			http.Error(w, fmt.Sprintf("apt codename %q is not in %s: it is served at %s", parts[0], aptArchiveLabel(archive), strings.Join(roots, " and ")), http.StatusNotFound)
+			return
+		case archive != "":
+			http.Error(w, fmt.Sprintf("apt archive %q has no codename %q (it has: %s)", archive, parts[0], strings.Join(s.aptArchiveCodenameList(archive), ", ")), http.StatusNotFound)
+			return
+		}
 	}
 
 	// Before the rewritten-or-proxied choice below: a vendor codename the
 	// host's profile does not list is refused whichever of the two serves it.
-	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) {
-		if p := s.profileFor(r); s.aptArchiveRefused(p, parts[0]) {
+	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(suite) {
+		if p := s.profileFor(r); s.aptArchiveRefused(p, suite) {
 			rest := strings.Join(parts[1:], "/")
-			s.refuseAptArchive(w, r, p, parts[0],
-				s.cfg.AptUpstreams[parts[0]][0].URL+"/dists/"+parts[0]+"/"+rest, aptMirrorPkgName(parts[0], rest))
+			s.refuseAptArchive(w, r, p, suite,
+				s.cfg.AptUpstreams[suite][0].URL+"/dists/"+parts[0]+"/"+rest, aptMirrorPkgName(suite, rest))
 			return
 		}
 	}
@@ -189,28 +206,27 @@ func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, 
 	// the generated snapshot below, unless a hidden version made the rebuild
 	// rewrite it (apt_hide.go). config.Load refuses a codename in both sets, so
 	// this branch cannot shadow a suite bodega signs.
-	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) && !s.aptMirrorRewritten(parts[0]) {
-		s.handleAptMirrorDists(w, r, parts[0], strings.Join(parts[1:], "/"))
+	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(suite) && !s.aptMirrorRewritten(suite) {
+		s.handleAptMirrorDists(w, r, suite, strings.Join(parts[1:], "/"))
 		return
 	}
 
 	if len(parts) == 2 {
 		switch parts[1] {
 		case "Release":
-			s.handleAptRelease(w, r, parts[0])
+			s.handleAptRelease(w, r, suite)
 			return
 		case "InRelease":
-			s.handleAptSigned(w, r, parts[0], "InRelease")
+			s.handleAptSigned(w, r, suite, "InRelease")
 			return
 		case "Release.gpg":
-			s.handleAptSigned(w, r, parts[0], "Release.gpg")
+			s.handleAptSigned(w, r, suite, "Release.gpg")
 			return
 		}
 	}
 
 	// <suite>/<component>/binary-<arch>/Packages[.gz]
 	if len(parts) == 4 && strings.HasPrefix(parts[2], "binary-") {
-		suite := parts[0]
 		component := parts[1]
 		arch := strings.TrimPrefix(parts[2], "binary-")
 		file := parts[3]
@@ -495,7 +511,7 @@ type aptSnapshot struct {
 	// it, and the pool refuses each. mirrorRewritten names the mirrored
 	// codenames whose index in suites is bodega's rewrite rather than absent:
 	// those are served from the snapshot and signed with bodega's key.
-	hidden          aptMirrorHides
+	hidden          aptHidesByArchive
 	mirrorRewritten map[string]bool
 
 	// mirrorIndexes is every filtered Packages the rewritten groups above
@@ -1276,10 +1292,10 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	// generated suite does.
 	for _, codename := range mirrored {
 		one := st
-		one.Suites = []string{codename}
+		one.Suites = []string{config.AptCodenameOf(codename)}
 		one.Archive = s.cfg.AptArchiveOf(codename)
 		if s.aptMirrorRewritten(codename) {
-			one.Components = s.aptServedComponents(one.Suites)
+			one.Components = s.aptServedComponents([]string{codename})
 		} else {
 			one.Mirrored = true
 			one.Components = s.cfg.AptComponentsFor(codename)
@@ -1314,6 +1330,56 @@ func (s *Server) aptSuiteArchive(codename string) string {
 		}
 	}
 	return ""
+}
+
+// aptServesUnmirroredAt reports whether a suite no apt_upstreams key mirrors
+// is served under archive's root: a generated suite in the default archive,
+// or a profile's filtered codename in the archive of the suite it filters.
+func (s *Server) aptServesUnmirroredAt(archive, suite string) bool {
+	if s.cfg.MirrorsAptCodename(suite) {
+		return false
+	}
+	if snap := s.aptSnap.Load(); snap != nil {
+		if base, ok := snap.profileBases[suite]; ok {
+			return s.cfg.AptArchiveOf(base) == archive
+		}
+	}
+	return archive == "" && s.cfg.ServesAptSuite(suite)
+}
+
+// aptArchivesServing names every archive serving codename under its dists/
+// root, mirrored there or carried as a filtered codename, sorted, for a 404
+// to point at.
+func (s *Server) aptArchivesServing(codename string) []string {
+	var out []string
+	for _, key := range s.cfg.MirroredAptCodenames() {
+		if a := s.cfg.AptArchiveOf(key); config.AptCodenameOf(key) == codename && !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	if a := s.aptSuiteArchive(codename); s.aptServesUnmirroredAt(a, codename) && !slices.Contains(out, a) {
+		out = append(out, a)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// aptDistsRoot is where archive serves codename's dists/ tree.
+func aptDistsRoot(archive, codename string) string {
+	if archive == "" {
+		return "/apt/dists/" + codename + "/"
+	}
+	return "/apt/" + archive + "/dists/" + codename + "/"
+}
+
+// aptArchiveCodenameList is the codenames an archive serves, as a request
+// path under its root names them.
+func (s *Server) aptArchiveCodenameList(archive string) []string {
+	var out []string
+	for _, key := range s.aptArchiveCodenames(archive) {
+		out = append(out, config.AptCodenameOf(key))
+	}
+	return out
 }
 
 // aptFilteredSuites names the filtered codenames the loaded snapshot carries,

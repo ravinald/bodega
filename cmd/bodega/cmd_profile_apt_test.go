@@ -654,3 +654,46 @@ func TestProfileSetAptArchives(t *testing.T) {
 		t.Error("--archives on an npm rule was accepted")
 	}
 }
+
+// F122 requirement 2: --archives takes a vendor's {archive}/{codename}, and a
+// bare --base mirrored in two named archives is refused with both spellings
+// while the qualified one is stored as the key it resolves to.
+func TestProfileSetAptQualifiedCodenames(t *testing.T) {
+	newDiscoverEnv(t)
+	path := os.Getenv(config.EnvConfigFile)
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(blob, &cfg); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cfg["apt_codename"] = "house"
+	cfg["apt_upstreams"] = map[string]any{
+		"noble": []any{map[string]any{"url": "https://archive.ubuntu.com/ubuntu"}},
+		"tailscale/noble": []any{map[string]any{"url": "https://pkgs.tailscale.com/stable/ubuntu", "components": []string{"main"},
+			"signing_key_url": "https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg", "signing_key_fingerprint": strings.Repeat("B", 40)}},
+	}
+	cfg["apt_archives"] = map[string]any{"ubuntu": []string{"noble"}}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	msg, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+	if err == nil || !strings.Contains(msg+err.Error(), "tailscale/noble, ubuntu/noble") {
+		t.Fatalf("--base noble = %v %s, want a refusal naming tailscale/noble, ubuntu/noble", err, msg)
+	}
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "ubuntu/noble")
+	mustRunProfile(t, "set", "web", "apt", "--archives", "tailscale/noble")
+	shown := mustRunProfile(t, "show", "web")
+	if !strings.Contains(shown, " noble ") || !strings.Contains(shown, " tailscale/noble ") {
+		t.Errorf("show does not carry the base and the qualified archive:\n%s", shown)
+	}
+}

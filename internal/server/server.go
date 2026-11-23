@@ -1069,7 +1069,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /apt/{archive}/{rest...}", s.handleAptArchive)
 	m.HandleFunc("GET /apt/bodega-archive-keyring.gpg", s.handleAptKeyring)
 	m.HandleFunc("GET /apt/bodega-archive-keyring.asc", s.handleAptPublicKey)
-	m.HandleFunc("GET /apt/keys/{file}", s.handleAptVendorKey)
+	m.HandleFunc("GET /apt/keys/{file...}", s.handleAptVendorKey)
 
 	// PyPI simple index (PEP 503)
 	m.HandleFunc("GET /pypi/simple/", s.handlePypiIndex)

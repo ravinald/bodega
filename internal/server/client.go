@@ -92,6 +92,10 @@ type clientQuery struct {
 	OS       string
 	ABI      string
 	Codename string
+	// codenameParam is how Codename is written back into a URL the plan
+	// hands out: a spelling that resolves to the same apt_upstreams key.
+	// Empty writes Codename.
+	codenameParam string
 	// Release is the FreeBSD major release whose repository tags the pkg
 	// overrides disable, for a host whose release is not the one its
 	// repository is named for. Zero keeps the repository's own.
@@ -127,7 +131,7 @@ const (
 
 var (
 	clientABIRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:._-]{0,63}$`)
-	clientCodenameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.+-]{0,63}$`)
+	clientCodenameRe = regexp.MustCompile(`^(?:[A-Za-z][A-Za-z0-9_-]*/)?[a-z0-9][a-z0-9.+-]{0,63}$`)
 )
 
 func parseClientQuery(r *http.Request) (clientQuery, error) {
@@ -191,6 +195,52 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 	return q, nil
 }
 
+// resolveAptQuery rewrites the apt suites a query names, codename, archives
+// and archive alike, to the apt_upstreams keys they resolve to
+// (config.ResolveAptSuite), so the plan compares one spelling of each. A
+// bare codename mirrored in several named archives is refused here.
+func (s *Server) resolveAptQuery(q clientQuery) (clientQuery, error) {
+	var err error
+	if q.Codename, err = s.cfg.ResolveAptSuite(q.Codename); err != nil {
+		return q, fmt.Errorf("codename=: %w", err)
+	}
+	q.codenameParam = s.aptSuiteParam(q.Codename)
+	if q.Archive, err = s.cfg.ResolveAptSuite(q.Archive); err != nil {
+		return q, fmt.Errorf("archive=: %w", err)
+	}
+	archives := make([]string, 0, len(q.Archives))
+	for _, c := range q.Archives {
+		key, err := s.cfg.ResolveAptSuite(c)
+		if err != nil {
+			return q, fmt.Errorf("archives=: %w", err)
+		}
+		if !slices.Contains(archives, key) {
+			archives = append(archives, key)
+		}
+	}
+	q.Archives = archives
+	return q, nil
+}
+
+// aptSuiteParam is how a URL names an apt_upstreams key: the key itself when
+// it resolves back to itself, and {archive}/{codename} when the bare codename
+// is mirrored in other archives too.
+func (s *Server) aptSuiteParam(key string) string {
+	if back, err := s.cfg.ResolveAptSuite(key); err == nil && back == key {
+		return key
+	}
+	return s.cfg.AptQualifiedName(key)
+}
+
+// aptSourceKey is the apt_upstreams key a rendered sources block serves, or
+// its suite when no key mirrors it.
+func (s *Server) aptSourceKey(src aptsources.Sources) string {
+	if key, ok := s.cfg.AptSuiteAt(src.Archive, src.Suite); ok {
+		return key
+	}
+	return src.Suite
+}
+
 // checkAptArchives refuses a named archive this server cannot configure: one
 // it does not mirror, or mirrors with no vendor key, since a stanza naming a
 // Signed-By: file nothing serves fails every "apt update".
@@ -219,7 +269,9 @@ func (q clientQuery) encode() string {
 	if q.ABI != "" {
 		v.Set("abi", q.ABI)
 	}
-	if q.Codename != "" {
+	if q.codenameParam != "" {
+		v.Set("codename", q.codenameParam)
+	} else if q.Codename != "" {
 		v.Set("codename", q.Codename)
 	}
 	if q.Release != 0 {
@@ -288,6 +340,9 @@ func (s *Server) admitClient(w http.ResponseWriter, r *http.Request, subject str
 // profile and the rule it reports describe one resolution.
 func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject string, m identityMatch) (*clientHost, bool) {
 	q, err := parseClientQuery(r)
+	if err == nil {
+		q, err = s.resolveAptQuery(q)
+	}
 	if err == nil {
 		err = s.checkAptArchives(q)
 	}
@@ -593,21 +648,23 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			filtered[c] = true
 		}
 		var choices []aptsources.Sources
-		var names []string
+		var keys, names []string
 		for _, served := range st.Sources {
 			if served.Suite == "" || filtered[served.Suite] {
 				continue
 			}
-			if served.Mirrored || s.aptMirrorRewritten(served.Suite) {
-				if _, ok := s.aptPocketBase(served.Suite); ok {
+			key := s.aptSourceKey(served)
+			if served.Mirrored || s.aptMirrorRewritten(key) {
+				if _, ok := s.aptPocketBase(key); ok {
 					continue
 				}
-				if pockets := s.aptMirroredPockets(served.Suite); len(pockets) > 0 {
-					served = s.aptPocketStanza(r, served.Suite, pockets)
+				if pockets := s.aptMirroredPockets(key); len(pockets) > 0 {
+					served = s.aptPocketStanza(r, key, pockets)
 				}
 			}
 			choices = append(choices, served)
-			names = append(names, served.Suite)
+			keys = append(keys, key)
+			names = append(names, s.aptSuiteParam(key))
 		}
 		switch {
 		case len(choices) == 0:
@@ -617,7 +674,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 				return skip(fmt.Sprintf("%s is a pocket of %s, and pockets are configured together with their base: name %s with %s", h.q.Codename, base, base, clientconf.AptSuiteRemedy(base)))
 			}
 			for i := range choices {
-				if choices[i].Suite == h.q.Codename {
+				if keys[i] == h.q.Codename {
 					src = &choices[i]
 				}
 			}
@@ -681,7 +738,7 @@ func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []st
 				reason: fmt.Sprintf("the vendor key for %s could not be served (%d %s); the server log names why", c, status, http.StatusText(status))}}
 		}
 		v, _ := url.ParseQuery(h.q.encode())
-		v.Set("archive", c)
+		v.Set("archive", s.aptSuiteParam(c))
 		f := s.aptArchiveFile(h, c)
 		out = append(out,
 			planFile{system: manifest.TypeApt, action: planInstall, path: f.Path(clientconf.OSLinux),
@@ -752,7 +809,7 @@ func (s *Server) aptStanzas(r *http.Request, suites []string, mirrored bool) apt
 			groups = append(groups, &group{archive: archive, components: components})
 			i = len(groups) - 1
 		}
-		groups[i].suites = append(groups[i].suites, suite)
+		groups[i].suites = append(groups[i].suites, config.AptCodenameOf(suite))
 	}
 	parts := make([]aptsources.Sources, len(groups))
 	for i, g := range groups {

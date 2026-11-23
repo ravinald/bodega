@@ -21,6 +21,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -175,8 +176,9 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	// reachable under codenames of their own. Mixing them under one name would
 	// serve a Release from one host and a Packages from another, which is the
 	// hash mismatch the whole disjoint-namespace rule exists to prevent.
-	upstream := upstreams[0].URL + "/dists/" + codename + "/" + rest
-	key := manifest.AptArchiveKey(s.cfg.AptArchiveOf(codename), "dists/"+codename+"/"+rest)
+	dists := "dists/" + config.AptCodenameOf(codename) + "/" + rest
+	upstream := upstreams[0].URL + "/" + dists
+	key := manifest.AptArchiveKey(s.cfg.AptArchiveOf(codename), dists)
 	immutable := aptDistsImmutable(rest)
 	markIndexResponse(r)
 

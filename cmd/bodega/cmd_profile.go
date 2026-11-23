@@ -488,8 +488,11 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 			VersionDefault: t.VersionDefault, Expansion: t.Expansion, AptBase: t.AptBase, Actor: actor,
 		})
 	}
-	for _, rule := range types {
-		if err := checkProfileAptBase(gf, doc.Name, rule); err != nil {
+	for i := range types {
+		if err := resolveProfileAptBase(gf, &types[i]); err != nil {
+			return err
+		}
+		if err := checkProfileAptBase(gf, doc.Name, types[i]); err != nil {
 			return err
 		}
 	}
@@ -1033,13 +1036,16 @@ name keeps the value it has.`,
 			}
 			if cmd.Flags().Changed("base") {
 				rule.AptBase = base
+				if err := resolveProfileAptBase(gf, &rule); err != nil {
+					return err
+				}
 			}
 			if err := checkProfileAptBase(gf, profile, rule); err != nil {
 				return err
 			}
 			if cmd.Flags().Changed("archives") {
 				rule.AptArchives = audit.NormalizeAptArchives(strings.Split(archives, ","))
-				if err := checkProfileAptArchives(gf, rule); err != nil {
+				if err := checkProfileAptArchives(gf, &rule); err != nil {
 					return err
 				}
 			}
@@ -1099,10 +1105,12 @@ name keeps the value it has.`,
 }
 
 // checkProfileAptArchives refuses a vendor archive this instance could not
-// serve. Unlike the base check it needs the config: a codename that is not
-// mirrored with a key is one archives= refuses anyway, so storing it admits
-// nothing and reads as a decision someone made.
-func checkProfileAptArchives(gf *globalFlags, rule audit.ProfileTypeRule) error {
+// serve, and rewrites each one named to the apt_upstreams key it resolves to
+// (config.ResolveAptSuite), the spelling archives= and the server compare.
+// Unlike the base check it needs the config: a codename that is not mirrored
+// with a key is one archives= refuses anyway, so storing it admits nothing
+// and reads as a decision someone made.
+func checkProfileAptArchives(gf *globalFlags, rule *audit.ProfileTypeRule) error {
 	if len(rule.AptArchives) == 0 {
 		return nil
 	}
@@ -1114,6 +1122,15 @@ func checkProfileAptArchives(gf *globalFlags, rule audit.ProfileTypeRule) error 
 		return fmt.Errorf("--archives is checked against apt_upstreams, and the config would not load: %w\n"+
 			"  Run this where the server's config file is, or name it with BODEGA_CONFIG_FILE", err)
 	}
+	resolved := make([]string, 0, len(rule.AptArchives))
+	for _, c := range rule.AptArchives {
+		key, err := cfg.ResolveAptSuite(c)
+		if err != nil {
+			return fmt.Errorf("--archives: %w", err)
+		}
+		resolved = append(resolved, key)
+	}
+	rule.AptArchives = audit.NormalizeAptArchives(resolved)
 	keyed := cfg.AptKeyedCodenames()
 	var bad []string
 	for _, c := range rule.AptArchives {
@@ -1128,6 +1145,26 @@ func checkProfileAptArchives(gf *globalFlags, rule audit.ProfileTypeRule) error 
 		"  Vendor archives here:  %s\n"+
 		"  Add one:               signing_key_url and signing_key_fingerprint on its apt_upstreams entry",
 		strings.Join(bad, ", "), orNone(strings.Join(keyed, " ")))
+}
+
+// resolveProfileAptBase rewrites a base the operator named to the
+// apt_upstreams key it resolves to (config.ResolveAptSuite), which is what the
+// server compares a stored base against. A base already stored is a key and
+// is never resolved again: the same bare key reads as ambiguous once another
+// archive mirrors its codename. A config that will not load leaves the base as
+// typed, for the reason checkProfileAptBase gives.
+func resolveProfileAptBase(gf *globalFlags, rule *audit.ProfileTypeRule) error {
+	if rule.AptBase == "" {
+		return nil
+	}
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return nil
+	}
+	if rule.AptBase, err = cfg.ResolveAptSuite(rule.AptBase); err != nil {
+		return fmt.Errorf("--base: %w", err)
+	}
+	return nil
 }
 
 // checkProfileAptBase refuses a base this instance could not serve, at the
