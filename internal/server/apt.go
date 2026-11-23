@@ -164,7 +164,7 @@ func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, 
 	// mirrored in several archives, so every lookup below takes the key.
 	suite, mirrored := s.cfg.AptSuiteAt(archive, parts[0])
 	if !mirrored {
-		suite = parts[0]
+		suite = config.AptSuiteKey(archive, parts[0])
 	}
 
 	// A codename answers under its own archive's root and nowhere else. The
@@ -193,7 +193,7 @@ func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, 
 
 	// Before the rewritten-or-proxied choice below: a vendor codename the
 	// host's profile does not list is refused whichever of the two serves it.
-	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(suite) {
+	if len(parts) >= 2 && mirrored {
 		if p := s.profileFor(r); s.aptArchiveRefused(p, suite) {
 			rest := strings.Join(parts[1:], "/")
 			s.refuseAptArchive(w, r, p, suite,
@@ -206,7 +206,7 @@ func (s *Server) serveAptDists(w http.ResponseWriter, r *http.Request, archive, 
 	// the generated snapshot below, unless a hidden version made the rebuild
 	// rewrite it (apt_hide.go). config.Load refuses a codename in both sets, so
 	// this branch cannot shadow a suite bodega signs.
-	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(suite) && !s.aptMirrorRewritten(suite) {
+	if len(parts) >= 2 && mirrored && !s.aptMirrorRewritten(suite) {
 		s.handleAptMirrorDists(w, r, suite, strings.Join(parts[1:], "/"))
 		return
 	}
@@ -641,13 +641,13 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 	// suite's do: the first carries the digests of the second.
 	snap.hidden = s.aptMirrorHidesFrom(ctx)
 	for _, ps := range s.aptProfileIndexes(ctx, views, snap.hidden, date, snap.validUntil) {
-		snap.suites[ps.codename] = ps.index
+		snap.suites[ps.key] = ps.index
 		if snap.profileSuites == nil {
 			snap.profileSuites = map[string]string{}
 			snap.profileBases = map[string]string{}
 		}
-		snap.profileSuites[ps.codename] = ps.profile
-		snap.profileBases[ps.codename] = ps.base
+		snap.profileSuites[ps.key] = ps.profile
+		snap.profileBases[ps.key] = ps.base
 	}
 	rewrites, reusable := s.aptMirrorRewrites(ctx, snap.hidden, date, snap.validUntil)
 	snap.mirrorIndexes = reusable
@@ -1150,6 +1150,8 @@ type aptStatus struct {
 	// that matters to a client — bodega's key signs them and Signed-By: goes
 	// on the line — and separate from Suites because nothing in apt_suites
 	// produced them and an operator reading the config would not find them.
+	// One over a base in a named archive is written {archive}/{codename},
+	// since another archive may derive the same codename under its own root.
 	Filtered []string `json:"filtered,omitempty"`
 
 	// Profile is the profile bound to the request that asked, when one scopes
@@ -1305,46 +1307,45 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	// A filtered codename renders as what it is: a suite bodega generated and
 	// signed. Same stanza shape as an apt_suites codename, because from the
 	// client's side that is the only thing it is.
-	for _, codename := range out.Filtered {
+	for _, key := range out.Filtered {
 		one := st
-		one.Suites = []string{codename}
-		one.Archive = s.aptSuiteArchive(codename)
-		one.Components = s.aptServedComponents(one.Suites)
+		one.Suites = []string{config.AptCodenameOf(key)}
+		one.Archive = s.aptSuiteArchive(key)
+		one.Components = s.aptServedComponents([]string{key})
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	out.Profile, out.Host = s.aptHostSources(r, out)
 	return out
 }
 
-// aptSuiteArchive is the archive a served codename answers under: a mirrored
-// codename's own, and for a profile's filtered codename the archive of the
-// suite it filters, because the Filename of every paragraph it carries is a
-// pool path of that archive. Everything else is the default archive.
-func (s *Server) aptSuiteArchive(codename string) string {
-	if archive := s.cfg.AptArchiveOf(codename); archive != "" {
-		return archive
-	}
+// aptSuiteArchive is the archive a served suite key answers under: for a
+// profile's filtered codename the archive of the suite it filters, because the
+// Filename of every paragraph it carries is a pool path of that archive, and
+// a mirrored codename's own. Everything else is the default archive.
+//
+// The filtered codename is asked first: held under config.AptSuiteKey, a
+// default-archive one is a bare string a mirrored codename listed in a named
+// archive may also spell.
+func (s *Server) aptSuiteArchive(key string) string {
 	if snap := s.aptSnap.Load(); snap != nil {
-		if base, ok := snap.profileBases[codename]; ok {
+		if base, ok := snap.profileBases[key]; ok {
 			return s.cfg.AptArchiveOf(base)
 		}
 	}
-	return ""
+	return s.cfg.AptArchiveOf(key)
 }
 
-// aptServesUnmirroredAt reports whether a suite no apt_upstreams key mirrors
-// is served under archive's root: a generated suite in the default archive,
-// or a profile's filtered codename in the archive of the suite it filters.
-func (s *Server) aptServesUnmirroredAt(archive, suite string) bool {
-	if s.cfg.MirrorsAptCodename(suite) {
-		return false
-	}
+// aptServesUnmirroredAt reports whether the suite held under key, no
+// apt_upstreams key mirroring it at archive, is served under archive's root:
+// a generated suite in the default archive, or a profile's filtered codename
+// in the archive of the suite it filters.
+func (s *Server) aptServesUnmirroredAt(archive, key string) bool {
 	if snap := s.aptSnap.Load(); snap != nil {
-		if base, ok := snap.profileBases[suite]; ok {
+		if base, ok := snap.profileBases[key]; ok {
 			return s.cfg.AptArchiveOf(base) == archive
 		}
 	}
-	return archive == "" && s.cfg.ServesAptSuite(suite)
+	return archive == "" && s.cfg.ServesAptSuite(key)
 }
 
 // aptArchivesServing names every archive serving codename under its dists/
@@ -1352,13 +1353,25 @@ func (s *Server) aptServesUnmirroredAt(archive, suite string) bool {
 // to point at.
 func (s *Server) aptArchivesServing(codename string) []string {
 	var out []string
-	for _, key := range s.cfg.MirroredAptCodenames() {
-		if a := s.cfg.AptArchiveOf(key); config.AptCodenameOf(key) == codename && !slices.Contains(out, a) {
+	add := func(a string) {
+		if !slices.Contains(out, a) {
 			out = append(out, a)
 		}
 	}
-	if a := s.aptSuiteArchive(codename); s.aptServesUnmirroredAt(a, codename) && !slices.Contains(out, a) {
-		out = append(out, a)
+	for _, key := range s.cfg.MirroredAptCodenames() {
+		if config.AptCodenameOf(key) == codename {
+			add(s.cfg.AptArchiveOf(key))
+		}
+	}
+	if snap := s.aptSnap.Load(); snap != nil {
+		for key, base := range snap.profileBases {
+			if config.AptCodenameOf(key) == codename {
+				add(s.cfg.AptArchiveOf(base))
+			}
+		}
+	}
+	if s.cfg.ServesAptSuite(codename) {
+		add("")
 	}
 	slices.Sort(out)
 	return out
@@ -1445,20 +1458,26 @@ func (s *Server) aptProfileHostSuites(p *entitle.Profile) (suites, missing []str
 	if base == "" {
 		return nil, nil
 	}
-	_, byCodename := s.aptFilteredSuites()
-	if codename := config.ProfileAptCodename(base, p.Name()); byCodename[codename] == p.Name() {
-		suites = append(suites, codename)
+	_, byKey := s.aptFilteredSuites()
+	if key := s.aptProfileKey(base, p.Name()); byKey[key] == p.Name() {
+		suites = append(suites, key)
 	} else {
 		return nil, nil
 	}
 	for _, pocket := range s.aptMirroredPockets(base) {
-		if codename := config.ProfileAptCodename(pocket, p.Name()); byCodename[codename] == p.Name() {
-			suites = append(suites, codename)
+		if key := s.aptProfileKey(pocket, p.Name()); byKey[key] == p.Name() {
+			suites = append(suites, key)
 		} else {
 			missing = append(missing, pocket)
 		}
 	}
 	return suites, missing
+}
+
+// aptProfileKey is the key the snapshot holds profile's filtered codename
+// over the mirrored suite base under.
+func (s *Server) aptProfileKey(base, profile string) string {
+	return config.AptSuiteKey(s.cfg.AptArchiveOf(base), config.ProfileAptCodename(base, profile))
 }
 
 // publicBase returns the base URL clients reach this server at, with no
@@ -2092,9 +2111,10 @@ func (s *Server) aptSourcesBanner() string {
 	// no trace of it; leaving it off the banner as well would mean the only
 	// place the name appears is the log line that built it.
 	filtered, _ := s.aptFilteredSuites()
-	for _, codename := range filtered {
+	for _, key := range filtered {
 		one := st
-		one.Suites = []string{codename}
+		one.Suites = []string{config.AptCodenameOf(key)}
+		one.Archive = s.aptSuiteArchive(key)
 		blocks = append(blocks, aptsources.Render(one))
 	}
 	var b strings.Builder

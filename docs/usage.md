@@ -2051,7 +2051,7 @@ $ bodega profile set web apt --membership closed --base noble
     the profile then reads the mirrored codename noble unchanged, verified against the distro keyring
 ```
 
-**A filtered codename lives in its base's archive.** When the base is in an [`apt_archives`](#apt_archives) archive, the filtered codename is served at that archive's root, `/apt/<archive>/dists/noble-web/`, because the pool paths its paragraphs name are that archive's: `/apt/<archive>/pool/` serves the `.deb`s it lists and refuses the rest with the same `403` the default layout gives. The status route and `bodega doctor --write-apt-sources` write the stanza with that root, and a request for the codename at `/apt/dists/` gets a `404` naming where it is served. A base in no archive keeps its filtered codename at `/apt/dists/`.
+**A filtered codename lives in its base's archive.** When the base is in an [`apt_archives`](#apt_archives) archive, the filtered codename is served at that archive's root, `/apt/<archive>/dists/noble-web/`, because the pool paths its paragraphs name are that archive's: `/apt/<archive>/pool/` serves the `.deb`s it lists and refuses the rest with the same `403` the default layout gives. The status route and `bodega doctor --write-apt-sources` write the stanza with that root, and a request for the codename at `/apt/dists/` gets a `404` naming where it is served. A base in no archive keeps its filtered codename at `/apt/dists/`. `apt.filtered` in `GET /api/v1/status` lists a filtered codename in a named archive as `<archive>/noble-web`, because two archives can each serve a `noble-web` of their own.
 
 **A profile with no base still governs apt.** `--base` buys a filtered view of a _mirrored_ codename. A suite bodega serves from its own catalog — an `apt_suites` codename holding the entries an operator put in it — is filtered in place instead: the host reads the suite it was always pointed at and bodega answers with that profile's view of it, generated and signed at the same rebuild. Either way `/apt/pool/` refuses a `.deb` the profile does not entitle. What no base costs is the mirrored codename: that document is the archive's own, so a host reading one is offered the archive whole and meets the refusal at the fetch, which is the mid-transaction 403 the arrangement above avoids. Add `--base` to buy back the legible half.
 
@@ -6727,7 +6727,7 @@ Components: main
 Signed-By: /etc/apt/keyrings/bodega-tailscale_noble.asc
 ```
 
-`bodega doctor --configure apt --suite noble --archive tailscale/noble --apply` writes the second stanza to `/etc/apt/sources.list.d/bodega-tailscale_noble.sources` and the vendor key, served at `/apt/keys/tailscale/noble.asc`, beside it.
+`bodega doctor --configure apt --suite /noble --archive tailscale/noble --apply` writes the second stanza to `/etc/apt/sources.list.d/bodega-tailscale_noble.sources` and the vendor key, served at `/apt/keys/tailscale/noble.asc`, beside it.
 A host keeping its own sources line points it at the archive's root and keeps its `signed-by`:
 
 ```text
@@ -6735,14 +6735,20 @@ deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://bodega
 ```
 
 Every command and query that names a mirrored codename takes `{archive}/{codename}` too: `bodega profile set --base` and `--archives`, `bodega doctor --suite` and `--archive`, and the `codename=`, `archives=` and `archive=` parameters of `/client/plan`.
-A bare codename names the default archive's suite when there is one, and otherwise the one archive mirroring it.
-Mirrored in two or more named archives and in none of the default, a bare codename names none of them, and is refused with the qualified forms that would:
+`/{codename}` names the default archive's suite, the one served at `/apt/dists/{codename}/`.
+A bare codename names the one archive mirroring it.
+Mirrored in two or more archives, the default archive among them, a bare codename names none of them, and is refused with the forms that would:
 
 ```text
-apt codename "noble" is mirrored in 2 archives, so it names none of them: write one of tailscale/noble, ubuntu/noble
+apt codename "noble" is mirrored in 2 archives, so it names none of them: write one of /noble, tailscale/noble (/noble is the default archive's, served at /apt/dists/noble/)
 ```
 
+So once `tailscale/noble` is configured, `--suite noble` and `codename=noble` are refused on that server; write `--suite /noble` for Ubuntu's.
+A value already stored, such as a profile's base, keeps naming the suite it named when it was written.
+
 `{archive}/{codename}` also names a codename listed in `apt_archives`, so `ubuntu/noble` answers for `noble` in `apt_archives.ubuntu`.
+Pockets are read the same way: a base and its `-updates` and `-security` pockets are one choice when they are in one archive, whichever of the two spellings each key uses, and never across archives.
+A profile's filtered codename is served under its base's archive, so `web` over `noble` and `security-web` over `ports/noble` both derive `noble-security-web` and are both served, one at `/apt/dists/` and one at `/apt/ports/dists/`; two profiles deriving one codename in one archive are both withdrawn, and the server log names the pair.
 Config load refuses one (archive, codename) pair given twice, naming both spellings: `debian/trixie` beside `trixie` listed in `apt_archives.debian` is refused.
 A hide set with `bodega pkg hide` on a version found only in `tailscale/noble` applies in the `tailscale` archive and leaves Ubuntu's build of the same name and version served.
 The OSV gate checks a mirrored suite against the release its key names, so `tailscale/noble` is recorded as not checked rather than checked against Ubuntu's advisories, which do not cover a vendor's build.

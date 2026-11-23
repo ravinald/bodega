@@ -1434,6 +1434,9 @@ func ProfileAptCodename(base, profile string) string {
 // collision with a generated suite, whose Release this one would shadow in
 // handleAptDists; and a collision with a mirrored codename, where a proxied
 // dists/ tree wins the route and the filtered index is generated for nobody.
+// The last two are collisions within the base's archive, where the filtered
+// codename is served, and with the apt_upstreams key spelled as the filtered
+// one's AptSuiteKey, since one map holds both indexes.
 // Each is a profile rename or an apt_upstreams key rename, so the error names
 // the pair that produced it.
 func (c *Config) ValidateProfileAptCodename(codename, base, profile string) error {
@@ -1441,12 +1444,13 @@ func (c *Config) ValidateProfileAptCodename(codename, base, profile string) erro
 		return fmt.Errorf("profile %q over base %q derives the codename %q, which must match %s — rename the profile to a lowercase word",
 			profile, base, codename, aptCodenamePattern)
 	}
-	if c.ServesAptSuite(codename) {
+	archive := c.AptArchiveOf(base)
+	if archive == "" && c.ServesAptSuite(codename) {
 		return fmt.Errorf("profile %q over base %q derives the codename %q, which apt_suites already serves: one URL serves one Release, and the generated suite owns it",
 			profile, base, codename)
 	}
-	_, mirroredBeside := c.AptSuiteAt(c.AptArchiveOf(base), codename)
-	if c.MirrorsAptCodename(codename) || mirroredBeside {
+	_, mirroredBeside := c.AptSuiteAt(archive, codename)
+	if c.MirrorsAptCodename(AptSuiteKey(archive, codename)) || mirroredBeside {
 		return fmt.Errorf("profile %q over base %q derives the codename %q, which apt_upstreams already mirrors: the proxied dists/ tree wins the route and the filtered index would be generated for nobody",
 			profile, base, codename)
 	}
@@ -1537,23 +1541,58 @@ func (c *Config) AptSuiteAt(archive, codename string) (string, bool) {
 	return "", false
 }
 
-// AptQualifiedName is how an operator names a mirrored suite unambiguously:
-// {archive}/{codename} in a named archive, the bare codename in the default
-// one.
-func (c *Config) AptQualifiedName(key string) string {
-	if archive := c.AptArchiveOf(key); archive != "" {
-		return archive + "/" + AptCodenameOf(key)
+// AptSuiteKey is the one string an (archive, codename) pair is held under in
+// a map: the codename in the default archive, {archive}/{codename} in a named
+// one. It is the apt_upstreams key for a pair keyed qualified, and the key a
+// profile's filtered codename is held under; a mirrored codename listed in
+// apt_archives keeps its bare apt_upstreams key, which AptSuiteAt returns.
+func AptSuiteKey(archive, codename string) string {
+	if archive == "" {
+		return codename
 	}
-	return key
+	return archive + "/" + codename
+}
+
+// AptQualifiedName is how an operator names a mirrored suite unambiguously:
+// {archive}/{codename} in a named archive. In the default archive it is the
+// bare codename while no other archive mirrors that codename, and
+// /{codename} once one does, since the bare codename then names none of them.
+func (c *Config) AptQualifiedName(key string) string {
+	codename := AptCodenameOf(key)
+	if archive := c.AptArchiveOf(key); archive != "" {
+		return archive + "/" + codename
+	}
+	if len(c.AptKeysMirroring(codename)) > 1 {
+		return "/" + codename
+	}
+	return codename
+}
+
+// AptKeysMirroring lists the apt_upstreams keys mirroring codename, in every
+// archive, sorted.
+func (c *Config) AptKeysMirroring(codename string) []string {
+	var keys []string
+	for _, key := range c.MirroredAptCodenames() {
+		if AptCodenameOf(key) == codename {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 // ResolveAptSuite turns a codename an operator typed, on a command line or in
 // a config field, into the apt_upstreams key it names. {archive}/{codename}
-// names that pair whichever way the config spells it. A bare codename names
-// the default archive's when there is one, and otherwise the one archive
-// mirroring it; mirrored in several named archives, it names none of them and
-// is refused with the spellings that would. A name nothing mirrors comes back
+// names that pair whichever way the config spells it, and /{codename} names
+// the default archive's. A bare codename names the one archive mirroring it;
+// mirrored in several, the default archive among them, it names none of them
+// and is refused with the spellings that would, since preferring one would
+// point a host at a publisher nobody chose. A name nothing mirrors comes back
 // unchanged, for the caller's own refusal or for a generated suite.
+//
+// A stored apt_upstreams key is not operator input: resolving the bare key of
+// the default archive's noble refuses once a vendor mirrors noble too.
+// Callers holding a key compare it as one, and AptQualifiedName writes it
+// back out in a spelling this function resolves to the same key.
 func (c *Config) ResolveAptSuite(name string) (string, error) {
 	if archive, codename, ok := strings.Cut(name, "/"); ok {
 		if key, found := c.AptSuiteAt(archive, codename); found {
@@ -1561,15 +1600,7 @@ func (c *Config) ResolveAptSuite(name string) (string, error) {
 		}
 		return name, nil
 	}
-	if c.MirrorsAptCodename(name) && c.AptArchiveOf(name) == "" {
-		return name, nil
-	}
-	var keys []string
-	for _, key := range c.MirroredAptCodenames() {
-		if AptCodenameOf(key) == name {
-			keys = append(keys, key)
-		}
-	}
+	keys := c.AptKeysMirroring(name)
 	switch len(keys) {
 	case 0:
 		return name, nil
@@ -1581,8 +1612,12 @@ func (c *Config) ResolveAptSuite(name string) (string, error) {
 		qualified[i] = c.AptQualifiedName(key)
 	}
 	slices.Sort(qualified)
-	return "", fmt.Errorf("apt codename %q is mirrored in %d archives, so it names none of them: write one of %s",
-		name, len(keys), strings.Join(qualified, ", "))
+	var root string
+	if slices.Contains(qualified, "/"+name) {
+		root = fmt.Sprintf(" (/%s is the default archive's, served at /apt/dists/%s/)", name, name)
+	}
+	return "", fmt.Errorf("apt codename %q is mirrored in %d archives, so it names none of them: write one of %s%s",
+		name, len(keys), strings.Join(qualified, ", "), root)
 }
 
 func orNoneList(items []string) string {

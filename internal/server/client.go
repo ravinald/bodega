@@ -131,7 +131,7 @@ const (
 
 var (
 	clientABIRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:._-]{0,63}$`)
-	clientCodenameRe = regexp.MustCompile(`^(?:[A-Za-z][A-Za-z0-9_-]*/)?[a-z0-9][a-z0-9.+-]{0,63}$`)
+	clientCodenameRe = regexp.MustCompile(`^(?:(?:[A-Za-z][A-Za-z0-9_-]*)?/)?[a-z0-9][a-z0-9.+-]{0,63}$`)
 )
 
 func parseClientQuery(r *http.Request) (clientQuery, error) {
@@ -644,13 +644,13 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		src = &rendered
 	} else {
 		filtered := map[string]bool{}
-		for _, c := range st.Filtered {
-			filtered[c] = true
+		for _, key := range st.Filtered {
+			filtered[key] = true
 		}
 		var choices []aptsources.Sources
 		var keys, names []string
 		for _, served := range st.Sources {
-			if served.Suite == "" || filtered[served.Suite] {
+			if served.Suite == "" || filtered[config.AptSuiteKey(served.Archive, served.Suite)] {
 				continue
 			}
 			key := s.aptSourceKey(served)
@@ -755,18 +755,66 @@ func (s *Server) aptArchiveFile(h *clientHost, codename string) clientconf.File 
 
 // aptPocketBase names the mirrored base a mirrored suite is a pocket of. A
 // pocket whose base this server does not mirror belongs to nothing and stays a
-// choice of its own.
+// choice of its own. It is the inverse of aptMirroredPockets: a suite is a
+// pocket of base exactly when base lists it.
 func (s *Server) aptPocketBase(suite string) (string, bool) {
 	if !s.cfg.MirrorsAptCodename(suite) {
 		return "", false
 	}
-	return clientconf.AptPocketBase(suite, s.cfg.MirrorsAptCodename)
+	archive := s.cfg.AptArchiveOf(suite)
+	var base string
+	clientconf.AptPocketBase(config.AptCodenameOf(suite), func(codename string) bool {
+		if key, ok := s.cfg.AptSuiteAt(archive, codename); ok {
+			base = key
+			return true
+		}
+		if keys := s.cfg.AptKeysMirroring(codename); len(keys) == 1 {
+			base = keys[0]
+			return true
+		}
+		return false
+	})
+	if base == "" || !slices.Contains(s.aptMirroredPockets(base), suite) {
+		return "", false
+	}
+	return base, true
 }
 
-// aptMirroredPockets lists the pockets of base this server mirrors, in
-// clientconf.AptPockets order.
+// aptMirroredPockets lists the apt_upstreams keys of the pockets of base this
+// server mirrors, in clientconf.AptPockets order.
+//
+// A pocket is a suite of base's distribution, which is not always base's
+// archive: Debian publishes trixie-security under its own root, so an
+// operator lists it in an archive of its own. The pocket in base's own
+// archive is the one read. A pocket in another archive is read only while
+// base is the one key mirroring its codename and the pocket's archive holds
+// no base of that codename, since otherwise a vendor's noble would claim
+// Ubuntu's noble-security, or Ubuntu's noble a vendor's.
 func (s *Server) aptMirroredPockets(base string) []string {
-	return clientconf.AptPockets(base, s.cfg.MirrorsAptCodename)
+	archive, codename := s.cfg.AptArchiveOf(base), config.AptCodenameOf(base)
+	sole := len(s.cfg.AptKeysMirroring(codename)) == 1
+	var out []string
+	clientconf.AptPockets(codename, func(pocket string) bool {
+		if key, ok := s.cfg.AptSuiteAt(archive, pocket); ok {
+			out = append(out, key)
+			return true
+		}
+		if !sole {
+			return false
+		}
+		var found []string
+		for _, key := range s.cfg.AptKeysMirroring(pocket) {
+			if _, home := s.cfg.AptSuiteAt(s.cfg.AptArchiveOf(key), codename); !home {
+				found = append(found, key)
+			}
+		}
+		if len(found) != 1 {
+			return false
+		}
+		out = append(out, found[0])
+		return true
+	})
+	return out
 }
 
 // aptPocketStanza renders a mirrored base and its pockets as one choice, in

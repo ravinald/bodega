@@ -495,9 +495,17 @@ func TestAptUpstreamsQualifiedKeyMirrorsCodenameInItsArchive(t *testing.T) {
 	if got := cfg.AptArchiveNames(); !slices.Equal(got, []string{"debian", "tailscale"}) {
 		t.Errorf("AptArchiveNames = %v, want the apt_archives key and the qualified key's archive", got)
 	}
-	for in, want := range map[string]string{"noble": "noble", "tailscale/noble": "tailscale/noble", "trixie": "trixie", "debian/trixie": "trixie", "jammy": "jammy"} {
+	for in, want := range map[string]string{"/noble": "noble", "tailscale/noble": "tailscale/noble", "trixie": "trixie", "debian/trixie": "trixie", "jammy": "jammy"} {
 		if got, err := cfg.ResolveAptSuite(in); err != nil || got != want {
 			t.Errorf("ResolveAptSuite(%q) = %q %v, want %q", in, got, err, want)
+		}
+	}
+	if got, err := cfg.ResolveAptSuite("noble"); err == nil || !strings.Contains(err.Error(), "/noble, tailscale/noble") {
+		t.Errorf("ResolveAptSuite(noble) = %q %v, want a refusal listing /noble, tailscale/noble", got, err)
+	}
+	for key, want := range map[string]string{"noble": "/noble", "tailscale/noble": "tailscale/noble", "trixie": "debian/trixie"} {
+		if got := cfg.AptQualifiedName(key); got != want {
+			t.Errorf("AptQualifiedName(%q) = %q, want %q", key, got, want)
 		}
 	}
 }
@@ -559,5 +567,23 @@ func TestResolveAptSuiteRefusesAmbiguousBareCodename(t *testing.T) {
 	}
 	if got, err := cfg.ResolveAptSuite("ubuntu/noble"); err != nil || got != "noble" {
 		t.Errorf("ResolveAptSuite(ubuntu/noble) = %q %v, want the bare key", got, err)
+	}
+}
+
+func TestReviewF122DefaultArchiveAmbiguity(t *testing.T) {
+	writeAptConfig(t, map[string]any{
+		"apt_codename": "house",
+		"apt_upstreams": map[string]any{
+			"noble":        []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}},
+			"vendor/noble": []any{map[string]string{"url": "https://vendor.example/ubuntu"}},
+		},
+	})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cfg.ResolveAptSuite("noble")
+	if err == nil || !strings.Contains(err.Error(), "vendor/noble") {
+		t.Fatalf("ResolveAptSuite(noble) = %q, %v; want ambiguity refusal naming vendor/noble", got, err)
 	}
 }

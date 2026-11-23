@@ -184,10 +184,12 @@ configured. Repeat it for several. A vendor whose suite is the
 distribution's codename is mirrored under its own archive and named
 {archive}/{codename}: --archive tailscale/noble writes
 bodega-tailscale_noble.sources, reading noble from /apt/tailscale/ with
-its own key, beside the host's Ubuntu noble.
+its own key, beside the host's Ubuntu noble. With noble mirrored in two
+archives a bare noble names neither: --suite /noble is the default
+archive's, served at /apt/dists/noble/.
 
   bodega doctor --configure apt --suite noble --archive stable --url https://bodega.internal
-  bodega doctor --configure apt --suite noble --archive tailscale/noble --url https://bodega.internal
+  bodega doctor --configure apt --suite /noble --archive tailscale/noble --url https://bodega.internal
 
 --abi is the pkg ABI the freebsd system is configured for, "pkg config abi"
 on a FreeBSD host by default. The tags the pkg override disables follow the

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -184,7 +185,7 @@ func pairVendorServer(t *testing.T) (*Server, *profileFixture, *vendorKeyHost) {
 // at /apt/, and the key that Signed-By: names is the vendor's.
 func TestClientPlanQualifiedVendorArchive(t *testing.T) {
 	s, f, vendor := pairVendorServer(t)
-	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=noble&archives="+vendorNoble), manifest.TypeApt)
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=/noble&archives="+vendorNoble), manifest.TypeApt)
 	paths := make([]string, len(recs))
 	for i, r := range recs {
 		paths[i] = r.Path
@@ -218,5 +219,105 @@ func TestClientPlanRefusesAmbiguousBareCodename(t *testing.T) {
 	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=ubuntu/noble"), manifest.TypeApt)
 	if len(recs) == 0 || !strings.Contains(fetchRecord(t, s, f.token, recs[0]), "URIs: http://bodega.example.com:8080/apt/ubuntu/\nSuites: noble\n") {
 		t.Errorf("codename=ubuntu/noble does not plan Ubuntu's noble at /apt/ubuntu/: %+v", recs)
+	}
+}
+
+func TestReviewF122MixedSpellingKeepsSecurityPocket(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "http://bodega.example.com:8080"
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"noble":                 {{URL: "https://archive.ubuntu.com/ubuntu"}},
+		"ubuntu/noble-security": {{URL: "https://security.ubuntu.com/ubuntu"}},
+	}
+	s.cfg.AptArchives = map[string][]string{"ubuntu": {"noble"}}
+	f := clientProfile(t, s)
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=ubuntu/noble"), manifest.TypeApt)
+	if len(recs) == 0 {
+		t.Fatal("no apt stanza")
+	}
+	got := fetchRecord(t, s, f.token, recs[0])
+	if !strings.Contains(got, "Suites: noble noble-security\n") {
+		t.Fatalf("same-archive security pocket missing from client stanza:\n%s", got)
+	}
+}
+
+func TestReviewF122FilteredCodenamesInDifferentArchives(t *testing.T) {
+	s, _, _ := noblePairServer(t)
+	s.cfg.AptUpstreams["ports/noble"] = s.cfg.AptUpstreams[vendorNoble]
+	delete(s.cfg.AptUpstreams, vendorNoble)
+	kr, err := aptsign.Generate("ubuntu security", "security@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := fixtureDistsFor(t, kr, "noble-security", fixturePackages(fixtureDeb, fixtureDebBody), "amd64")
+	security := newFixtureArchive(t, objects)
+	s.cfg.AptUpstreams["noble-security"] = []config.AptUpstream{{URL: security.URL()}}
+	aptProfileBindBase(t, s, "web", "noble", audit.ExpansionBlock, "nginx")
+	aptProfileBindBase(t, s, "security-web", "ports/noble", audit.ExpansionBlock, "nginx")
+	for _, root := range []string{"/apt/", "/apt/ports/"} {
+		path := root + "dists/noble-security-web/" + packagesPath
+		if code, body := mirrorGet(t, s, path); code != http.StatusOK || !strings.Contains(string(body), "Package: nginx\n") {
+			t.Errorf("GET %s = %d %s; want its own profile index", path, code, body)
+		}
+	}
+}
+
+// F122 requirement 2: the inverse of the mixed spelling above, a qualified
+// base whose pocket is listed bare in apt_archives, is one choice too.
+func TestMixedSpellingQualifiedBaseKeepsBarePocket(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "http://bodega.example.com:8080"
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"ubuntu/noble":   {{URL: "https://archive.ubuntu.com/ubuntu"}},
+		"noble-security": {{URL: "https://security.ubuntu.com/ubuntu"}},
+	}
+	s.cfg.AptArchives = map[string][]string{"ubuntu": {"noble-security"}}
+	if base, ok := s.aptPocketBase("noble-security"); !ok || base != "ubuntu/noble" {
+		t.Errorf("aptPocketBase(noble-security) = %q %v, want ubuntu/noble", base, ok)
+	}
+	f := clientProfile(t, s)
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&codename=ubuntu/noble"), manifest.TypeApt)
+	if len(recs) == 0 {
+		t.Fatal("no apt stanza")
+	}
+	if got := fetchRecord(t, s, f.token, recs[0]); !strings.Contains(got, "URIs: http://bodega.example.com:8080/apt/ubuntu/\n") ||
+		!strings.Contains(got, "Suites: noble noble-security\n") {
+		t.Fatalf("same-archive pocket missing from client stanza:\n%s", got)
+	}
+}
+
+// F122 requirement 2: with noble mirrored in the default archive and in a
+// vendor's, a plan naming bare noble is refused with both spellings, and a
+// stored default-archive key is written back as /noble so it resolves again.
+func TestClientPlanRefusesBareCodenameBesideDefault(t *testing.T) {
+	s, f, _ := pairVendorServer(t)
+	code, body := clientGet(t, s, f.token, "/client/plan?os=linux&codename=noble")
+	if code == http.StatusOK || !strings.Contains(body, "/noble, vendor/noble") {
+		t.Errorf("GET /client/plan?codename=noble = %d %s; want a refusal listing /noble, vendor/noble", code, body)
+	}
+	if got := s.aptSuiteParam("noble"); got != "/noble" {
+		t.Errorf("aptSuiteParam(noble) = %q, want /noble", got)
+	}
+}
+
+// F122 requirement 2: a vendor's noble beside Ubuntu's claims none of
+// Ubuntu's pockets, and Ubuntu's claims none of the vendor's.
+func TestPocketsStayWithTheirOwnBase(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"noble":                  {{URL: "https://archive.ubuntu.com/ubuntu"}},
+		"noble-security":         {{URL: "https://security.ubuntu.com/ubuntu"}},
+		"vendor/noble":           {{URL: "https://vendor.example/ubuntu"}},
+		"vendor/noble-backports": {{URL: "https://vendor.example/ubuntu"}},
+	}
+	for base, want := range map[string]string{"noble": "noble-security", "vendor/noble": "vendor/noble-backports"} {
+		if got := s.aptMirroredPockets(base); !slices.Equal(got, []string{want}) {
+			t.Errorf("aptMirroredPockets(%s) = %v, want [%s]", base, got, want)
+		}
+	}
+	for pocket, want := range map[string]string{"noble-security": "noble", "vendor/noble-backports": "vendor/noble"} {
+		if got, ok := s.aptPocketBase(pocket); !ok || got != want {
+			t.Errorf("aptPocketBase(%s) = %q %v, want %s", pocket, got, ok, want)
+		}
 	}
 }
