@@ -876,6 +876,10 @@ type aptPoolIndex struct {
 	// or one it carried from, read a body for. A 404 for one of them is a
 	// failed read rather than an architecture the root does not serve.
 	indexed map[string]bool
+	// owners is, per triple in indexed, the configured suite whose Packages it
+	// is. The triple's spelling cannot say: a qualified suite stable/noble
+	// writes triples that begin with the bare suite stable's prefix.
+	owners map[string]string
 	// acquired is, per triple in indexed, when bodega read from upstream the
 	// Packages this index or one it carried from parsed for it. at is when
 	// the build ran, which says nothing about how old its documents were.
@@ -911,10 +915,11 @@ func (d aptPoolDocument) supersedes(held aptPoolDocument) bool {
 	return d.at.After(held.at)
 }
 
-// read records one Packages of triple read from upstream at at and returns
-// the add that files its paragraphs both in the document and in the index.
-func (idx *aptPoolIndex) read(triple string, at time.Time) func(key string, st aptPoolStanza) {
-	idx.acquire(triple, at)
+// read records one Packages of codename's triple read from upstream at at and
+// returns the add that files its paragraphs both in the document and in the
+// index.
+func (idx *aptPoolIndex) read(codename, triple string, at time.Time) func(key string, st aptPoolStanza) {
+	idx.acquire(codename, triple, at)
 	doc := idx.documents[triple]
 	if doc == nil {
 		doc = map[string]aptPoolStanza{}
@@ -936,17 +941,17 @@ func (idx *aptPoolIndex) documentsOf(codename, archive string) map[string]aptPoo
 		return docs
 	}
 	for triple := range idx.indexed {
-		if strings.HasPrefix(triple, codename+"/") {
+		if idx.owners[triple] == codename {
 			docs[triple] = aptPoolDocument{triple: triple, stanzas: idx.documents[triple], at: idx.acquired[triple]}
 		}
 	}
 	return docs
 }
 
-// carryDocuments adds docs, newest upstream read first, so that where two
-// triples of one codename name a path, add keeps the paragraph of the one
-// read more recently.
-func (idx *aptPoolIndex) carryDocuments(docs map[string]aptPoolDocument) {
+// carryDocuments adds codename's docs, newest upstream read first, so that
+// where two triples of one codename name a path, add keeps the paragraph of
+// the one read more recently.
+func (idx *aptPoolIndex) carryDocuments(codename string, docs map[string]aptPoolDocument) {
 	ordered := make([]aptPoolDocument, 0, len(docs))
 	for _, d := range docs {
 		ordered = append(ordered, d)
@@ -958,17 +963,21 @@ func (idx *aptPoolIndex) carryDocuments(docs map[string]aptPoolDocument) {
 		return ordered[i].triple < ordered[j].triple
 	})
 	for _, d := range ordered {
-		add := idx.read(d.triple, d.at)
+		add := idx.read(codename, d.triple, d.at)
 		for k, st := range d.stanzas {
 			add(k, st)
 		}
 	}
 }
 
-// acquire records that the Packages of triple read from upstream at at went
-// into idx.
-func (idx *aptPoolIndex) acquire(triple string, at time.Time) {
+// acquire records that the Packages of codename's triple read from upstream at
+// at went into idx.
+func (idx *aptPoolIndex) acquire(codename, triple string, at time.Time) {
+	if idx.owners == nil {
+		idx.owners = map[string]string{}
+	}
 	idx.indexed[triple] = true
+	idx.owners[triple] = codename
 	if at.After(idx.acquired[triple]) {
 		idx.acquired[triple] = at
 	}
@@ -979,7 +988,7 @@ func (idx *aptPoolIndex) acquire(triple string, at time.Time) {
 func (idx *aptPoolIndex) acquiredFor(codename string) time.Time {
 	var newest time.Time
 	for triple, at := range idx.acquired {
-		if strings.HasPrefix(triple, codename+"/") && at.After(newest) {
+		if idx.owners[triple] == codename && at.After(newest) {
 			newest = at
 		}
 	}
@@ -1103,7 +1112,7 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, prev *aptPoolIndex) *aptPoolIndex {
 	idx := &aptPoolIndex{ident: s.aptPoolIndexIdent(codenames), byKey: map[string]aptPoolStanza{},
 		shadow: map[string][]aptPoolStanza{}, conflicts: map[string]aptPoolConflict{}, archives: map[string]string{},
-		indexed: map[string]bool{}, acquired: map[string]time.Time{}, documents: map[string]map[string]aptPoolStanza{},
+		indexed: map[string]bool{}, owners: map[string]string{}, acquired: map[string]time.Time{}, documents: map[string]map[string]aptPoolStanza{},
 		at: time.Now(), ttl: s.cache.MetadataTTL}
 	if idx.ttl <= 0 {
 		idx.ttl = aptRouteTTL
@@ -1120,7 +1129,7 @@ func (s *Server) buildAptPoolIndexFrom(ctx context.Context, codenames []string, 
 		if err != nil {
 			idx.failed = append(idx.failed, err.Error())
 		}
-		idx.carryDocuments(s.aptServed.choose(prev, c, archive, current, err == nil))
+		idx.carryDocuments(c, s.aptServed.choose(prev, c, archive, current, err == nil))
 		if err == nil {
 			s.aptServed.forget(c, idx)
 		}
