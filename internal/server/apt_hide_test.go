@@ -617,7 +617,7 @@ func BenchmarkAptMirrorRewrite(b *testing.B) {
 		body.WriteString(hideStanza(fmt.Sprintf("pkg%05d", i), "1.0-1", "amd64"))
 	}
 	s, _ := hideGroupServer(b, map[string]map[string]string{hideGroupBase: {"amd64": body.String()}})
-	hidden := aptMirrorHides{"pkg00042": {"1.0-1": true}}
+	hidden := aptHidesByArchive{"": {"pkg00042": {"1.0-1": true}}}
 	now := time.Now().UTC()
 	ctx := context.Background()
 

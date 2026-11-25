@@ -54,8 +54,9 @@ func (c *aptVendorKeys) put(k config.AptSigningKey, armored []byte) {
 	c.keys[k] = armored
 }
 
-// handleAptVendorKey serves GET /apt/keys/{file}, the vendor key a mirrored
-// codename's InRelease is signed with, as <codename>.asc.
+// handleAptVendorKey serves GET /apt/keys/{file...}, the vendor key a mirrored
+// codename's InRelease is signed with, as <codename>.asc, or
+// <archive>/<codename>.asc for an apt_upstreams key naming its archive.
 //
 // The fingerprint in the config is the trust decision; the URL only says
 // where to look. A key whose primary fingerprint differs is refused with 502

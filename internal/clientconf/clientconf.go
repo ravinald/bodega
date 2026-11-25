@@ -388,16 +388,22 @@ func Apt(src aptsources.Sources) File {
 }
 
 // AptArchiveKeyPath is where a client installs a vendor archive's key, and
-// what that archive's Signed-By: names.
-func AptArchiveKeyPath(codename string) string {
-	return "/etc/apt/keyrings/bodega-" + codename + ".asc"
+// what that archive's Signed-By: names. key is the apt_upstreams key, a bare
+// codename or {archive}/{codename}; the slash becomes an underscore, which no
+// codename carries, so two keys never share a file.
+func AptArchiveKeyPath(key string) string {
+	return "/etc/apt/keyrings/bodega-" + aptArchiveFileStem(key) + ".asc"
 }
 
 // AptArchiveSourcesPath is where a client installs a vendor archive's stanza,
 // beside AptSourcesPath rather than in it, so configuring one archive never
 // rewrites the host's distribution stanza.
-func AptArchiveSourcesPath(codename string) string {
-	return "/etc/apt/sources.list.d/bodega-" + codename + ".sources"
+func AptArchiveSourcesPath(key string) string {
+	return "/etc/apt/sources.list.d/bodega-" + aptArchiveFileStem(key) + ".sources"
+}
+
+func aptArchiveFileStem(key string) string {
+	return strings.ReplaceAll(key, "/", "_")
 }
 
 // AptArchive renders the stanza for a vendor archive bodega mirrors as
@@ -408,26 +414,32 @@ func AptArchive(base, codename string, components []string) File {
 	return AptArchiveIn(base, "", codename, components)
 }
 
-// AptArchiveIn is AptArchive for a codename in the named archive archive
-// (apt_archives), whose URIs: is that archive's root, {base}/apt/{archive}/.
-// "" is the default archive at {base}/apt/.
-func AptArchiveIn(base, archive, codename string, components []string) File {
+// AptArchiveIn is AptArchive for the apt_upstreams key in the named archive
+// archive, whose URIs: is that archive's root, {base}/apt/{archive}/. ""
+// is the default archive at {base}/apt/. A key {archive}/{codename} puts its
+// codename on Suites: and keeps the key in the file names, so a vendor's
+// noble and the distribution's are two stanzas, each with its own Signed-By:.
+func AptArchiveIn(base, archive, key string, components []string) File {
 	root := trim(base) + "/apt/"
 	if archive != "" {
 		root += archive + "/"
+	}
+	codename := key
+	if _, c, ok := strings.Cut(key, "/"); ok {
+		codename = c
 	}
 	stanza := strings.Join([]string{
 		"Types: deb",
 		"URIs: " + root,
 		"Suites: " + codename,
 		"Components: " + strings.Join(aptsources.MirroredComponentList(components), " "),
-		"Signed-By: " + AptArchiveKeyPath(codename),
+		"Signed-By: " + AptArchiveKeyPath(key),
 	}, "\n")
 	return File{
 		System:  manifest.TypeApt,
 		Label:   "Vendor archive sources",
-		Scope:   codename,
-		Paths:   map[string]string{OSLinux: AptArchiveSourcesPath(codename)},
+		Scope:   key,
+		Paths:   map[string]string{OSLinux: AptArchiveSourcesPath(key)},
 		Content: stanza + "\n",
 	}
 }

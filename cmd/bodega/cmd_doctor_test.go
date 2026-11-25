@@ -5066,3 +5066,43 @@ func TestReviewF121MovedArchiveUnderPublicURLPrefix(t *testing.T) {
 		})
 	}
 }
+
+// F122 requirement 3: a host reading Ubuntu's noble from /apt/ and a vendor's
+// noble from /apt/vendor/, each with its own Signed-By:, reads both from the
+// root bodega serves them under, and the row says nothing moved.
+func TestDoctorAptRowAcceptsOneCodenameInTwoArchives(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base := "http://" + r.Host
+		_ = json.NewEncoder(w).Encode(map[string]any{"apt": map[string]any{"sources": []aptsources.Sources{
+			{Suite: "noble", URI: base + "/apt/", Mirrored: true},
+			{Suite: "noble", URI: base + "/apt/vendor/", Archive: "vendor", Mirrored: true},
+		}}})
+	}))
+	t.Cleanup(srv.Close)
+	files := map[string]string{
+		clientconf.AptSourcesPath:                        "Types: deb\nURIs: " + srv.URL + "/apt/\nSuites: noble\nComponents: main\n",
+		clientconf.AptArchiveSourcesPath("vendor/noble"): "Types: deb\nURIs: " + srv.URL + "/apt/vendor/\nSuites: noble\nComponents: main\nSigned-By: " + clientconf.AptArchiveKeyPath("vendor/noble") + "\n",
+	}
+	for rel, body := range files {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &aptSourcesHost{goos: "linux", root: root}
+	ok := host.Finding{Check: "apt-sources", Status: host.StatusOK}
+	if got := h.rootFinding(ok, srv.URL, aptServedRootsAt(srv.URL, "", true)); got != ok {
+		t.Errorf("row = %+v, want it unchanged: both sources read noble where bodega serves it", got)
+	}
+	if err := os.WriteFile(filepath.Join(root, clientconf.AptArchiveSourcesPath("vendor/noble")),
+		[]byte("Types: deb\nURIs: "+srv.URL+"/apt/other/\nSuites: noble\nComponents: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.rootFinding(ok, srv.URL, aptServedRootsAt(srv.URL, "", true)); got.Status != host.StatusWarn {
+		t.Errorf("a source reading noble from /apt/other/ = %+v, want a WARN naming where bodega serves it", got)
+	}
+}

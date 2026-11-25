@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -47,8 +48,8 @@ func TestAptUpstreamsRejected(t *testing.T) {
 			wantIn:    "invalid apt_upstreams key",
 		},
 		{
-			name:      "codename with a slash would misroute the dists path",
-			upstreams: map[string]any{"noble/updates": []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}}},
+			name:      "codename with a slash after the archive would misroute the dists path",
+			upstreams: map[string]any{"vendor/noble/updates": []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}}},
 			wantIn:    "invalid apt_upstreams key",
 		},
 		{
@@ -450,5 +451,139 @@ func TestAptArchitectures(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// F122 requirement 1: a key {archive}/{codename} mirrors that codename in
+// that archive, beside the same codename in the default archive, and an
+// existing config's bare keys and apt_archives keep their meaning.
+func TestAptUpstreamsQualifiedKeyMirrorsCodenameInItsArchive(t *testing.T) {
+	writeAptConfig(t, map[string]any{
+		"apt_codename": "jammy",
+		"apt_upstreams": map[string]any{
+			"noble":           []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}},
+			"tailscale/noble": []any{map[string]string{"url": "https://pkgs.tailscale.com/stable/ubuntu"}},
+			"trixie":          []any{map[string]string{"url": "https://deb.debian.org/debian"}},
+		},
+		"apt_archives": map[string]any{"debian": []string{"trixie"}},
+	})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatalf("Load refused noble beside tailscale/noble: %v", err)
+	}
+	for key, want := range map[string][2]string{
+		"noble":           {"", "noble"},
+		"tailscale/noble": {"tailscale", "noble"},
+		"trixie":          {"debian", "trixie"},
+	} {
+		if got := [2]string{cfg.AptArchiveOf(key), config.AptCodenameOf(key)}; got != want {
+			t.Errorf("%s: (archive, codename) = %v, want %v", key, got, want)
+		}
+	}
+	for _, tc := range []struct{ archive, codename, want string }{
+		{"", "noble", "noble"},
+		{"tailscale", "noble", "tailscale/noble"},
+		{"debian", "trixie", "trixie"},
+	} {
+		if got, ok := cfg.AptSuiteAt(tc.archive, tc.codename); !ok || got != tc.want {
+			t.Errorf("AptSuiteAt(%q, %q) = %q %v, want %q", tc.archive, tc.codename, got, ok, tc.want)
+		}
+	}
+	if _, ok := cfg.AptSuiteAt("", "trixie"); ok {
+		t.Error("trixie answers in the default archive; apt_archives moved it to debian")
+	}
+	if got := cfg.AptArchiveNames(); !slices.Equal(got, []string{"debian", "tailscale"}) {
+		t.Errorf("AptArchiveNames = %v, want the apt_archives key and the qualified key's archive", got)
+	}
+	for in, want := range map[string]string{"/noble": "noble", "tailscale/noble": "tailscale/noble", "trixie": "trixie", "debian/trixie": "trixie", "jammy": "jammy"} {
+		if got, err := cfg.ResolveAptSuite(in); err != nil || got != want {
+			t.Errorf("ResolveAptSuite(%q) = %q %v, want %q", in, got, err, want)
+		}
+	}
+	if got, err := cfg.ResolveAptSuite("noble"); err == nil || !strings.Contains(err.Error(), "/noble, tailscale/noble") {
+		t.Errorf("ResolveAptSuite(noble) = %q %v, want a refusal listing /noble, tailscale/noble", got, err)
+	}
+	for key, want := range map[string]string{"noble": "/noble", "tailscale/noble": "tailscale/noble", "trixie": "debian/trixie"} {
+		if got := cfg.AptQualifiedName(key); got != want {
+			t.Errorf("AptQualifiedName(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// F122 requirement 1: one (archive, codename) pair given twice is refused at
+// load, naming both spellings.
+func TestAptUpstreamsDuplicatePairRefused(t *testing.T) {
+	writeAptConfig(t, map[string]any{
+		"apt_codename": "jammy",
+		"apt_upstreams": map[string]any{
+			"trixie":        []any{map[string]string{"url": "https://deb.debian.org/debian"}},
+			"debian/trixie": []any{map[string]string{"url": "https://deb.debian.org/debian"}},
+		},
+		"apt_archives": map[string]any{"debian": []string{"trixie"}},
+	})
+	_, err := loadApt(t)
+	if err == nil {
+		t.Fatal("Load accepted debian/trixie beside trixie listed in apt_archives.debian")
+	}
+	for _, want := range []string{`"debian/trixie"`, `"trixie" listed in apt_archives["debian"]`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %s", err, want)
+		}
+	}
+}
+
+// F122 requirement 1: the archive half of a qualified key obeys the rules an
+// apt_archives key does.
+func TestAptUpstreamsQualifiedKeyArchiveRules(t *testing.T) {
+	for _, archive := range []string{"keys", "pool", "9vendor"} {
+		writeAptConfig(t, map[string]any{
+			"apt_codename":  "jammy",
+			"apt_upstreams": map[string]any{archive + "/noble": []any{map[string]string{"url": "https://pkgs.tailscale.com/stable/ubuntu"}}},
+		})
+		if _, err := loadApt(t); err == nil || !strings.Contains(err.Error(), "invalid apt_upstreams key") {
+			t.Errorf("Load of %s/noble = %v, want the archive name refused", archive, err)
+		}
+	}
+}
+
+// F122 requirement 2: a bare codename mirrored in two named archives names
+// neither, and the refusal lists the qualified forms that would.
+func TestResolveAptSuiteRefusesAmbiguousBareCodename(t *testing.T) {
+	writeAptConfig(t, map[string]any{
+		"apt_codename": "jammy",
+		"apt_upstreams": map[string]any{
+			"noble":           []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}},
+			"tailscale/noble": []any{map[string]string{"url": "https://pkgs.tailscale.com/stable/ubuntu"}},
+		},
+		"apt_archives": map[string]any{"ubuntu": []string{"noble"}},
+	})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfg.ResolveAptSuite("noble")
+	if err == nil || !strings.Contains(err.Error(), "tailscale/noble, ubuntu/noble") {
+		t.Fatalf("ResolveAptSuite(noble) = %v, want a refusal listing tailscale/noble, ubuntu/noble", err)
+	}
+	if got, err := cfg.ResolveAptSuite("ubuntu/noble"); err != nil || got != "noble" {
+		t.Errorf("ResolveAptSuite(ubuntu/noble) = %q %v, want the bare key", got, err)
+	}
+}
+
+func TestReviewF122DefaultArchiveAmbiguity(t *testing.T) {
+	writeAptConfig(t, map[string]any{
+		"apt_codename": "house",
+		"apt_upstreams": map[string]any{
+			"noble":        []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}},
+			"vendor/noble": []any{map[string]string{"url": "https://vendor.example/ubuntu"}},
+		},
+	})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cfg.ResolveAptSuite("noble")
+	if err == nil || !strings.Contains(err.Error(), "vendor/noble") {
+		t.Fatalf("ResolveAptSuite(noble) = %q, %v; want ambiguity refusal naming vendor/noble", got, err)
 	}
 }

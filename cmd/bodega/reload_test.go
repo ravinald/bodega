@@ -212,7 +212,12 @@ func TestHideWithdrawsFromServedPackages(t *testing.T) {
 	// Waiting for Start to return keeps this server's SIGHUP handler from
 	// reading the host-path globals while a later cleanup restores them.
 	// Cleanups run LIFO, so this one precedes the restore registered above.
-	t.Cleanup(func() { cancel(); <-serveErr })
+	t.Cleanup(func() {
+		cancel()
+		if err := <-serveErr; err != nil {
+			t.Logf("Start returned %v after cancellation", err)
+		}
+	})
 	go func() { defer close(serveErr); serveErr <- srv.Start(ctx) }()
 
 	packagesURL := fmt.Sprintf("http://127.0.0.1:%d/apt/dists/noble/main/binary-amd64/Packages", port)
@@ -394,7 +399,12 @@ func TestRescanReachesTheServedAPI(t *testing.T) {
 	// Waiting for Start to return keeps this server's SIGHUP handler from
 	// reading the host-path globals while a later cleanup restores them.
 	// Cleanups run LIFO, so this one precedes the restore registered above.
-	t.Cleanup(func() { cancel(); <-serveErr })
+	t.Cleanup(func() {
+		cancel()
+		if err := <-serveErr; err != nil {
+			t.Logf("Start returned %v after cancellation", err)
+		}
+	})
 	go func() { defer close(serveErr); serveErr <- srv.Start(ctx) }()
 
 	versionURL := fmt.Sprintf("http://127.0.0.1:%d/api/v1/packages/npm/minimist/1.2.5", port)

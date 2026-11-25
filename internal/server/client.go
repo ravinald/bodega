@@ -92,6 +92,10 @@ type clientQuery struct {
 	OS       string
 	ABI      string
 	Codename string
+	// codenameParam is how Codename is written back into a URL the plan
+	// hands out: a spelling that resolves to the same apt_upstreams key.
+	// Empty writes Codename.
+	codenameParam string
 	// Release is the FreeBSD major release whose repository tags the pkg
 	// overrides disable, for a host whose release is not the one its
 	// repository is named for. Zero keeps the repository's own.
@@ -127,7 +131,7 @@ const (
 
 var (
 	clientABIRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:._-]{0,63}$`)
-	clientCodenameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.+-]{0,63}$`)
+	clientCodenameRe = regexp.MustCompile(`^(?:(?:[A-Za-z][A-Za-z0-9_-]*)?/)?[a-z0-9][a-z0-9.+-]{0,63}$`)
 )
 
 func parseClientQuery(r *http.Request) (clientQuery, error) {
@@ -191,6 +195,89 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 	return q, nil
 }
 
+// resolveAptQuery rewrites the apt suites a query names, codename, archives
+// and archive alike, to the apt_upstreams keys they resolve to
+// (config.ResolveAptSuite), so the plan compares one spelling of each. A
+// bare codename mirrored in several named archives is refused here.
+func (s *Server) resolveAptQuery(q clientQuery) (clientQuery, error) {
+	var err error
+	if q.Codename, err = s.resolveAptSourceSuite(q.Codename); err != nil {
+		return q, fmt.Errorf("codename=: %w", err)
+	}
+	q.codenameParam = s.aptSuiteParam(q.Codename)
+	if q.Archive, err = s.cfg.ResolveAptSuite(q.Archive); err != nil {
+		return q, fmt.Errorf("archive=: %w", err)
+	}
+	archives := make([]string, 0, len(q.Archives))
+	for _, c := range q.Archives {
+		key, err := s.cfg.ResolveAptSuite(c)
+		if err != nil {
+			return q, fmt.Errorf("archives=: %w", err)
+		}
+		if !slices.Contains(archives, key) {
+			archives = append(archives, key)
+		}
+	}
+	q.Archives = archives
+	return q, nil
+}
+
+// resolveAptSourceSuite is config.ResolveAptSuite for the suite a host's
+// own stanza names, which may also be a generated suite. Generated suites
+// live at the default archive root, so /{codename} names one, and a bare
+// codename both generated and mirrored in a named archive names neither:
+// resolving it to the mirror would move a host that named the generated
+// suite onto a vendor's publisher the moment that vendor is added.
+func (s *Server) resolveAptSourceSuite(name string) (string, error) {
+	codename, rooted := strings.CutPrefix(name, "/")
+	if !s.aptGeneratedSuite(codename) {
+		return s.cfg.ResolveAptSuite(name)
+	}
+	mirrors := s.cfg.AptKeysMirroring(codename)
+	if rooted || len(mirrors) == 0 {
+		return codename, nil
+	}
+	qualified := []string{"/" + codename}
+	for _, key := range mirrors {
+		qualified = append(qualified, s.cfg.AptQualifiedName(key))
+	}
+	return "", fmt.Errorf("apt codename %q is generated at the default archive and mirrored in %d other archives, so it names none of them: write one of %s (/%s is the generated suite, served at /apt/dists/%s/)",
+		codename, len(mirrors), strings.Join(qualified, ", "), codename, codename)
+}
+
+// aptGeneratedSuite reports whether suite is one this server generates
+// rather than mirrors. Load keeps the two sets disjoint.
+func (s *Server) aptGeneratedSuite(suite string) bool {
+	return suite != "" && !strings.Contains(suite, "/") && s.cfg.ServesAptSuite(suite) && !s.cfg.MirrorsAptCodename(suite)
+}
+
+// aptSuiteParam is how a URL names an apt_upstreams key: the key itself when
+// it resolves back to itself, and {archive}/{codename} when the bare codename
+// is mirrored in other archives too. A generated suite sharing its codename
+// with a mirror is /{codename}, the spelling resolveAptSourceSuite reads back
+// as the generated one.
+func (s *Server) aptSuiteParam(key string) string {
+	if s.aptGeneratedSuite(key) {
+		if len(s.cfg.AptKeysMirroring(key)) > 0 {
+			return "/" + key
+		}
+		return key
+	}
+	if back, err := s.cfg.ResolveAptSuite(key); err == nil && back == key {
+		return key
+	}
+	return s.cfg.AptQualifiedName(key)
+}
+
+// aptSourceKey is the apt_upstreams key a rendered sources block serves, or
+// the key its (archive, suite) pair is held under when no key mirrors it.
+func (s *Server) aptSourceKey(src aptsources.Sources) string {
+	if key, ok := s.cfg.AptSuiteAt(src.Archive, src.Suite); ok {
+		return key
+	}
+	return config.AptSuiteKey(src.Archive, src.Suite)
+}
+
 // checkAptArchives refuses a named archive this server cannot configure: one
 // it does not mirror, or mirrors with no vendor key, since a stanza naming a
 // Signed-By: file nothing serves fails every "apt update".
@@ -219,7 +306,9 @@ func (q clientQuery) encode() string {
 	if q.ABI != "" {
 		v.Set("abi", q.ABI)
 	}
-	if q.Codename != "" {
+	if q.codenameParam != "" {
+		v.Set("codename", q.codenameParam)
+	} else if q.Codename != "" {
 		v.Set("codename", q.Codename)
 	}
 	if q.Release != 0 {
@@ -288,6 +377,9 @@ func (s *Server) admitClient(w http.ResponseWriter, r *http.Request, subject str
 // profile and the rule it reports describe one resolution.
 func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject string, m identityMatch) (*clientHost, bool) {
 	q, err := parseClientQuery(r)
+	if err == nil {
+		q, err = s.resolveAptQuery(q)
+	}
 	if err == nil {
 		err = s.checkAptArchives(q)
 	}
@@ -577,6 +669,9 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		if h.q.Codename != "" && h.q.Codename != base {
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and this host reports %s", h.profile.Name(), base, h.q.Codename))
 		}
+		if _, unresolved := s.aptPocketsOf(base); len(unresolved) > 0 {
+			return refuse(fmt.Sprintf("profile %q scopes apt to %s: %s", h.profile.Name(), base, s.aptUnresolvedPocketsReason(base, unresolved)))
+		}
 		suites, missing := s.aptProfileHostSuites(h.profile)
 		if len(suites) == 0 {
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s and no filtered codename answers for it yet; the index rebuild has not produced one", h.profile.Name(), base))
@@ -589,25 +684,33 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		src = &rendered
 	} else {
 		filtered := map[string]bool{}
-		for _, c := range st.Filtered {
-			filtered[c] = true
+		for _, key := range st.Filtered {
+			filtered[key] = true
 		}
 		var choices []aptsources.Sources
-		var names []string
+		var keys, names, unplaced []string
 		for _, served := range st.Sources {
-			if served.Suite == "" || filtered[served.Suite] {
+			if served.Suite == "" || filtered[config.AptSuiteKey(served.Archive, served.Suite)] {
 				continue
 			}
-			if served.Mirrored || s.aptMirrorRewritten(served.Suite) {
-				if _, ok := s.aptPocketBase(served.Suite); ok {
+			key := s.aptSourceKey(served)
+			reason := ""
+			if served.Mirrored || s.aptMirrorRewritten(key) {
+				if _, ok := s.aptPocketBase(key); ok {
 					continue
 				}
-				if pockets := s.aptMirroredPockets(served.Suite); len(pockets) > 0 {
-					served = s.aptPocketStanza(r, served.Suite, pockets)
+				pockets, unresolved := s.aptPocketsOf(key)
+				if len(pockets) > 0 {
+					served = s.aptPocketStanza(r, key, pockets)
+				}
+				if len(unresolved) > 0 {
+					reason = s.aptUnresolvedPocketsReason(key, unresolved)
 				}
 			}
 			choices = append(choices, served)
-			names = append(names, served.Suite)
+			unplaced = append(unplaced, reason)
+			keys = append(keys, key)
+			names = append(names, s.aptSuiteParam(key))
 		}
 		switch {
 		case len(choices) == 0:
@@ -617,7 +720,10 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 				return skip(fmt.Sprintf("%s is a pocket of %s, and pockets are configured together with their base: name %s with %s", h.q.Codename, base, base, clientconf.AptSuiteRemedy(base)))
 			}
 			for i := range choices {
-				if choices[i].Suite == h.q.Codename {
+				if keys[i] == h.q.Codename {
+					if unplaced[i] != "" {
+						return refuse(unplaced[i])
+					}
 					src = &choices[i]
 				}
 			}
@@ -625,6 +731,9 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 				return skip(fmt.Sprintf("this server serves no apt suite named %s. It serves %s: name one with %s", h.q.Codename, strings.Join(names, ", "), clientconf.AptSuiteRemedy("<suite>")))
 			}
 		case len(choices) == 1:
+			if unplaced[0] != "" {
+				return refuse(unplaced[0])
+			}
 			src = &choices[0]
 		default:
 			return skip(clientconf.AptSuiteChoiceReason(names))
@@ -644,16 +753,26 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			content: ring, url: h.base + aptsources.KeyringRoute,
 		})
 	}
-	return append(out, s.planAptArchives(r, h, aptStanzaSuites(src.Deb822))...)
+	return append(out, s.planAptArchives(r, h, aptStanzaSources(src.Deb822))...)
 }
 
-// aptStanzaSuites reads the suites back out of a rendered block, from every
-// stanza's Suites: line.
-func aptStanzaSuites(deb822 string) []string {
-	var out []string
-	for _, line := range strings.Split(deb822, "\n") {
-		if rest, ok := strings.CutPrefix(line, "Suites: "); ok {
-			out = append(out, strings.Fields(rest)...)
+// aptSourcePair is one archive apt indexes: a URI and a suite read from it.
+// apt keys its per-archive options on this pair, so two stanzas naming one
+// pair with different Signed-By: values conflict, and the same suite under
+// another URI is another archive.
+type aptSourcePair struct{ uri, suite string }
+
+// aptStanzaSources reads every (URI, suite) pair a rendered block names, each
+// URI with the trailing slash apt adds to it. A block bodega rendered always
+// parses; one that does not names no pair.
+func aptStanzaSources(deb822 string) map[aptSourcePair]bool {
+	out := map[aptSourcePair]bool{}
+	entries, _ := clientconf.AptStanzaEntries(deb822)
+	for _, e := range entries {
+		for _, uri := range e.URIs {
+			for _, suite := range e.Suites {
+				out[aptSourcePair{strings.TrimSuffix(uri, "/") + "/", suite}] = true
+			}
 		}
 	}
 	return out
@@ -665,15 +784,24 @@ func aptStanzaSuites(deb822 string) []string {
 // serves, so a key that cannot be fetched or fails its fingerprint check
 // refuses the whole system rather than installing a stanza apt cannot verify.
 //
-// An archive already on the host's own stanza is refused: two stanzas naming
-// one suite with different Signed-By: values stop every "apt update" with
-// "Conflicting values set for option Signed-By".
-func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []string) []planFile {
+// An archive already on the host's own stanza, at the same URI and suite, is
+// refused: two stanzas naming one archive with different Signed-By: values
+// stop every "apt update" with "Conflicting values set for option
+// Signed-By". The same codename under another archive root is another
+// archive, with its own key.
+func (s *Server) planAptArchives(r *http.Request, h *clientHost, onHost map[aptSourcePair]bool) []planFile {
 	var out []planFile
 	for _, c := range h.q.Archives {
-		if slices.Contains(mainSuites, c) {
-			return []planFile{{system: manifest.TypeApt, action: planRefuse,
-				reason: fmt.Sprintf("%s is already on this host's apt stanza, so a second stanza for it would conflict on Signed-By; drop it from archives", c)}}
+		f := s.aptArchiveFile(h, c)
+		pairs := aptStanzaSources(f.Content)
+		for pair := range pairs {
+			if onHost[pair] {
+				return []planFile{{system: manifest.TypeApt, action: planRefuse,
+					reason: fmt.Sprintf("%s (suite %s at %s) is already on this host's apt stanza, so a second stanza for it would conflict on Signed-By; drop it from archives", s.aptSuiteParam(c), pair.suite, pair.uri)}}
+			}
+		}
+		for pair := range pairs {
+			onHost[pair] = true
 		}
 		armored, status := s.aptVendorKey(r, c)
 		if armored == nil {
@@ -681,8 +809,7 @@ func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []st
 				reason: fmt.Sprintf("the vendor key for %s could not be served (%d %s); the server log names why", c, status, http.StatusText(status))}}
 		}
 		v, _ := url.ParseQuery(h.q.encode())
-		v.Set("archive", c)
-		f := s.aptArchiveFile(h, c)
+		v.Set("archive", s.aptSuiteParam(c))
 		out = append(out,
 			planFile{system: manifest.TypeApt, action: planInstall, path: f.Path(clientconf.OSLinux),
 				content: []byte(f.Content), url: h.base + "/client/" + manifest.TypeApt + "?" + v.Encode()},
@@ -698,18 +825,96 @@ func (s *Server) aptArchiveFile(h *clientHost, codename string) clientconf.File 
 
 // aptPocketBase names the mirrored base a mirrored suite is a pocket of. A
 // pocket whose base this server does not mirror belongs to nothing and stays a
-// choice of its own.
+// choice of its own. It is the inverse of aptMirroredPockets: a suite is a
+// pocket of base exactly when base lists it.
 func (s *Server) aptPocketBase(suite string) (string, bool) {
 	if !s.cfg.MirrorsAptCodename(suite) {
 		return "", false
 	}
-	return clientconf.AptPocketBase(suite, s.cfg.MirrorsAptCodename)
+	archive := s.cfg.AptArchiveOf(suite)
+	var base string
+	clientconf.AptPocketBase(config.AptCodenameOf(suite), func(codename string) bool {
+		if key, ok := s.cfg.AptSuiteAt(archive, codename); ok {
+			base = key
+			return true
+		}
+		if keys := s.cfg.AptKeysMirroring(codename); len(keys) == 1 {
+			base = keys[0]
+			return true
+		}
+		return false
+	})
+	if base == "" || !slices.Contains(s.aptMirroredPockets(base), suite) {
+		return "", false
+	}
+	return base, true
 }
 
-// aptMirroredPockets lists the pockets of base this server mirrors, in
-// clientconf.AptPockets order.
+// aptMirroredPockets lists the apt_upstreams keys of the pockets of base this
+// server mirrors, in clientconf.AptPockets order. A pocket aptPocketsOf could
+// not place is not among them; a caller building what a host reads asks
+// aptPocketsOf, which names it.
 func (s *Server) aptMirroredPockets(base string) []string {
-	return clientconf.AptPockets(base, s.cfg.MirrorsAptCodename)
+	pockets, _ := s.aptPocketsOf(base)
+	return pockets
+}
+
+// aptPocketsOf lists the apt_upstreams keys of the pockets of base this server
+// mirrors, in clientconf.AptPockets order, and separately the mirrored pockets
+// that may be base's but cannot be placed.
+//
+// A pocket is a suite of base's distribution, which is not always base's
+// archive: Debian publishes trixie-security under its own root, so an
+// operator lists it in an archive of its own. The pocket in base's own
+// archive is the one read. A pocket in another archive is read only while
+// base is the one key mirroring its codename and the pocket's archive holds
+// no base of that codename, since otherwise a vendor's noble would claim
+// Ubuntu's noble-security, or Ubuntu's noble a vendor's.
+//
+// Such a pocket that fails that test is unresolved, not absent. The
+// configuration still serves it and nothing here can say whose it is, so a
+// host plan that dropped it would install a base without its security fixes
+// the moment a vendor of the same codename was added beside it.
+func (s *Server) aptPocketsOf(base string) (pockets, unresolved []string) {
+	archive, codename := s.cfg.AptArchiveOf(base), config.AptCodenameOf(base)
+	sole := len(s.cfg.AptKeysMirroring(codename)) == 1
+	clientconf.AptPockets(codename, func(pocket string) bool {
+		if key, ok := s.cfg.AptSuiteAt(archive, pocket); ok {
+			pockets = append(pockets, key)
+			return true
+		}
+		var found []string
+		for _, key := range s.cfg.AptKeysMirroring(pocket) {
+			if _, home := s.cfg.AptSuiteAt(s.cfg.AptArchiveOf(key), codename); !home {
+				found = append(found, key)
+			}
+		}
+		switch {
+		case len(found) == 0:
+			return false
+		case sole && len(found) == 1:
+			pockets = append(pockets, found[0])
+			return true
+		}
+		unresolved = append(unresolved, found...)
+		return false
+	})
+	return pockets, unresolved
+}
+
+// aptUnresolvedPocketsReason refuses a host plan for base over the pockets
+// aptPocketsOf could not place.
+func (s *Server) aptUnresolvedPocketsReason(base string, unresolved []string) string {
+	names := make([]string, len(unresolved))
+	for i, key := range unresolved {
+		names[i] = s.aptSuiteParam(key)
+	}
+	bases := s.cfg.AptKeysMirroring(config.AptCodenameOf(base))
+	for i, key := range bases {
+		bases[i] = s.aptSuiteParam(key)
+	}
+	return fmt.Sprintf("this server mirrors %s under an archive root apart from %s and cannot tell which of %s it is a pocket of, so a host reading %s alone would stop receiving the updates and security fixes it publishes. Move it into the archive of its base in apt_archives",
+		strings.Join(names, ", "), s.aptSuiteParam(base), strings.Join(bases, ", "), s.aptSuiteParam(base))
 }
 
 // aptPocketStanza renders a mirrored base and its pockets as one choice, in
@@ -752,7 +957,7 @@ func (s *Server) aptStanzas(r *http.Request, suites []string, mirrored bool) apt
 			groups = append(groups, &group{archive: archive, components: components})
 			i = len(groups) - 1
 		}
-		groups[i].suites = append(groups[i].suites, suite)
+		groups[i].suites = append(groups[i].suites, config.AptCodenameOf(suite))
 	}
 	parts := make([]aptsources.Sources, len(groups))
 	for i, g := range groups {

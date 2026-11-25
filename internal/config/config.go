@@ -1322,8 +1322,17 @@ var aptCodenamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 // differ in one character are worse apart than a second short function.
 func validateAptUpstreams(ups map[string][]AptUpstream) error {
 	for codename, list := range ups {
-		if !aptCodenamePattern.MatchString(codename) {
-			return fmt.Errorf("invalid apt_upstreams key %q: must match %s — the key is the suite name apt requests under /apt/dists/", codename, aptCodenamePattern)
+		archive, suite, qualified := strings.Cut(codename, "/")
+		if !qualified {
+			archive, suite = "", codename
+		}
+		if !aptCodenamePattern.MatchString(suite) {
+			return fmt.Errorf("invalid apt_upstreams key %q: must be a codename matching %s, or {archive}/{codename} — the codename is the suite name apt requests under /apt/dists/ or /apt/{archive}/dists/", codename, aptCodenamePattern)
+		}
+		if qualified {
+			if err := validAptArchiveName(archive); err != nil {
+				return fmt.Errorf("invalid apt_upstreams key %q: archive %q %v", codename, archive, err)
+			}
 		}
 		if len(list) == 0 {
 			return fmt.Errorf("apt_upstreams[%q]: names no upstream — remove the key or give it at least one {\"url\": ...}", codename)
@@ -1394,6 +1403,10 @@ func (c *Config) AptComponentsFor(codename string) []string {
 // MirrorsAptCodename reports whether a codename is served from upstream rather
 // than generated. Load guarantees the two sets are disjoint, so a true answer
 // here is also a guarantee that no generated suite answers for it.
+//
+// The argument is the apt_upstreams key: a bare codename, or
+// {archive}/{codename} for one mirrored in a named archive beside another of
+// the same name. ResolveAptSuite turns what an operator typed into that key.
 func (c *Config) MirrorsAptCodename(codename string) bool {
 	_, ok := c.AptUpstreams[codename]
 	return ok
@@ -1406,8 +1419,12 @@ func (c *Config) MirrorsAptCodename(codename string) bool {
 // base is in the name because a profile filters one upstream suite and the
 // operator reading a sources line needs to see which; the profile is in it
 // because two profiles over one base are the ordinary case.
+//
+// A base keyed {archive}/{codename} derives from its codename: the filtered
+// suite is served under the base's archive root, where the archive is already
+// in the URL.
 func ProfileAptCodename(base, profile string) string {
-	return base + "-" + profile
+	return AptCodenameOf(base) + "-" + profile
 }
 
 // ValidateProfileAptCodename reports whether a derived codename can be served
@@ -1417,6 +1434,9 @@ func ProfileAptCodename(base, profile string) string {
 // collision with a generated suite, whose Release this one would shadow in
 // handleAptDists; and a collision with a mirrored codename, where a proxied
 // dists/ tree wins the route and the filtered index is generated for nobody.
+// The last two are collisions within the base's archive, where the filtered
+// codename is served, and with the apt_upstreams key spelled as the filtered
+// one's AptSuiteKey, since one map holds both indexes.
 // Each is a profile rename or an apt_upstreams key rename, so the error names
 // the pair that produced it.
 func (c *Config) ValidateProfileAptCodename(codename, base, profile string) error {
@@ -1424,11 +1444,13 @@ func (c *Config) ValidateProfileAptCodename(codename, base, profile string) erro
 		return fmt.Errorf("profile %q over base %q derives the codename %q, which must match %s — rename the profile to a lowercase word",
 			profile, base, codename, aptCodenamePattern)
 	}
-	if c.ServesAptSuite(codename) {
+	archive := c.AptArchiveOf(base)
+	if archive == "" && c.ServesAptSuite(codename) {
 		return fmt.Errorf("profile %q over base %q derives the codename %q, which apt_suites already serves: one URL serves one Release, and the generated suite owns it",
 			profile, base, codename)
 	}
-	if c.MirrorsAptCodename(codename) {
+	_, mirroredBeside := c.AptSuiteAt(archive, codename)
+	if c.MirrorsAptCodename(AptSuiteKey(archive, codename)) || mirroredBeside {
 		return fmt.Errorf("profile %q over base %q derives the codename %q, which apt_upstreams already mirrors: the proxied dists/ tree wins the route and the filtered index would be generated for nobody",
 			profile, base, codename)
 	}
@@ -1446,39 +1468,156 @@ func (c *Config) MirroredAptCodenames() []string {
 	return out
 }
 
+// validAptArchiveName refuses an archive name the URL or the storage tree
+// already uses. The error reads after the name it is about.
+func validAptArchiveName(name string) error {
+	if !upstreamNamespacePattern.MatchString(name) {
+		return fmt.Errorf("must match %s — an archive is a URL segment under /apt/ and a directory under packages/apt/", upstreamNamespacePattern)
+	}
+	reason, reserved := reservedPathElements[name]
+	if name == "keys" {
+		reason, reserved = "served route (/apt/keys/ serves the vendor signing keys)", true
+	}
+	if reserved {
+		return fmt.Errorf("is reserved (%s) — rename the archive", reason)
+	}
+	return nil
+}
+
 // validateAptArchives refuses an apt_archives block that names something the
-// URL or the storage tree already uses, or a codename it cannot place in
-// exactly one archive. It runs after apt_upstreams and apt_suites are settled,
-// since both are what a codename is checked against.
+// URL or the storage tree already uses, a codename it cannot place in
+// exactly one archive, or an (archive, codename) pair an apt_upstreams key
+// already mirrors as {archive}/{codename}. It runs after apt_upstreams and
+// apt_suites are settled, since both are what a codename is checked against.
 func (c *Config) validateAptArchives() error {
-	names := c.AptArchiveNames()
+	names := slices.Sorted(maps.Keys(c.AptArchives))
 	owner := map[string]string{}
 	for _, name := range names {
-		if !upstreamNamespacePattern.MatchString(name) {
-			return fmt.Errorf("invalid apt_archives key %q: must match %s — the key is a URL segment under /apt/ and a directory under packages/apt/", name, upstreamNamespacePattern)
-		}
-		reason, reserved := reservedPathElements[name]
-		if name == "keys" {
-			reason, reserved = "served route (/apt/keys/ serves the vendor signing keys)", true
-		}
-		if reserved {
-			return fmt.Errorf("invalid apt_archives key %q: reserved (%s) — rename the archive", name, reason)
+		if err := validAptArchiveName(name); err != nil {
+			return fmt.Errorf("invalid apt_archives key %q: %v", name, err)
 		}
 		for _, codename := range c.AptArchives[name] {
 			switch {
+			case strings.Contains(codename, "/"):
+				return fmt.Errorf("apt_archives[%q]: %q is a qualified apt_upstreams key, which names its archive itself — list bare codenames here, or drop it from the archive", name, codename)
 			case c.ServesAptSuite(codename):
 				return fmt.Errorf("apt_archives[%q]: %q is a generated suite from apt_suites: bodega builds and signs it under /apt/dists/, and an archive groups only codenames apt_upstreams mirrors — remove it from the archive", name, codename)
 			case !c.MirrorsAptCodename(codename):
 				return fmt.Errorf("apt_archives[%q]: codename %q is not mirrored: an archive groups apt_upstreams keys (%s) — add %q to apt_upstreams or remove it from the archive",
 					name, codename, orNoneList(c.MirroredAptCodenames()), codename)
 			case owner[codename] != "":
-				return fmt.Errorf("apt_archives[%q]: codename %q is already in archive %q: a codename is served under one root and its pool is one namespace — list it in one archive",
-					name, codename, owner[codename])
+				return fmt.Errorf("apt_archives[%q]: codename %q is already in archive %q: one apt_upstreams key is served under one root — to mirror %q in a second archive, key that one %q in apt_upstreams",
+					name, codename, owner[codename], codename, name+"/"+codename)
+			case c.MirrorsAptCodename(name + "/" + codename):
+				return fmt.Errorf("apt_upstreams mirrors %q in archive %q twice: as %q, and as %q listed in apt_archives[%q]. One (archive, codename) pair is one dists/ tree — keep one spelling",
+					codename, name, name+"/"+codename, codename, name)
 			}
 			owner[codename] = name
 		}
 	}
 	return nil
+}
+
+// AptCodenameOf is the codename an apt_upstreams key mirrors: the key itself,
+// or what follows the archive in {archive}/{codename}. It is the suite name
+// apt requests and the name an upstream publishes under dists/.
+func AptCodenameOf(key string) string {
+	if _, codename, ok := strings.Cut(key, "/"); ok {
+		return codename
+	}
+	return key
+}
+
+// AptSuiteAt returns the apt_upstreams key mirroring codename in archive, ""
+// being the default archive, and false when that pair is not mirrored. It is
+// what a request path names: /apt/{archive}/dists/{codename}/.
+func (c *Config) AptSuiteAt(archive, codename string) (string, bool) {
+	if archive != "" && c.MirrorsAptCodename(archive+"/"+codename) {
+		return archive + "/" + codename, true
+	}
+	if c.MirrorsAptCodename(codename) && c.AptArchiveOf(codename) == archive {
+		return codename, true
+	}
+	return "", false
+}
+
+// AptSuiteKey is the one string an (archive, codename) pair is held under in
+// a map: the codename in the default archive, {archive}/{codename} in a named
+// one. It is the apt_upstreams key for a pair keyed qualified, and the key a
+// profile's filtered codename is held under; a mirrored codename listed in
+// apt_archives keeps its bare apt_upstreams key, which AptSuiteAt returns.
+func AptSuiteKey(archive, codename string) string {
+	if archive == "" {
+		return codename
+	}
+	return archive + "/" + codename
+}
+
+// AptQualifiedName is how an operator names a mirrored suite unambiguously:
+// {archive}/{codename} in a named archive. In the default archive it is the
+// bare codename while no other archive mirrors that codename, and
+// /{codename} once one does, since the bare codename then names none of them.
+func (c *Config) AptQualifiedName(key string) string {
+	codename := AptCodenameOf(key)
+	if archive := c.AptArchiveOf(key); archive != "" {
+		return archive + "/" + codename
+	}
+	if len(c.AptKeysMirroring(codename)) > 1 {
+		return "/" + codename
+	}
+	return codename
+}
+
+// AptKeysMirroring lists the apt_upstreams keys mirroring codename, in every
+// archive, sorted.
+func (c *Config) AptKeysMirroring(codename string) []string {
+	var keys []string
+	for _, key := range c.MirroredAptCodenames() {
+		if AptCodenameOf(key) == codename {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// ResolveAptSuite turns a codename an operator typed, on a command line or in
+// a config field, into the apt_upstreams key it names. {archive}/{codename}
+// names that pair whichever way the config spells it, and /{codename} names
+// the default archive's. A bare codename names the one archive mirroring it;
+// mirrored in several, the default archive among them, it names none of them
+// and is refused with the spellings that would, since preferring one would
+// point a host at a publisher nobody chose. A name nothing mirrors comes back
+// unchanged, for the caller's own refusal or for a generated suite.
+//
+// A stored apt_upstreams key is not operator input: resolving the bare key of
+// the default archive's noble refuses once a vendor mirrors noble too.
+// Callers holding a key compare it as one, and AptQualifiedName writes it
+// back out in a spelling this function resolves to the same key.
+func (c *Config) ResolveAptSuite(name string) (string, error) {
+	if archive, codename, ok := strings.Cut(name, "/"); ok {
+		if key, found := c.AptSuiteAt(archive, codename); found {
+			return key, nil
+		}
+		return name, nil
+	}
+	keys := c.AptKeysMirroring(name)
+	switch len(keys) {
+	case 0:
+		return name, nil
+	case 1:
+		return keys[0], nil
+	}
+	qualified := make([]string, len(keys))
+	for i, key := range keys {
+		qualified[i] = c.AptQualifiedName(key)
+	}
+	slices.Sort(qualified)
+	var root string
+	if slices.Contains(qualified, "/"+name) {
+		root = fmt.Sprintf(" (/%s is the default archive's, served at /apt/dists/%s/)", name, name)
+	}
+	return "", fmt.Errorf("apt codename %q is mirrored in %d archives, so it names none of them: write one of %s%s",
+		name, len(keys), strings.Join(qualified, ", "), root)
 }
 
 func orNoneList(items []string) string {
@@ -1488,11 +1627,18 @@ func orNoneList(items []string) string {
 	return strings.Join(items, ", ")
 }
 
-// AptArchiveNames returns the declared archive names, sorted.
+// AptArchiveNames returns the declared archive names, sorted: the
+// apt_archives keys and the archive of every {archive}/{codename}
+// apt_upstreams key.
 func (c *Config) AptArchiveNames() []string {
 	out := make([]string, 0, len(c.AptArchives))
 	for name := range c.AptArchives {
 		out = append(out, name)
+	}
+	for key := range c.AptUpstreams {
+		if archive, _, ok := strings.Cut(key, "/"); ok && !slices.Contains(out, archive) {
+			out = append(out, archive)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -1500,8 +1646,11 @@ func (c *Config) AptArchiveNames() []string {
 
 // AptArchiveOf returns the named archive a mirrored codename belongs to, and
 // "" for the default archive: a codename in no archive, and every generated
-// suite.
+// suite. A key {archive}/{codename} belongs to its archive.
 func (c *Config) AptArchiveOf(codename string) string {
+	if archive, _, ok := strings.Cut(codename, "/"); ok {
+		return archive
+	}
 	for name, codenames := range c.AptArchives {
 		if slices.Contains(codenames, codename) {
 			return name
@@ -3044,7 +3193,7 @@ func defaultConfigContent() []byte {
   "_comment_apt_upstreams_pool": "/apt/pool/ carries no codename, so a .deb is resolved by probing every configured archive in sorted order and remembering which one answered. There is no per-package allow-list for apt: constrain it with 'bodega policy add apt <host>'.",
   "apt_upstreams": {},
 
-  "_comment_apt_archives": "apt_archives: names groups of mirrored codenames whose pool/ is one namespace, e.g. {\"ubuntu\": [\"resolute\", \"resolute-updates\"], \"debian\": [\"trixie\", \"trixie-updates\"]}. A named archive is served at /apt/<archive>/dists/ and /apt/<archive>/pool/ and stored under packages/apt/<archive>/. Needed only when one server mirrors two distributions: Debian and Ubuntu publish different bytes at one pool path. A mirrored codename in no archive stays at /apt/dists/ and /apt/pool/.",
+  "_comment_apt_archives": "apt_archives: names groups of mirrored codenames whose pool/ is one namespace, e.g. {\"ubuntu\": [\"resolute\", \"resolute-updates\"], \"debian\": [\"trixie\", \"trixie-updates\"]}. A named archive is served at /apt/<archive>/dists/ and /apt/<archive>/pool/ and stored under packages/apt/<archive>/. Needed only when one server mirrors two distributions: Debian and Ubuntu publish different bytes at one pool path. A mirrored codename in no archive stays at /apt/dists/ and /apt/pool/. A vendor publishing its own suite under the distribution's codename is keyed {archive}/{codename} in apt_upstreams instead, e.g. \"tailscale/noble\", and served at /apt/tailscale/dists/noble/ beside Ubuntu's noble.",
   "apt_archives": {},
 
   "_comment_apt_architectures": "apt_architectures: the Debian architectures whose mirrored Packages bodega reads to check each .deb it fetches against the paragraph naming it. 'all' is read whenever a Release declares it. A host of an architecture left out still installs: its dists/ files are forwarded unchanged, and its .debs are probed across the archive's roots and pinned on first fetch rather than checked against a paragraph. Each architecture read costs memory for every mirrored pocket.",

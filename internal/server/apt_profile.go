@@ -84,10 +84,14 @@ type aptProfileSuite struct {
 	scope    string
 	base     string
 	codename string
-	permit   *entitle.Profile
-	index    *aptSuiteIndex
-	// hidden is every mirrored version an operator hid server-wide, which a
-	// filtered codename drops whatever its profile permits.
+	// key is the codename as the snapshot holds it, config.AptSuiteKey of
+	// the base's archive and codename: two archives may each serve a
+	// filtered codename of one spelling under their own root.
+	key    string
+	permit *entitle.Profile
+	index  *aptSuiteIndex
+	// hidden is every mirrored version an operator hid in the base's
+	// archive, which a filtered codename drops whatever its profile permits.
 	hidden aptMirrorHides
 }
 
@@ -193,7 +197,8 @@ func (s *Server) aptProfileSuites(views []aptProfileView) []aptProfileSuite {
 				s.logger.Error("a profile's filtered apt codename cannot be served", "error", err)
 				continue
 			}
-			out = append(out, aptProfileSuite{profile: v.profile, scope: base, base: suite, codename: codename, permit: v.permit})
+			out = append(out, aptProfileSuite{profile: v.profile, scope: base, base: suite, codename: codename,
+				key: config.AptSuiteKey(s.cfg.AptArchiveOf(suite), codename), permit: v.permit})
 		}
 	}
 	return s.dropCollidingCodenames(out)
@@ -218,14 +223,18 @@ func (s *Server) aptProfileSuites(views []aptProfileView) []aptProfileSuite {
 //
 // ValidateProfileAptCodename cannot catch this. It is handed one profile and
 // checks it against the config, and the profile it collides with is in neither.
+//
+// A collision is one codename under one archive root. The same codename
+// derived over bases in two archives is two URLs over two pools, and both
+// are served.
 func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSuite {
 	claims := map[string][]aptProfileSuite{}
 	for _, ps := range suites {
-		claims[ps.codename] = append(claims[ps.codename], ps)
+		claims[ps.key] = append(claims[ps.key], ps)
 	}
 	out := make([]aptProfileSuite, 0, len(suites))
 	for _, ps := range suites {
-		group := claims[ps.codename]
+		group := claims[ps.key]
 		if len(group) == 1 {
 			out = append(out, ps)
 			continue
@@ -238,7 +247,7 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 			pairs = append(pairs, g.profile+" over "+g.base)
 		}
 		s.logger.Error("two profiles derive one filtered apt codename, so neither is served and both hosts' apt update fails; rename a profile, or move one onto a base whose name does not overlap the other's",
-			"codename", ps.codename, "profiles", strings.Join(pairs, ", "))
+			"codename", ps.key, "profiles", strings.Join(pairs, ", "))
 	}
 	return out
 }
@@ -251,7 +260,7 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 // the difference between a linear cost in profiles and a linear cost in bases.
 // A pocket is a suite like any other here, so a read that fails withdraws that
 // pocket's codename alone, and planApt refuses the host naming the pocket.
-func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, hidden aptMirrorHides, date, validUntil time.Time) (served []aptProfileSuite) {
+func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, hidden aptHidesByArchive, date, validUntil time.Time) (served []aptProfileSuite) {
 	suites := s.aptProfileSuites(views)
 	if len(suites) == 0 {
 		return nil
@@ -260,7 +269,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, 
 	cache := map[string]aptIndexRead{}
 	out := make([]aptProfileSuite, 0, len(suites))
 	for _, ps := range suites {
-		ps.hidden = hidden
+		ps.hidden = hidden.in(s.cfg.AptArchiveOf(ps.base))
 		release, ok := releases[ps.base]
 		if !ok {
 			var err error
@@ -698,7 +707,7 @@ func (s *Server) aptUpstreamFetchAt(ctx context.Context, base, rest string) ([]b
 	if len(ups) == 0 {
 		return nil, time.Time{}, fmt.Errorf("no archive is configured for %q", base)
 	}
-	url := ups[0].URL + "/dists/" + base + "/" + rest
+	url := ups[0].URL + "/dists/" + config.AptCodenameOf(base) + "/" + rest
 	if s.policy != nil {
 		_, violation, err := s.upstreamPolicyVerdict(ctx, manifest.TypeApt, url)
 		if err != nil {

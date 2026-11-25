@@ -50,6 +50,54 @@ import (
 // read, keyed name then version.
 type aptMirrorHides map[string]map[string]bool
 
+// aptHidesByArchive is the hides one rebuild read, as each archive applies
+// them, keyed by archive name with "" the default archive.
+//
+// A hide is recorded with the codenames its version was found in, and
+// applies in the archives those codenames belong to. Two archives are two
+// publishers, so a version withdrawn from a vendor's noble says nothing about
+// Ubuntu's build of the same name; within one archive it reaches every
+// codename, pockets included, as it always has. A hide naming no codename,
+// or one this config no longer mirrors, applies in every archive: dropping a
+// withdrawn version back into an index is the failure a hide exists to stop.
+type aptHidesByArchive map[string]aptMirrorHides
+
+// in is the hides applying in one archive.
+func (h aptHidesByArchive) in(archive string) aptMirrorHides { return h[archive] }
+
+// count is how many hides apply in some archive, each once.
+func (h aptHidesByArchive) count() int {
+	seen := map[string]bool{}
+	for _, hides := range h {
+		for name, versions := range hides {
+			for version := range versions {
+				seen[name+"\x00"+version] = true
+			}
+		}
+	}
+	return len(seen)
+}
+
+// aptHideArchives is the archives one hide applies in: those of the
+// codenames it was found in, or every archive this config serves when any of
+// them is no longer mirrored or none was recorded.
+func aptHideArchives(cfg *config.Config, codenames []string) []string {
+	every := append([]string{""}, cfg.AptArchiveNames()...)
+	var out []string
+	for _, c := range codenames {
+		if !cfg.MirrorsAptCodename(c) {
+			return every
+		}
+		if a := cfg.AptArchiveOf(c); !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return every
+	}
+	return out
+}
+
 // hides reports whether a binary package's version is hidden.
 func (h aptMirrorHides) hides(name, version string) bool {
 	return h[name][version]
@@ -226,26 +274,31 @@ func (p *aptMirrorPass) reuse(key aptMirrorIndexKey) (aptMirrorIndex, bool) {
 // aptMirrorHidesFrom reads every hide. A read that fails returns the previous
 // snapshot's set rather than none: an empty set would put a withdrawn version
 // back in the index and open the pool to it over a transient database error.
-func (s *Server) aptMirrorHidesFrom(ctx context.Context) aptMirrorHides {
+func (s *Server) aptMirrorHidesFrom(ctx context.Context) aptHidesByArchive {
 	if s.auditDB == nil {
 		return nil
 	}
 	rows, err := s.auditDB.ListAptMirrorHides(ctx, "")
 	if err != nil {
-		var kept aptMirrorHides
+		var kept aptHidesByArchive
 		if prev := s.aptSnap.Load(); prev != nil {
 			kept = prev.hidden
 		}
 		s.logger.Error("could not read the mirrored apt hides, so this rebuild keeps the previous set",
-			"error", err, "kept", len(kept))
+			"error", err, "kept", kept.count())
 		return kept
 	}
-	out := aptMirrorHides{}
+	out := aptHidesByArchive{}
 	for _, h := range rows {
-		if out[h.Name] == nil {
-			out[h.Name] = map[string]bool{}
+		for _, archive := range aptHideArchives(s.cfg, h.Codenames) {
+			if out[archive] == nil {
+				out[archive] = aptMirrorHides{}
+			}
+			if out[archive][h.Name] == nil {
+				out[archive][h.Name] = map[string]bool{}
+			}
+			out[archive][h.Name][h.Version] = true
 		}
-		out[h.Name][h.Version] = true
 	}
 	return out
 }
@@ -288,21 +341,22 @@ func (s *Server) aptMirrorGroups() [][]string {
 // that a read feeds. Each index whose record failed carries the membership it
 // was built from, and the previous snapshot's are retried first, so a
 // database that recovers between rebuilds still gets the evidence.
-func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, date, validUntil time.Time) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
+func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive, date, validUntil time.Time) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
 	if len(hidden) == 0 {
 		return nil, nil
 	}
 	if s.aptSign.Load() == nil {
 		s.logger.Error("mirrored apt versions are hidden and no apt signing key is installed, so the mirrored indexes still list them and only the pool refuses them; run bodega apt key generate and reload",
-			"hidden", len(hidden))
+			"hidden", hidden.count())
 		return nil, nil
 	}
 	prev := s.aptSnap.Load()
-	pass := &aptMirrorPass{hidden: hidden, hideSet: hidden.digest(), reads: map[string]aptIndexRead{}}
+	reads := map[string]aptIndexRead{}
+	var prevIndexes map[aptMirrorIndexKey]aptMirrorIndex
 	if prev != nil {
-		pass.prev = prev.mirrorIndexes
+		prevIndexes = prev.mirrorIndexes
 	}
-	s.retryAptMirrorEvidence(ctx, pass.prev)
+	s.retryAptMirrorEvidence(ctx, prevIndexes)
 	out := map[string]*aptSuiteIndex{}
 	reusable := map[aptMirrorIndexKey]aptMirrorIndex{}
 	for _, group := range s.aptMirrorGroups() {
@@ -311,6 +365,13 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, d
 		dropped, refiltered := 0, 0
 		var failed error
 		for _, codename := range group {
+			// A pocket may sit in another archive than its base (Debian's
+			// security archive), and a hide applies per archive, so each
+			// member filters with its own archive's set. The group is still
+			// rewritten and signed as one below, since one client stanza
+			// names every member under a single Signed-By:.
+			memberHidden := hidden.in(s.cfg.AptArchiveOf(codename))
+			pass := &aptMirrorPass{hidden: memberHidden, hideSet: memberHidden.digest(), reads: reads, prev: prevIndexes}
 			idx, d, n, err := s.aptMirrorRewrite(ctx, codename, pass, built, date, validUntil)
 			if err != nil {
 				failed = fmt.Errorf("%s: %w", codename, err)
@@ -329,7 +390,7 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptMirrorHides, d
 				out[codename] = idx
 			}
 			if carried != nil {
-				for key, idx := range pass.prev {
+				for key, idx := range prevIndexes {
 					if slices.Contains(group, key.codename) {
 						reusable[key] = idx
 					}
@@ -432,10 +493,10 @@ func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, pass *ap
 		butAutomaticUpgrades: release["ButAutomaticUpgrades"],
 	}
 	if header.suite == "" {
-		header.suite = codename
+		header.suite = config.AptCodenameOf(codename)
 	}
 	if header.codename == "" {
-		header.codename = codename
+		header.codename = config.AptCodenameOf(codename)
 	}
 	return s.aptIndexWithBodies(header, components, bodies, date, validUntil), dropped, refiltered, nil
 }
@@ -455,13 +516,13 @@ func (s *Server) aptMirrorRewritten(codename string) bool {
 // be a claim about the world that is false; the refusal says this server
 // withheld it. Checked before every other gate, because a hide is the
 // operator's verdict on the bytes whoever asks.
-func (s *Server) aptPoolHidden(w http.ResponseWriter, r *http.Request, poolPath string) bool {
+func (s *Server) aptPoolHidden(w http.ResponseWriter, r *http.Request, archive, poolPath string) bool {
 	snap := s.aptSnap.Load()
 	if snap == nil || len(snap.hidden) == 0 {
 		return false
 	}
 	name, poolVersion := manifest.AptDebIdentity(path.Base(poolPath))
-	version, hidden := snap.hidden.poolHides(name, poolVersion)
+	version, hidden := snap.hidden.in(archive).poolHides(name, poolVersion)
 	if !hidden {
 		return false
 	}

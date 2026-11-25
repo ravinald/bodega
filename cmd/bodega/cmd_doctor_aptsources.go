@@ -170,6 +170,12 @@ func aptUpdateAgainst(sources string) []string {
 // the block /api/v1/status renders for it. A codename in an apt_archives
 // archive is served under /apt/{archive}/ and nowhere else, which only the
 // server's config knows.
+//
+// One codename can be served in several archives (a vendor's noble beside
+// Ubuntu's), so a block in a named archive is also listed as
+// {archive}/{suite}, which is how rootFinding recognizes a source reading
+// that archive. The bare suite names the default archive's block when there
+// is one, and otherwise the first.
 func aptServedRoots(client *Client) (map[string]string, error) {
 	var status struct {
 		Apt struct {
@@ -181,8 +187,14 @@ func aptServedRoots(client *Client) (map[string]string, error) {
 	}
 	out := map[string]string{}
 	for _, src := range status.Apt.Sources {
-		if src.Suite != "" && src.URI != "" {
+		if src.Suite == "" || src.URI == "" {
+			continue
+		}
+		if _, set := out[src.Suite]; !set || src.Archive == "" {
 			out[src.Suite] = src.URI
+		}
+		if src.Archive != "" {
+			out[src.Archive+"/"+src.Suite] = src.URI
 		}
 	}
 	return out, nil
@@ -280,6 +292,13 @@ func (h *aptSourcesHost) rootFinding(f host.Finding, base string, served func() 
 	var moved, fixes []string
 	for _, o := range ours {
 		for _, suite := range o.entry.Suites {
+			if archive, ok := strings.CutPrefix(o.root, "/apt/"); ok {
+				if here, served := roots[archive+"/"+suite]; served {
+					if hereRoot, ok := aptRootPath(b.Path, here); ok && hereRoot == o.root {
+						continue
+					}
+				}
+			}
 			want, ok := roots[suite]
 			if !ok {
 				continue

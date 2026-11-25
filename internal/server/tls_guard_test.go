@@ -146,7 +146,10 @@ func TestPlaintextOn443AtDefaultLogLevel(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Logf("Start returned %v after cancellation", err)
+			}
 		case <-time.After(30 * time.Second):
 			t.Error("server did not shut down")
 		}

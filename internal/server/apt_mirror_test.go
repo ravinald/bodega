@@ -3571,7 +3571,7 @@ func TestPoolIndexChoosesEachDocumentByUpstreamRead(t *testing.T) {
 				var prev *aptPoolIndex
 				if tc.src.prev != nil {
 					prev = emptyIndex()
-					prev.carryDocuments(map[string]aptPoolDocument{triple: *tc.src.prev})
+					prev.carryDocuments(mirroredCodename, map[string]aptPoolDocument{triple: *tc.src.prev})
 				}
 				served := &aptServedIndexes{}
 				if tc.src.served != nil {
@@ -3580,7 +3580,7 @@ func TestPoolIndexChoosesEachDocumentByUpstreamRead(t *testing.T) {
 				current := map[string]aptPoolDocument{triple: *tc.src.current}
 				// A parse break fails the build, so a broken read is never part of a complete one.
 				idx := emptyIndex()
-				idx.carryDocuments(served.choose(prev, mirroredCodename, "", current, complete && !tc.src.current.broken))
+				idx.carryDocuments(mirroredCodename, served.choose(prev, mirroredCodename, "", current, complete && !tc.src.current.broken))
 				if got := idx.byKey[key].sha256; got != tc.want {
 					t.Errorf("paragraph came from %q, want %q", got, tc.want)
 				}
@@ -3593,18 +3593,18 @@ func TestPoolIndexChoosesEachDocumentByUpstreamRead(t *testing.T) {
 
 	t.Run("complete read drops a triple its Release no longer lists", func(t *testing.T) {
 		prev := emptyIndex()
-		prev.carryDocuments(map[string]aptPoolDocument{other: doc(other, "prev", newer)})
+		prev.carryDocuments(mirroredCodename, map[string]aptPoolDocument{other: doc(other, "prev", newer)})
 		idx := emptyIndex()
-		idx.carryDocuments((&aptServedIndexes{}).choose(prev, mirroredCodename, "", map[string]aptPoolDocument{}, true))
+		idx.carryDocuments(mirroredCodename, (&aptServedIndexes{}).choose(prev, mirroredCodename, "", map[string]aptPoolDocument{}, true))
 		if idx.indexed[other] {
 			t.Error("a complete read kept a document its Release no longer lists")
 		}
 	})
 	t.Run("failed read keeps every triple it could not reach", func(t *testing.T) {
 		prev := emptyIndex()
-		prev.carryDocuments(map[string]aptPoolDocument{other: doc(other, "prev", older)})
+		prev.carryDocuments(mirroredCodename, map[string]aptPoolDocument{other: doc(other, "prev", older)})
 		idx := emptyIndex()
-		idx.carryDocuments((&aptServedIndexes{}).choose(prev, mirroredCodename, "", map[string]aptPoolDocument{triple: doc(triple, "cur", newer)}, false))
+		idx.carryDocuments(mirroredCodename, (&aptServedIndexes{}).choose(prev, mirroredCodename, "", map[string]aptPoolDocument{triple: doc(triple, "cur", newer)}, false))
 		if !idx.indexed[other] || !idx.acquired[other].Equal(older) {
 			t.Error("a failed read lost a document only the previous index held, or restamped it")
 		}
