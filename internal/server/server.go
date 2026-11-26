@@ -217,6 +217,12 @@ type Server struct {
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
 	aptSnap atomic.Pointer[aptSnapshot]
+	// aptRebuild serializes rebuildAptSnapshot from its first read through
+	// publication. A mirrored codename's recorded rewrite Date is read, then
+	// upserted or cleared, across upstream I/O; two overlapping rebuilds would
+	// each act on the other's stale read, and one could clear a Date the other
+	// had just served and publish proxy state over it.
+	aptRebuild sync.Mutex
 
 	// distinfo is the ports tree's digest index, or nil when
 	// distfiles_ports_tree is unset. Nil is what makes /distfiles/ answer

@@ -1124,3 +1124,102 @@ func TestMirroredRewriteWhoseDateWriteFailsKeepsThePreviousRewrite(t *testing.T)
 		t.Errorf("an earlier write moved the record from %s to %s", recorded[hideGroupBase], after[hideGroupBase])
 	}
 }
+
+func TestReviewB201OverlappingRebuildMustNotForgetServedRewrite(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	ctx := t.Context()
+	rel := "dists/" + hideGroupBase + "/Release"
+	original, _ := archive.object(rel)
+	upstreamDate := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	archive.setObject(rel, "Date: "+upstreamDate.Format(time.RFC1123Z)+"\n"+original)
+	s.cache.MetadataTTL = 0
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	hidden := s.aptMirrorHidesFrom(ctx)
+	seedDate := upstreamDate.Add(-24 * time.Hour)
+	indexes, reusable := s.aptMirrorRewrites(ctx, hidden, seedDate, seedDate.Add(aptValidity))
+	if indexes[hideGroupBase] == nil {
+		t.Fatal("seed rewrite missing")
+	}
+	s.aptSnap.Store(&aptSnapshot{suites: indexes, hidden: hidden, mirrorRewritten: map[string]bool{hideGroupBase: true}, mirrorIndexes: reusable})
+
+	firstStarted, secondStarted := make(chan struct{}), make(chan struct{})
+	releaseFirst, releaseSecond := make(chan struct{}), make(chan struct{})
+	var firstOnce, secondOnce sync.Once
+	first := func() { firstOnce.Do(func() { close(releaseFirst) }) }
+	second := func() { secondOnce.Do(func() { close(releaseSecond) }) }
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/ubuntu/"+rel {
+			switch requests.Add(1) {
+			case 1:
+				close(firstStarted)
+				<-releaseFirst
+			case 2:
+				close(secondStarted)
+				<-releaseSecond
+			}
+		}
+		archive.ts.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+	s.cfg.AptUpstreams[hideGroupBase] = []config.AptUpstream{{URL: upstream.URL + "/ubuntu"}}
+	firstDone, secondDone := make(chan struct{}), make(chan struct{})
+	secondLaunched := false
+	defer func() {
+		first()
+		second()
+		<-firstDone
+		if secondLaunched {
+			<-secondDone
+		}
+	}()
+	go func() { s.rebuildAptSnapshot(ctx); close(firstDone) }()
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hidden rebuild did not reach upstream")
+	}
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatal(err)
+	}
+	secondLaunched = true
+	go func() { s.rebuildAptSnapshot(ctx); close(secondDone) }()
+	// A serialized rebuild cannot reach upstream until the first completes.
+	select {
+	case <-secondStarted:
+	case <-time.After(5 * time.Second):
+	}
+	first()
+	<-firstDone
+	servedDate, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !servedDate.After(upstreamDate) {
+		t.Fatalf("served %s must be newer than upstream %s", servedDate, upstreamDate)
+	}
+	second()
+	<-secondDone
+	dates, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dates[hideGroupBase].Before(servedDate) {
+		t.Errorf("overlapping unhide erased served rewrite Date %s (record now %s)", servedDate, dates[hideGroupBase])
+	}
+	if !s.aptMirrorRewritten(hideGroupBase) {
+		t.Errorf("unhide proxied upstream Date %s although a client can hold filtered rewrite Date %s", upstreamDate, servedDate)
+	}
+	if s.aptMirrorRewritten(hideGroupBase) {
+		got := aptIndexVersions(t, s, "/apt/dists/"+hideGroupBase+"/main/binary-amd64/Packages", "htop")
+		if !slices.Equal(got, []string{"1.0-1"}) {
+			t.Errorf("unhide kept filtered Packages: %v", got)
+		}
+	}
+	restarted := restartMirrorServer(t, s)
+	if !restarted.aptMirrorRewritten(hideGroupBase) {
+		t.Error("restart forgot the concurrently served rewrite and proxied the older upstream Release")
+	}
+}

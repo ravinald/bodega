@@ -525,6 +525,8 @@ type aptSnapshot struct {
 // index is a smaller problem than a truncated one, which would have clients
 // remove packages that are still published.
 func (s *Server) rebuildAptSnapshot(ctx context.Context) {
+	s.aptRebuild.Lock()
+	defer s.aptRebuild.Unlock()
 	snap, err := s.buildAptSnapshot(ctx)
 	if err != nil {
 		s.logger.Error("apt index rebuild failed, previous snapshot still serving",
