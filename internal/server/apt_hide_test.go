@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +29,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // The fixture archive's htop is the vulnerable build being withdrawn: a binary
@@ -107,6 +110,102 @@ func TestMirroredHideDropsTheStanzaAndReSignsTheCodename(t *testing.T) {
 	}
 	if stanza.Mirrored || !strings.Contains(stanza.Deb822, "Signed-By: "+aptsources.ClientKeyringPath) {
 		t.Errorf("the stanza for a rewritten codename does not name bodega's keyring:\n%s", stanza.Deb822)
+	}
+}
+
+// restartMirrorServer is a new server process on s's audit database and
+// upstreams, with nothing else carried over: no snapshot, no cached upstream
+// document, no cached dists/ object.
+func restartMirrorServer(t *testing.T, s *Server) *Server {
+	t.Helper()
+	cfg := *s.cfg
+	next := newServer(&cfg, manifest.NewLocalStore(t.TempDir()), storage.NewSingle(storage.NewMemory()),
+		"127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	next.cache = s.cache
+	t.Cleanup(func() { _ = next.auditDB.Close() })
+	if next.aptSign.Load() == nil {
+		t.Fatal("the restarted server loaded no apt signing key")
+	}
+	return next
+}
+
+// An Ubuntu release pocket's Release is dated once and never again. apt keeps
+// a stored Release over a fetched one dated earlier, so a host that read the
+// hidden rewrite would keep its filtered Packages if the codename went back to
+// the archive's Release when the hide was lifted.
+func TestMirroredUnhideKeepsAFrozenCodenameSignedUntilUpstreamRedates(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64") + hideStanza("nginx", "1.24-1", "amd64")},
+	})
+	rel := "dists/" + hideGroupBase + "/Release"
+	undated, _ := archive.object(rel)
+	frozen := time.Now().UTC().Add(-200 * 24 * time.Hour)
+	archive.setObject(rel, "Date: "+frozen.Format(time.RFC1123Z)+"\n"+undated)
+	ctx := t.Context()
+	packages := "/apt/dists/" + hideGroupBase + "/main/binary-amd64/Packages"
+	releaseDate := func(s *Server) time.Time {
+		t.Helper()
+		d, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+		if err != nil {
+			t.Fatalf("the served rewrite: %v", err)
+		}
+		return d
+	}
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(ctx)
+	if !s.aptMirrorRewritten(hideGroupBase) {
+		t.Fatal("the hide did not rewrite the codename")
+	}
+	if got := aptIndexVersions(t, s, packages, "htop"); len(got) != 0 {
+		t.Fatalf("the hidden rewrite lists htop %v", got)
+	}
+	hiddenDate := releaseDate(s)
+
+	held := func(stage string, s *Server) {
+		t.Helper()
+		if !s.aptMirrorRewritten(hideGroupBase) {
+			t.Fatalf("%s: the codename went back to proxy while its upstream Release (%s) is older than the rewrite hosts hold (%s)",
+				stage, frozen.Format(time.RFC1123Z), hiddenDate.Format(time.RFC1123Z))
+		}
+		if got := aptIndexVersions(t, s, packages, "htop"); !slices.Equal(got, []string{"1.0-1"}) {
+			t.Errorf("%s: the held rewrite lists htop %v, want the unhidden 1.0-1", stage, got)
+		}
+		if got := aptIndexVersions(t, s, packages, "nginx"); !slices.Equal(got, []string{"1.24-1"}) {
+			t.Errorf("%s: the held rewrite lists nginx %v, want 1.24-1", stage, got)
+		}
+		if d := releaseDate(s); d.Before(hiddenDate) {
+			t.Errorf("%s: the held rewrite is dated %s, earlier than the hidden rewrite's %s, so apt would keep the hidden one",
+				stage, d.Format(time.RFC1123Z), hiddenDate.Format(time.RFC1123Z))
+		}
+	}
+
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatalf("remove the hide: %v", err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	held("after the unhide", s)
+
+	restarted := restartMirrorServer(t, s)
+	restarted.rebuildAptSnapshot(ctx)
+	held("after a restart", restarted)
+
+	redated := "Date: " + time.Now().UTC().Format(time.RFC1123Z) + "\n" + undated
+	archive.setObject(rel, redated)
+	restarted.aptUpstreamIdx.Clear()
+	restarted.rebuildAptSnapshot(ctx)
+	if restarted.aptMirrorRewritten(hideGroupBase) {
+		t.Fatal("the codename stayed rewritten after its upstream Release was re-dated past the last rewrite")
+	}
+	if code, body := mirrorGet(t, restarted, "/apt/"+rel); code != http.StatusOK || string(body) != redated {
+		t.Errorf("after upstream re-dated, Release = %d, want the archive's own bytes:\n%s", code, body)
+	}
+	dates, err := restarted.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatalf("read the rewrite dates: %v", err)
+	}
+	if d, ok := dates[hideGroupBase]; ok {
+		t.Errorf("the proxied codename still has a rewrite date on record: %s", d)
 	}
 }
 
@@ -712,6 +811,30 @@ func TestUsageDocumentsMirrorRewriteCost(t *testing.T) {
 		"only the changed index for an upstream change",
 		"Every other rebuild, the hourly one and the one each profile write triggers, reuses the filtered `Packages`, its gzip and both digests from the previous rebuild",
 		"An index is reused only while the `SHA256` its upstream `Release` publishes is unchanged.",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("the `bodega pkg hide` section of usage.md does not say %q", want)
+		}
+	}
+}
+
+func TestUsageDocumentsWhenAnUnhiddenCodenameReturnsToProxy(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read usage.md: %v", err)
+	}
+	_, after, ok := strings.Cut(string(raw), "\n### `bodega pkg hide")
+	if !ok {
+		t.Fatal("usage.md has no `bodega pkg hide` section")
+	}
+	section, _, _ := strings.Cut(after, "\n### ")
+	for _, want := range []string{
+		"A codename with no hidden stanza in it stays proxied byte-for-byte, unless bodega has already served a rewrite of it.",
+		"returns it to the archive's own `InRelease` at the first rebuild where every codename in the group has an upstream `Release` dated later than the last rewrite bodega served for it",
+		"apt treats a `Release` dated earlier than the one it holds as unchanged",
+		"a host that read the rewrite would keep the filtered `Packages`",
+		"once that rewrite's `Valid-Until` passed it would fail `apt update` on the codename",
+		"A frozen pocket such as an Ubuntu release pocket (`resolute`) is dated once, at release, so its group stays bodega-signed after its first hide.",
 	} {
 		if !strings.Contains(section, want) {
 			t.Errorf("the `bodega pkg hide` section of usage.md does not say %q", want)

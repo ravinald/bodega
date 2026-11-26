@@ -259,6 +259,10 @@ type aptMirrorPass struct {
 	hideSet string
 	prev    map[aptMirrorIndexKey]aptMirrorIndex
 	reads   map[string]aptIndexRead
+
+	// upstreamDate is the Date: of the upstream Release the rewrite read,
+	// zero when it carries none.
+	upstreamDate time.Time
 }
 
 // reuse returns the previous snapshot's index for key. A key with no
@@ -317,7 +321,8 @@ func (s *Server) aptMirrorGroups() [][]string {
 }
 
 // aptMirrorRewrites generates a bodega-signed index for every mirrored group
-// carrying a hidden version, keyed by codename.
+// carrying a hidden version, keyed by codename, and for every group a host may
+// still hold a rewrite of (aptMirrorHeld).
 //
 // No signing key means no rewrite. An unsigned rewrite of a distro codename
 // would need [trusted=yes] on the host, which replaces the archive's check
@@ -342,10 +347,14 @@ func (s *Server) aptMirrorGroups() [][]string {
 // was built from, and the previous snapshot's are retried first, so a
 // database that recovers between rebuilds still gets the evidence.
 func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive, date, validUntil time.Time) (map[string]*aptSuiteIndex, map[aptMirrorIndexKey]aptMirrorIndex) {
-	if len(hidden) == 0 {
+	served, servedKnown := s.aptMirrorRewriteDatesFrom(ctx)
+	if len(hidden) == 0 && len(served) == 0 && servedKnown {
 		return nil, nil
 	}
 	if s.aptSign.Load() == nil {
+		if len(hidden) == 0 {
+			return nil, nil
+		}
 		s.logger.Error("mirrored apt versions are hidden and no apt signing key is installed, so the mirrored indexes still list them and only the pool refuses them; run bodega apt key generate and reload",
 			"hidden", hidden.count())
 		return nil, nil
@@ -359,8 +368,13 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 	s.retryAptMirrorEvidence(ctx, prevIndexes)
 	out := map[string]*aptSuiteIndex{}
 	reusable := map[aptMirrorIndexKey]aptMirrorIndex{}
+	record := map[string]bool{}
 	for _, group := range s.aptMirrorGroups() {
+		if len(hidden) == 0 && !aptMirrorMayHold(group, served, servedKnown, prev) {
+			continue
+		}
 		indexes := make(map[string]*aptSuiteIndex, len(group))
+		upstreamDates := make(map[string]time.Time, len(group))
 		built := map[aptMirrorIndexKey]aptMirrorIndex{}
 		dropped, refiltered := 0, 0
 		var failed error
@@ -378,6 +392,7 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 				break
 			}
 			indexes[codename] = idx
+			upstreamDates[codename] = pass.upstreamDate
 			dropped += d
 			refiltered += n
 		}
@@ -401,11 +416,103 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 				"group", strings.Join(group, " "), "dropped", dropped, "refiltered", refiltered)
 			for codename, idx := range indexes {
 				out[codename] = idx
+				record[codename] = true
 			}
 			maps.Copy(reusable, built)
+		case aptMirrorHeld(group, served, servedKnown, prev, upstreamDates):
+			s.logger.Info("kept a mirrored apt group bodega-signed with nothing hidden, because its upstream Release is not newer than the rewrite hosts may hold",
+				"group", strings.Join(group, " "))
+			for codename, idx := range indexes {
+				out[codename] = idx
+				record[codename] = true
+			}
+			maps.Copy(reusable, built)
+		default:
+			for _, codename := range group {
+				if _, ok := served[codename]; ok {
+					record[codename] = false
+				}
+			}
 		}
 	}
+	s.recordAptMirrorRewriteDates(ctx, record, date)
 	return out, reusable
+}
+
+// aptMirrorRewriteDatesFrom reads the Date of the latest rewrite served per
+// codename, and reports false when the read failed and nothing is known.
+func (s *Server) aptMirrorRewriteDatesFrom(ctx context.Context) (map[string]time.Time, bool) {
+	if s.auditDB == nil {
+		return nil, true
+	}
+	dates, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		s.logger.Error("could not read the mirrored apt rewrite dates, so every group served from a rewrite stays one this rebuild",
+			"error", err)
+		return nil, false
+	}
+	return dates, true
+}
+
+// aptMirrorMayHold reports whether a host may hold a rewrite of a member of
+// group: one is recorded, or, with the record unreadable, the previous
+// snapshot served one.
+func aptMirrorMayHold(group []string, served map[string]time.Time, servedKnown bool, prev *aptSnapshot) bool {
+	if !servedKnown {
+		return prev.mirrorGroup(group) != nil
+	}
+	for _, codename := range group {
+		if _, ok := served[codename]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// aptMirrorHeld reports whether a group with nothing hidden in it has to stay
+// a rewrite rather than go back to proxy.
+//
+// apt keeps a stored Release over a fetched one dated earlier, and says
+// nothing: a host that read a rewrite would keep its filtered Packages until
+// the rewrite's Valid-Until, and then fail apt update on the codename. So a
+// group returns to proxy only once every member's upstream Date is later than
+// the last rewrite served for it. An Ubuntu release pocket never re-dates, so
+// its group stays bodega-signed after its first hide. A member whose upstream
+// Release carries no Date has nothing to order by, and does not hold the
+// group.
+func aptMirrorHeld(group []string, served map[string]time.Time, servedKnown bool, prev *aptSnapshot, upstreamDates map[string]time.Time) bool {
+	if !servedKnown {
+		return prev.mirrorGroup(group) != nil
+	}
+	for _, codename := range group {
+		last, ok := served[codename]
+		upstream := upstreamDates[codename]
+		if ok && !upstream.IsZero() && !upstream.After(last) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordAptMirrorRewriteDates stores date for every codename record marks
+// true and clears every one it marks false. A failed write is logged: the next
+// rebuild that serves the codename writes it again.
+func (s *Server) recordAptMirrorRewriteDates(ctx context.Context, record map[string]bool, date time.Time) {
+	if s.auditDB == nil {
+		return
+	}
+	for codename, servedNow := range record {
+		var err error
+		if servedNow {
+			err = s.auditDB.RecordAptMirrorRewriteDate(ctx, codename, date)
+		} else {
+			err = s.auditDB.ClearAptMirrorRewriteDate(ctx, codename)
+		}
+		if err != nil {
+			s.logger.Error("could not record the date of a mirrored apt rewrite; a restart before the next rebuild could return the codename to proxy while hosts hold a newer rewrite",
+				"codename", codename, "served", servedNow, "error", err)
+		}
+	}
 }
 
 // mirrorGroup returns this snapshot's rewrite of every codename in group, or
@@ -433,6 +540,7 @@ func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, pass *ap
 	if err != nil {
 		return nil, 0, 0, err
 	}
+	pass.upstreamDate, _ = aptReleaseDate(release)
 	layout, err := s.aptUpstreamComponents(codename, release)
 	if err != nil {
 		return nil, 0, 0, err

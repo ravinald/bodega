@@ -94,3 +94,47 @@ func (a *DB) queryAptMirrorHides(ctx context.Context, query string, args ...any)
 	}
 	return out, nil
 }
+
+// AptMirrorRewriteDates returns, per mirrored codename, the Date of the latest
+// bodega-signed rewrite served for it.
+func (a *DB) AptMirrorRewriteDates(ctx context.Context) (map[string]time.Time, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT codename, served_date FROM apt_mirror_rewrite_dates`)
+	if err != nil {
+		return nil, fmt.Errorf("read mirrored apt rewrite dates: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var codename, served string
+		if err := rows.Scan(&codename, &served); err != nil {
+			return nil, fmt.Errorf("scan mirrored apt rewrite dates: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339, served)
+		if err != nil {
+			return nil, fmt.Errorf("mirrored apt rewrite date for %s: %w", codename, err)
+		}
+		out[codename] = t
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan mirrored apt rewrite dates: %w", err)
+	}
+	return out, nil
+}
+
+// RecordAptMirrorRewriteDate sets the Date of the latest rewrite served for
+// codename, at the one-second precision a Release carries.
+func (a *DB) RecordAptMirrorRewriteDate(ctx context.Context, codename string, date time.Time) error {
+	_, err := a.writer().ExecContext(ctx,
+		`INSERT INTO apt_mirror_rewrite_dates (codename, served_date) VALUES (?, ?)
+		 ON CONFLICT (codename) DO UPDATE SET served_date = excluded.served_date`,
+		codename, date.UTC().Truncate(time.Second).Format(time.RFC3339))
+	return err
+}
+
+// ClearAptMirrorRewriteDate forgets codename's rewrite Date, once the codename
+// is proxied again.
+func (a *DB) ClearAptMirrorRewriteDate(ctx context.Context, codename string) error {
+	_, err := a.writer().ExecContext(ctx,
+		`DELETE FROM apt_mirror_rewrite_dates WHERE codename = ?`, codename)
+	return err
+}
