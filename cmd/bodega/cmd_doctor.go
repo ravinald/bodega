@@ -327,7 +327,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF"), Registries: doctorOCIRegistries(gf)}.Check(base)...)
+			registries, registriesUnread := doctorOCIRegistries(base, token, allowPlaintext)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF"), Registries: registries, RegistriesUnread: registriesUnread}.Check(base)...)
 			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
 			}
@@ -1363,16 +1364,42 @@ func printRuntimeRestarts(changes []clientconf.Change) {
 	}
 }
 
-// doctorOCIRegistries is the oci_upstreams names the report checks Docker
-// Engine's hosts.toml files for: this host's config where it loads, else
-// bodega's defaults, which is what a client host with no config of its own
-// is served unless the server's operator changed them.
-func doctorOCIRegistries(gf *globalFlags) []string {
-	upstreams := config.DefaultOCIUpstreams
-	if cfg, err := loadConfig(gf); err == nil && len(cfg.OCIUpstreams) > 0 {
-		upstreams = cfg.OCIUpstreams
+// doctorOCIRegistries is the registries bodega at base serves this host,
+// one per containerd hosts.toml record of its plan: the server renders one
+// for each oci_upstreams key, so the record paths name its registry set. A
+// client's own config is not the server's, so nothing local stands in for
+// it; the string says why the set could not be read. The plan's oci paths
+// are Linux paths, which is where dockerd reads them. Asked only where
+// dockerd is on PATH, the one row that reads the set.
+func doctorOCIRegistries(base, token string, allowPlaintext bool) ([]string, string) {
+	if !runtimePresent(clientconf.RuntimeDocker) {
+		return nil, ""
 	}
-	return slices.Sorted(maps.Keys(upstreams))
+	if base == "" {
+		return nil, "doctor knows no bodega URL; pass --url"
+	}
+	client, err := NewClient(base, token, allowPlaintext)
+	if err != nil {
+		return nil, err.Error()
+	}
+	client.HTTP.Timeout = 10 * time.Second
+	var plan clientconf.Plan
+	if err := getJSON(client, "/client/plan?"+url.Values{"os": {clientconf.OSLinux}}.Encode(), &plan); err != nil {
+		return nil, err.Error()
+	}
+	var regs []string
+	for _, r := range plan.Records {
+		if r.System != manifest.TypeOCI || r.Action != clientconf.PlanInstall {
+			continue
+		}
+		if _, rest, ok := strings.Cut(r.Path, clientconf.ContainerdCertsDir+"/"); ok {
+			if reg, ok := strings.CutSuffix(rest, "/hosts.toml"); ok && !strings.Contains(reg, "/") && !slices.Contains(regs, reg) {
+				regs = append(regs, reg)
+			}
+		}
+	}
+	slices.Sort(regs)
+	return regs, ""
 }
 
 // doctorBaseURL is the bodega URL doctor's report compares a client's

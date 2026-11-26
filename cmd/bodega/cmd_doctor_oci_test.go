@@ -251,3 +251,119 @@ func TestDoctorConfigureOCICAReachesDockerHosts(t *testing.T) {
 		t.Errorf("Docker's docker.io hosts.toml after --apply = %q, want bodega's host with ca = %s", got, userCA)
 	}
 }
+
+func TestB200ReviewDoctorUsesServerRegistries(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		snapshotter bool
+		registries  []string
+		want        string
+		status      string
+	}{
+		{"subset", true, []string{"docker.io", "ghcr.io"}, "ghcr.io routed through bodega", "OK"},
+		{"custom missing", true, []string{"docker.io", "ghcr.io", "quay.io", "registry.k8s.io"}, "registry.k8s.io", "WARN"},
+		{"overlay2 custom", false, []string{"docker.io", "registry.k8s.io"}, "registry.k8s.io", "OK"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			stubRuntimes(t, "dockerd")
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/client/plan" {
+					http.NotFound(w, r)
+					return
+				}
+				upstreams := map[string]string{}
+				for _, reg := range tc.registries {
+					upstreams[reg] = "https://" + reg
+				}
+				var plan clientconf.Plan
+				for _, f := range clientconf.OCIClient(srv.URL, upstreams) {
+					sum := sha256.Sum256([]byte(f.Content))
+					plan.Records = append(plan.Records, clientconf.PlanRecord{System: manifest.TypeOCI, Action: clientconf.PlanInstall, Path: f.Path(clientconf.OSLinux), URL: srv.URL + "/client/oci?file=" + f.Key, SHA256: hex.EncodeToString(sum[:])})
+				}
+				_ = json.NewEncoder(w).Encode(plan)
+			}))
+			t.Cleanup(srv.Close)
+			write := func(p, body string) {
+				p = filepath.Join(root, p)
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("etc/docker/daemon.json", `{"registry-mirrors":["`+srv.URL+`/"],"features":{"containerd-snapshotter":`+strconv.FormatBool(tc.snapshotter)+`}}`)
+			for _, reg := range tc.registries {
+				if reg != "registry.k8s.io" {
+					write("etc/docker/certs.d/"+reg+"/hosts.toml", clientconf.ContainerdHosts(srv.URL, reg, "https://"+reg).Content)
+				}
+			}
+			oldRoot, oldExit := doctorOCIRoot, doctorExit
+			doctorOCIRoot, doctorExit = root, func(int) {}
+			t.Cleanup(func() { doctorOCIRoot, doctorExit = oldRoot, oldExit })
+			out, err := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var row string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "oci-docker ") {
+					row = line
+					break
+				}
+			}
+			if !strings.Contains(row, tc.want) || !strings.Contains(row, tc.status) {
+				t.Fatalf("want %s naming %q; got %s", tc.status, tc.want, row)
+			}
+			for _, absent := range []string{"ghcr.io", "quay.io"} {
+				served := false
+				for _, reg := range tc.registries {
+					if reg == absent {
+						served = true
+					}
+				}
+				if !served && strings.Contains(row, absent) {
+					t.Errorf("server does not serve %s; got %s", absent, row)
+				}
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerCAInstallRejectsSkipVerify(t *testing.T) {
+	for _, rt := range []string{"docker", "containerd"} {
+		t.Run(rt, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			bin := rt
+			if rt == "docker" {
+				bin = "dockerd"
+			}
+			stubRuntimes(t, bin)
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+			daemon := filepath.Join(home, "etc/docker/daemon.json")
+			hosts := filepath.Join(home, "etc", rt, "certs.d/docker.io/hosts.toml")
+			original := clientconf.ContainerdHosts(srv.URL, "docker.io", "https://registry-1.docker.io").Content + "  skip_verify = true\n"
+			for path, content := range map[string]string{caFile: string(caPEM), daemon: `{"features":{"containerd-snapshotter":true}}`, hosts: original} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+			if err == nil || !strings.Contains(err.Error(), "skip_verify") {
+				got, _ := os.ReadFile(hosts)
+				t.Fatalf("want refusal naming skip_verify before writing; got err=%v, hosts=%s", err, got)
+			}
+			if got, _ := os.ReadFile(hosts); string(got) != original {
+				t.Fatalf("refusal wrote hosts.toml: %s", got)
+			}
+		})
+	}
+}

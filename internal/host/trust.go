@@ -245,7 +245,8 @@ var trustRows = map[string]trustRow{
 // dockerHandCheck is the remediation for a daemon.json key doctor does not
 // decide on: the key stays, since dockerd may need it, and the operator
 // verifies bodega's certificate against what dockerd reads, the system
-// store and certs.d/<host>/ca.crt, with openssl instead.
+// store and certs.d/<host>/ca.crt, with openssl instead. -servername only
+// sets SNI; -verify_hostname or -verify_ip is what checks the peer's name.
 func dockerHandCheck(t TrustProbe, u *url.URL, key string) string {
 	port := u.Port()
 	if port == "" {
@@ -256,12 +257,19 @@ func dockerHandCheck(t TrustProbe, u *url.URL, key string) string {
 	if _, err := plannedfs.Stat(filepath.Join(t.Root, p)); err == nil {
 		ca = " -CAfile " + p
 	}
-	return fmt.Sprintf("keep %s if dockerd needs it: doctor cannot verify dockerd's trust while %s is set in %s. Check bodega's certificate by hand against the stores dockerd reads: openssl s_client -connect %s -servername %s -verify_return_error%s </dev/null, which ends with \"Verify return code: 0 (ok)\" when dockerd would accept it",
-		key, key, clientconf.DockerDaemonPath, net.JoinHostPort(u.Hostname(), port), u.Hostname(), ca)
+	name := "-verify_hostname " + u.Hostname()
+	if net.ParseIP(u.Hostname()) != nil {
+		name = "-verify_ip " + u.Hostname()
+	}
+	return fmt.Sprintf("keep %s if dockerd needs it: doctor cannot verify dockerd's trust while %s is set in %s. Check bodega's certificate by hand against the stores dockerd reads: openssl s_client -connect %s -servername %s %s -verify_return_error%s </dev/null, which ends with \"Verify return code: 0 (ok)\" when dockerd would accept it",
+		key, key, clientconf.DockerDaemonPath, net.JoinHostPort(u.Hostname(), port), u.Hostname(), name, ca)
 }
 
 // dockerStores is the certs.d directory dockerd reads for bodega at u when a
-// registry-mirrors entry of the daemon.json it loads names that host. The
+// registry-mirrors entry of the daemon.json it loads names that host, and on
+// the containerd image store every hosts.toml under /etc/docker/certs.d that
+// names bodega, whose TLS settings containerd's resolver applies for dockerd
+// as it does for containerd (moby v29.5.3 daemon/hosts.go). The
 // file is loaded whole, as dockerd loads it: one dockerd refuses, over any
 // key, is one it does not start with, so the mirror and the directory are
 // settings nothing runs with and Docker Engine is left unchecked. A file it
@@ -274,14 +282,30 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd refuses to load its configuration (%v) and does not start, so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
 	case doc != nil && doc.StartError != "":
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd loads its configuration and exits as it starts (%s), so whether dockerd reaches bodega or verifies its certificate is unchecked", doc.StartError)}}
-	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return clientconf.NamesBodega(m, u) }):
+	}
+	containerd, err := clientconf.DockerContainerdStore(t.Root)
+	if err != nil {
+		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd exits as it starts choosing its image store (%v), so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
+	}
+	mirrored := doc != nil && slices.ContainsFunc(doc.Mirrors, func(m string) bool { return clientconf.NamesBodega(m, u) })
+	var hosts []trustStore
+	if containerd {
+		hosts = hostsFileStores(t, u, "dockerd", []string{clientconf.DockerCertsDir})
+	}
+	switch {
+	case !mirrored && len(hosts) == 0:
 		return nil
+	case doc == nil:
+		return hosts
 	}
 	if doc.StartUnmodeled != "" {
 		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.StartUnmodeled), blind: fmt.Sprintf("dockerd's configuration sets %s, which dockerd acts on against this host as it starts and may exit over, and doctor reads no such host state, so whether dockerd runs to verify bodega's certificate is unchecked", doc.StartUnmodeled)}}
 	}
 	if doc.TLSUnmodeled != "" {
 		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.TLSUnmodeled), blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
+	}
+	if !mirrored || len(hosts) == 1 && hosts[0].blind != "" {
+		return hosts
 	}
 	if route := plainRoute(doc.Mirrors, u); route != "" {
 		return plainUncertified("dockerd", "a registry mirror", route)
@@ -308,7 +332,7 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		s.note = loopbackNote("dockerd", u)
 		out = append(out, s)
 	}
-	return out
+	return append(out, hosts...)
 }
 
 // aptStores is the store apt verifies bodega at u against, for a host one of
@@ -1037,11 +1061,21 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 			roots = strings.Split(cfg.ConfigPath, ":")
 		}
 	}
+	return hostsFileStores(t, u, "containerd", roots)
+}
+
+// hostsFileStores is what client verifies bodega at u against through the
+// hosts.toml files under roots, read as containerd's resolver reads them:
+// containerd itself, and dockerd on the containerd image store, which hands
+// its registry lookups to the same resolver. A single blind store is the
+// whole verdict: a file the resolver discards, or a setting that verifies
+// nothing, leaves the rest of the files beside the point.
+func hostsFileStores(t TrustProbe, u *url.URL, client string, roots []string) []trustStore {
 	var out []trustStore
 	for _, path := range clientconf.ContainerdHostsFiles(t.Root, roots) {
 		doc, err := clientconf.LoadContainerdHostsFile(path)
 		if err != nil {
-			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd discards its registry configuration (%v) and pulls from the registry's own server instead, so whether containerd reaches bodega or verifies its certificate is unchecked", err)}}
+			return []trustStore{{name: client + "'s configuration", blind: fmt.Sprintf("%s discards its registry configuration (%v) and pulls from the registry's own server instead, so whether %s reaches bodega or verifies its certificate is unchecked", client, err, client)}}
 		}
 		if doc == nil {
 			continue
@@ -1056,20 +1090,20 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 			keys = append(keys, h.Key)
 		}
 		if route := plainRoute(keys, u); route != "" {
-			return plainUncertified("containerd", "a host in "+path, route)
+			return plainUncertified(client, "a host in "+path, route)
 		}
 		if key := doc.SkipsVerify(atBodega); key != "" {
-			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
+			return uncertified(client, fmt.Sprintf("%s sets skip_verify = true for the host %s: %s then accepts any certificate that host presents", path, key, client))
 		}
 		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return atBodega(h.Key) }) {
 			continue
 		}
 		if err := doc.TLSError(""); err != nil {
-			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd cannot load a certificate %s names (%v) and resolves no host for that registry while it cannot, the bodega host included, so whether containerd reaches bodega or verifies its certificate is unchecked", path, err)}}
+			return []trustStore{{name: client + "'s configuration", blind: fmt.Sprintf("%s cannot load a certificate %s names (%v) and resolves no host for that registry while it cannot, the bodega host included, so whether %s reaches bodega or verifies its certificate is unchecked", client, path, err, client)}}
 		}
 		for _, h := range doc.Hosts {
 			if atBodega(h.Key) {
-				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA, note: loopbackNote("containerd", u)})
+				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA, note: loopbackNote(client, u)})
 			}
 		}
 	}

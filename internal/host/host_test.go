@@ -1236,3 +1236,46 @@ func TestCheckDockerMirrorFollowsImageStore(t *testing.T) {
 		})
 	}
 }
+
+// B200: a registry set the server could not be asked for is not certified.
+// Under the containerd store an OK on Docker Hub alone becomes a skip naming
+// the error; a warning stays a warning; overlay2 says which registries it
+// could not name.
+func TestCheckDockerMirrorUnreadRegistries(t *testing.T) {
+	hub := clientconf.ContainerdHosts("https://bodega.internal", "docker.io", "https://registry-1.docker.io").Content
+	for _, c := range []struct {
+		name, daemon string
+		files        map[string]string
+		status       Status
+		want         []string
+	}{
+		{name: "containerd store, hub mirrored", daemon: `{"registry-mirrors":["https://bodega.internal/"]}`, status: StatusSkip,
+			want: []string{"could not be read (connection refused)", "registries other than Docker Hub are unchecked"}},
+		{name: "containerd store, hub through hosts.toml", daemon: `{}`, files: map[string]string{"etc/docker/certs.d/docker.io/hosts.toml": hub}, status: StatusSkip,
+			want: []string{"docker.io routed through bodega", "unchecked"}},
+		{name: "containerd store, hub bypassing", daemon: `{}`, status: StatusWarn,
+			want: []string{"docker.io (no ", "unchecked"}},
+		{name: "overlay2", daemon: `{"registry-mirrors":["https://bodega.internal/"],"features":{"containerd-snapshotter":false}}`, status: StatusOK,
+			want: []string{"any registry other than Docker Hub (which ones bodega serves could not be read: connection refused)"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, write := ociFixture(t)
+			write(clientconf.DockerDaemonPath, c.daemon)
+			for p, body := range c.files {
+				write(p, body)
+			}
+			f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), Registries: []string{"docker.io", "ghcr.io"}, RegistriesUnread: "connection refused"}, "oci-docker")
+			if f.Status != c.status {
+				t.Errorf("status = %s, want %s: %s", f.Status, c.status, f.Detail)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(f.Detail, w) {
+					t.Errorf("detail lacks %q: %s", w, f.Detail)
+				}
+			}
+			if strings.Contains(f.Detail, "ghcr.io") {
+				t.Errorf("detail names ghcr.io from a set nobody served: %s", f.Detail)
+			}
+		})
+	}
+}

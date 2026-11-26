@@ -747,8 +747,22 @@ func (h CAHost) helmClientTLS(rec PlanRecord, target string, planned []byte) err
 // dockerReads refuses a plan for Docker Engine on a host whose dockerd would
 // not load its daemon.json, as the plan leaves it: dockerd does not start
 // with that file, so a ca.crt under certs.d would report an install no pull
-// uses.
+// uses. A plan carrying Docker hosts.toml files is one for a dockerd on the
+// containerd image store, and those files are judged as containerd's are;
+// on overlay2 dockerd reads none of them, so none is judged.
 func (h CAHost) dockerReads(changes []Change) error {
+	if err := h.dockerDaemonReads(changes); err != nil {
+		return err
+	}
+	if !slices.ContainsFunc(changes, func(c Change) bool {
+		return c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeDocker && filepath.Base(c.Target) == "hosts.toml"
+	}) {
+		return nil
+	}
+	return h.hostsFilesRead(changes, RuntimeDocker, []string{DockerCertsDir})
+}
+
+func (h CAHost) dockerDaemonReads(changes []Change) error {
 	if !slices.ContainsFunc(changes, func(c Change) bool {
 		return c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeDocker
 	}) {
@@ -851,14 +865,25 @@ func (h CAHost) containerdReads(changes []Change) error {
 			roots = strings.Split(eff.ConfigPath, ":")
 		}
 	}
-	// Every hosts.toml containerd loads, and every one the plan edits, read
-	// whole as containerd reads it, whether or not this plan changes it: a
-	// wrong type in a field no edit touches makes containerd discard the
+	return h.hostsFilesRead(changes, RuntimeContainerd, roots)
+}
+
+// hostsFilesRead refuses a plan whose hosts.toml files for rt, under roots,
+// leave a CA undecided once the plan is applied: one containerd's resolver
+// discards, one that skips verification for bodega, or one naming a
+// certificate file that does not load. dockerd on the containerd image store
+// reads /etc/docker/certs.d through that same resolver, so it is judged the
+// same way as containerd.
+func (h CAHost) hostsFilesRead(changes []Change, rt string, roots []string) error {
+	client := map[string]string{RuntimeContainerd: "containerd", RuntimeDocker: "dockerd"}[rt]
+	// Every hosts.toml the client loads, and every one the plan edits, read
+	// whole as the resolver reads it, whether or not this plan changes it: a
+	// wrong type in a field no edit touches makes the resolver discard the
 	// file, and the merge would carry that field into the rewrite.
 	files := ContainerdHostsFiles(h.Root, roots)
 	var planned []string
 	for _, c := range changes {
-		if c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeContainerd && filepath.Base(c.Target) == "hosts.toml" {
+		if c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == rt && filepath.Base(c.Target) == "hosts.toml" {
 			planned = append(planned, c.Target)
 			if !slices.Contains(files, c.Target) {
 				files = append(files, c.Target)
@@ -884,8 +909,8 @@ func (h CAHost) containerdReads(changes []Change) error {
 			return base != nil && (namesBodega(key, base) || key == "" && namesBodega(filepath.Base(filepath.Dir(f)), base))
 		}
 		if err != nil {
-			return fmt.Errorf("%s: containerd discards its registry configuration (%w) and pulls from the registry's own server instead, so it would use neither the bodega host nor the ca this command writes, and the install could not be verified. "+
-				"Nothing was written. Fix that field so containerd loads the file (its log names the same error at each pull), then re-run", manifest.TypeOCI, err)
+			return fmt.Errorf("%s: %s discards its registry configuration (%w) and pulls from the registry's own server instead, so it would use neither the bodega host nor the ca this command writes, and the install could not be verified. "+
+				"Nothing was written. Fix that field so %s loads the file (its log names the same error at each pull), then re-run", manifest.TypeOCI, client, err, client)
 		}
 		// The certificate files of each registry that reaches bodega, the
 		// ones this plan edits and any that already name it, which is the set
@@ -897,11 +922,11 @@ func (h CAHost) containerdReads(changes []Change) error {
 			continue
 		}
 		if key := doc.SkipsVerify(atBodega); key != "" {
-			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents, so no CA decides what it trusts", f, key), f)
+			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s sets skip_verify = true for the host %s: %s then accepts any certificate that host presents, so no CA decides what it trusts", f, key, client), f)
 		}
 		if err := doc.TLSError(trim(h.Base)); err != nil {
-			return fmt.Errorf("%s: containerd cannot load a certificate %s names (%w) and resolves no host for that registry while it cannot, the bodega host included, so it would not use the ca this command writes, and the install could not be verified. "+
-				"Nothing was written. Restore the file the error names or remove the setting naming it, then re-run", manifest.TypeOCI, f, err)
+			return fmt.Errorf("%s: %s cannot load a certificate %s names (%w) and resolves no host for that registry while it cannot, the bodega host included, so it would not use the ca this command writes, and the install could not be verified. "+
+				"Nothing was written. Restore the file the error names or remove the setting naming it, then re-run", manifest.TypeOCI, client, f, err)
 		}
 	}
 	return nil
