@@ -827,7 +827,7 @@ func (h CAHost) dockerHostsRead(changes []Change) error {
 				case host.SkipVerify != nil && *host.SkipVerify:
 					return uncertified(manifest.TypeOCI, fmt.Sprintf("%s sets skip_verify = true for the host dockerd sends %s's pulls to at bodega: dockerd then accepts any certificate that host presents, so no CA decides what it trusts", r.Source, reg), r.Dir)
 				case host.Insecure != "":
-					return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which dockerd applies to %s's one host at bodega: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", DockerDaemonPath, host.Insecure, reg), filepath.Join(root, DockerDaemonPath))
+					return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which dockerd applies to %s through the transport %s's host at bodega shares with it: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", DockerDaemonPath, host.Insecure, host.InsecureHost, reg), filepath.Join(root, DockerDaemonPath))
 				}
 			}
 			if !reaches {
@@ -883,6 +883,13 @@ func (h CAHost) dockerDaemonReads(changes []Change) error {
 		}
 		if base, perr := url.Parse(h.Base); err == nil && perr == nil && doc.Insecure(base) != "" {
 			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", path, doc.Insecure(base)), filepath.Join(filepath.Dir(path), "certs.d"))
+		}
+		if base, perr := url.Parse(h.Base); mirrorCA.resolved != nil && perr == nil {
+			for _, host := range mirrorCA.resolved.Hosts {
+				if host.Insecure != "" && namesBodega(host.Host, base) {
+					return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which dockerd applies to %s through the transport docker.io's host at bodega shares with it: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", path, host.Insecure, host.InsecureHost), path)
+				}
+			}
 		}
 		if mirrorCA.hub != "" {
 			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s names one host for Docker Hub, whose TLS settings dockerd verifies registry-mirrors with in place of any certs.d file", mirrorCA.hub), mirrorCA.hub)
@@ -946,9 +953,10 @@ type dockerMirror struct {
 func (h CAHost) dockerMirrorCA(changes []Change) dockerMirror {
 	root := h.Root
 	files := map[string][]byte{}
+	var daemon []byte
 	for _, c := range changes {
 		if c.Record.System == manifest.TypeOCI && strings.HasSuffix(c.Target, DockerDaemonPath) {
-			root = strings.TrimSuffix(c.Target, DockerDaemonPath)
+			root, daemon = strings.TrimSuffix(c.Target, DockerDaemonPath), c.New
 		}
 		if c.New != nil && filepath.Base(c.Target) == "hosts.toml" {
 			files[c.Target] = c.New
@@ -962,9 +970,21 @@ func (h CAHost) dockerMirrorCA(changes []Change) dockerMirror {
 	if err != nil || !containerd {
 		return dockerMirror{dir: filepath.Join(root, DockerCertsDir, host), byHand: DockerCertsDir + "/" + host + "/ca.crt"}
 	}
+	if daemon == nil {
+		daemon, _ = plannedfs.ReadFile(filepath.Join(root, DockerDaemonPath))
+	}
+	doc, _ := ParseDockerDaemonFile(daemon)
+	if doc == nil {
+		doc = &DockerDaemonFile{}
+	}
+	// The plan's whole daemon.json, not its mirror alone: insecure-registries
+	// covering any host merged with the mirror reaches the mirror too.
+	if !slices.Contains(doc.Mirrors, h.Base) {
+		doc.Mirrors = append(slices.Clone(doc.Mirrors), h.Base)
+	}
 	var hub DockerRegistry
 	_ = plannedfs.With(files, func() error {
-		hub = ResolveDockerRegistry(root, &DockerDaemonFile{Mirrors: []string{h.Base}}, "docker.io")
+		hub = ResolveDockerRegistry(root, doc, "docker.io")
 		return nil
 	})
 	switch {

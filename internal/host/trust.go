@@ -1,6 +1,7 @@
 package host
 
 import (
+	"cmp"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -432,12 +433,15 @@ func dockerContainerdStores(t TrustProbe, u *url.URL, doc *clientconf.DockerDaem
 			case h.SkipVerify != nil && *h.SkipVerify:
 				return uncertified("dockerd", fmt.Sprintf("%s sets skip_verify = true for %s, the host dockerd sends %s's pulls to at bodega: dockerd then accepts any certificate that host presents", r.Source, h.Host, reg))
 			case h.Insecure != "":
-				return uncertified("dockerd", fmt.Sprintf("dockerd's configuration lists %s under insecure-registries, which dockerd applies to %s's one host at bodega (%s): dockerd then accepts any certificate that endpoint presents", h.Insecure, reg, h.Host))
+				return uncertified("dockerd", fmt.Sprintf("dockerd's configuration lists %s under insecure-registries, which dockerd applies to %s through the transport %s's host at bodega (%s) shares with it: dockerd then accepts any certificate that endpoint presents", h.Insecure, h.InsecureHost, reg, h.Host))
 			}
-			name := "the TLS settings of " + r.Source + ", which dockerd verifies " + reg + "'s host at bodega with"
-			if slices.ContainsFunc(out, func(s trustStore) bool { return s.name == name }) {
+			// Hosts with their own TLS settings get their own transport even
+			// where they share an endpoint or a file, so only a store whose
+			// roots are the same as one already listed is the same store.
+			if slices.ContainsFunc(out, func(s trustStore) bool { return s.system && s.blind == "" && slices.Equal(s.files, h.CA) }) {
 				continue
 			}
+			name := "the TLS settings of " + r.Source + " for " + cmp.Or(h.Key, h.URL()) + ", which dockerd verifies " + reg + "'s host at bodega with"
 			out = append(out, trustStore{name: name, system: true, files: h.CA, note: loopbackNote("dockerd", u)})
 		}
 	}

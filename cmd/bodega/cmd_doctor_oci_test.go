@@ -516,3 +516,29 @@ func TestDockerHostsRefusedWhereShadowed(t *testing.T) {
 		})
 	}
 }
+
+// B200 R6: the usage page says which image store covers which registries
+// for Docker Engine, in the doctor section and in the OCI recipe.
+func TestUsageDocDescribesDockerImageStores(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := string(data)
+	for _, want := range []string{
+		"Docker Engine on the containerd image store, the default on a fresh Docker 29 install, covers every registry",
+		"On the overlay2 image store `registry-mirrors` covers Docker Hub only",
+		"hides every image and container `dockerd` already holds until each is pulled and recreated, so doctor never sets it",
+		"every other registry only on the containerd image store, where `dockerd` reads `/etc/docker/certs.d/<registry>/hosts.toml`",
+		"here `/etc/docker/certs.d/ghcr.io/hosts.toml`, which sends `docker pull ghcr.io/<image>` through bodega",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("docs/usage.md lacks %q", want)
+		}
+	}
+	for _, stale := range []string{"Docker Engine's `registry-mirrors` covers Docker Hub only", "Docker Engine mirrors Docker Hub and nothing else"} {
+		if strings.Contains(usage, stale) {
+			t.Errorf("docs/usage.md still says %q", stale)
+		}
+	}
+}

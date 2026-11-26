@@ -1200,8 +1200,11 @@ type DockerRegistryHost struct {
 	// one host, sharing that host's TLS settings.
 	Mirror bool
 	// Insecure is the insecure-registries entry dockerd applies to this
-	// host, which then verifies no certificate, "" for none.
-	Insecure string
+	// host, which then verifies no certificate, "" for none. Legacy-merged
+	// hosts share one transport, so the entry covering any of them is every
+	// one's; InsecureHost names the host it was listed for.
+	Insecure     string
+	InsecureHost string
 	// Implicit marks the registry's own server, which containerd fills in
 	// where nothing names one: a pull reaches it by naming the registry,
 	// not by any configuration sending it there.
@@ -1269,7 +1272,11 @@ func (r DockerRegistry) tlsError(planned, plannedCA string) error {
 // more is a mirror configuration dockerd leaves as containerd built it. For
 // docker.io the mirrors go ahead of that host as copies of it, sharing its
 // transport and so its TLS settings, and insecure-registries then marks each
-// host it covers. The transport's TLS configuration is never nil there, so
+// host it covers. Every merged host holds the same client, so the first
+// host insecure-registries covers sets InsecureSkipVerify on the one TLS
+// configuration they all send through: a mirror at bodega stops verifying
+// when registry-1.docker.io or another mirror is listed, not only when
+// bodega is. The transport's TLS configuration is never nil there, so
 // mergeLegacyConfig's own certs.d read never runs.
 func ResolveDockerRegistry(root string, daemon *DockerDaemonFile, registry string) DockerRegistry {
 	r := DockerRegistry{Registry: registry}
@@ -1325,8 +1332,15 @@ func ResolveDockerRegistry(root string, daemon *DockerDaemonFile, registry strin
 		}
 		r.Hosts = append(merged, r.Hosts[0])
 	}
-	for i, h := range r.Hosts {
-		r.Hosts[i].Insecure = daemon.Insecure(&url.URL{Scheme: h.Scheme, Host: h.Host})
+	insecure, via := "", ""
+	for _, h := range r.Hosts {
+		if entry := daemon.Insecure(&url.URL{Scheme: h.Scheme, Host: h.Host}); entry != "" {
+			insecure, via = entry, h.Host
+			break
+		}
+	}
+	for i := range r.Hosts {
+		r.Hosts[i].Insecure, r.Hosts[i].InsecureHost = insecure, via
 	}
 	return r
 }

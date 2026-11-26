@@ -1453,3 +1453,24 @@ func TestResolveDockerRegistry(t *testing.T) {
 		}
 	})
 }
+
+func TestB200ReviewDockerCAPlanSharedLegacyTransport(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshotter := range []string{"true", "false"} {
+		t.Run(snapshotter, func(t *testing.T) {
+			root := t.TempDir()
+			writeFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"insecure-registries":["registry-1.docker.io"]}`)
+			_, err := AddCA(caPlan(t, root, DockerDaemon(testBase, nil)), ca, CAHost{Base: testBase, Home: root, Root: root, GOOS: OSLinux})
+			if snapshotter == "true" && (err == nil || !strings.Contains(err.Error(), "insecure")) {
+				t.Fatalf("CA plan must refuse the shared Docker Hub transport that skips verification at bodega; got %v", err)
+			}
+			if snapshotter == "false" && err != nil {
+				t.Fatalf("overlay2 has separate transports and must retain its working CA install: %v", err)
+			}
+		})
+	}
+}

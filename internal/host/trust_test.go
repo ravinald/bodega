@@ -3397,3 +3397,43 @@ func TestB200ReviewDockerHandCheckDoesNotDropBrokenHostsCA(t *testing.T) {
 		t.Fatalf("cannot replace an unread active hosts CA with a system-only hand check: %+v", f)
 	}
 }
+
+func TestB200ReviewDockerLegacyTransportSharesInsecure(t *testing.T) {
+	for _, snapshotter := range []string{"true", "false"} {
+		t.Run(snapshotter, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			pem, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"registry-mirrors":["`+base+`/"],"insecure-registries":["registry-1.docker.io"]}`)
+			dir := "docker.io"
+			want := TrustUnchecked
+			if snapshotter == "false" {
+				dir, want = "bodega.internal:8443", TrustVerified
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, "ca.crt"), string(pem))
+			vs, err := p.Judge([]string{"oci-docker"}, base)
+			if err != nil || len(vs) != 1 || vs[0].State != want {
+				t.Fatalf("want %v: Moby's merged mirror shares the upstream transport's insecure flag on the containerd store; got %+v, %v", want, vs, err)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerDistinctHostTLSIsNotDeduplicated(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "wrong-ca.pem")
+	writeTrustFile(t, wrong, string(other))
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true}}`)
+	body := "server = \"https://ghcr.io\"\n" +
+		"[host.\"" + base + "/v2\"]\ncapabilities = [\"resolve\"]\nca = \"" + ca + "\"\n" +
+		"[host.\"" + base + "\"]\ncapabilities = [\"pull\", \"resolve\"]\nca = \"" + wrong + "\"\n"
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), body)
+	rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"ghcr.io"}}).Check(base)
+	f := p.Apply(rows, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "certificate") {
+		t.Fatalf("the pull host has its own wrong CA even though the resolve host verifies the same peer; got %+v", f)
+	}
+}
