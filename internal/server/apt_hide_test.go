@@ -1223,3 +1223,113 @@ func TestReviewB201OverlappingRebuildMustNotForgetServedRewrite(t *testing.T) {
 		t.Error("restart forgot the concurrently served rewrite and proxied the older upstream Release")
 	}
 }
+
+// ageAptUpstreamCache moves every cached upstream document back by d, which is
+// what d of wall time does to it.
+func ageAptUpstreamCache(s *Server, d time.Duration) {
+	s.aptUpstreamIdx.Range(func(k, v any) bool {
+		doc := *v.(*aptUpstreamDoc)
+		doc.at = doc.at.Add(-d)
+		doc.confirmed = doc.confirmed.Add(-d)
+		s.aptUpstreamIdx.Store(k, &doc)
+		return true
+	})
+}
+
+// A held group is rewritten on every rebuild and reuses its filtered Packages
+// while the Release digests are unchanged. When the hourly rebuild refetched
+// an expired Release and reused the Packages without reading them, the cached
+// Release became an hour younger than the cached Packages. The pocket's next
+// republish then left a pass that had to read Packages (a new hide) fetching
+// them fresh and checking them against the cached, older Release: the digest
+// check failed, the hide never reached the index, and every profile codename
+// over the same pocket failed with it, until that Release expired.
+func TestReviewB201HeldRewriteKeepsReleaseAndPackagesFromOneUpstreamRead(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase:    {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+		hideGroupUpdates: {"amd64": hideStanza("curl", "8.5-1", "amd64")},
+	})
+	ctx := t.Context()
+	rel := "dists/" + hideGroupBase + "/Release"
+	undated, _ := archive.object(rel)
+	archive.setObject(rel, "Date: "+time.Now().UTC().Add(-200*24*time.Hour).Format(time.RFC1123Z)+"\n"+undated)
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(ctx)
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatalf("remove the hide: %v", err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	if !s.aptMirrorRewritten(hideGroupUpdates) {
+		t.Fatal("the unhidden group is not held")
+	}
+
+	ageAptUpstreamCache(s, 2*s.cache.MetadataTTL)
+	s.rebuildAptSnapshot(ctx)
+
+	for rest, body := range hideGroupDists(hideGroupUpdates, map[string]string{
+		"amd64": hideStanza("curl", "8.5-1", "amd64") + hideStanza("curl", "8.5-2", "amd64"),
+	}) {
+		archive.setObject(rest, body)
+	}
+	recordHide(t, s, "curl", "8.5-1", hideGroupUpdates)
+	s.rebuildAptSnapshot(ctx)
+
+	packages := "/apt/dists/" + hideGroupUpdates + "/main/binary-amd64/Packages"
+	if got := aptIndexVersions(t, s, packages, "curl"); slices.Contains(got, "8.5-1") {
+		t.Errorf("the hide's rebuild did not reach the index: %s lists curl %v, want 8.5-1 dropped", hideGroupUpdates, got)
+	}
+}
+
+// The two other ways a path-keyed cache pairs a Packages with a Release from
+// another sync: a cached Packages outliving the Release it matched, and a
+// Release cached before the archive finished publishing the Packages beside
+// it. Both have to recover at the next rebuild, not when metadata_ttl runs
+// out.
+func TestReviewB201UpstreamCachePairsPackagesWithTheReleaseInHand(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase:    {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+		hideGroupUpdates: {"amd64": hideStanza("curl", "8.5-1", "amd64")},
+	})
+	ctx := t.Context()
+	packages := "/apt/dists/" + hideGroupUpdates + "/main/binary-amd64/Packages"
+	publish := func(withRelease bool, stanzas string) {
+		t.Helper()
+		for rest, body := range hideGroupDists(hideGroupUpdates, map[string]string{"amd64": stanzas}) {
+			if withRelease || !strings.HasSuffix(rest, "/Release") {
+				archive.setObject(rest, body)
+			}
+		}
+	}
+	age := func(rest string) {
+		t.Helper()
+		key := hideGroupUpdates + "/" + rest
+		v, ok := s.aptUpstreamIdx.Load(key)
+		if !ok {
+			t.Fatalf("%s is not cached", key)
+		}
+		doc := *v.(*aptUpstreamDoc)
+		doc.confirmed = doc.confirmed.Add(-2 * s.cache.MetadataTTL)
+		s.aptUpstreamIdx.Store(key, &doc)
+	}
+
+	recordHide(t, s, "curl", "8.5-1", hideGroupUpdates)
+	s.rebuildAptSnapshot(ctx)
+
+	publish(true, hideStanza("curl", "8.5-1", "amd64")+hideStanza("curl", "8.5-2", "amd64"))
+	age("Release")
+	s.rebuildAptSnapshot(ctx)
+	if got := aptIndexVersions(t, s, packages, "curl"); !slices.Equal(got, []string{"8.5-2"}) {
+		t.Errorf("after the archive republished, the rewrite lists curl %v, want 8.5-2: the cached Packages from the earlier sync stood in for the one the new Release names", got)
+	}
+
+	publish(false, hideStanza("curl", "8.5-1", "amd64")+hideStanza("curl", "8.5-2", "amd64")+hideStanza("curl", "8.5-3", "amd64"))
+	age("main/binary-amd64/Packages.gz")
+	recordHide(t, s, "curl", "8.5-2", hideGroupUpdates)
+	s.rebuildAptSnapshot(ctx)
+	publish(true, hideStanza("curl", "8.5-1", "amd64")+hideStanza("curl", "8.5-2", "amd64")+hideStanza("curl", "8.5-3", "amd64"))
+	s.rebuildAptSnapshot(ctx)
+	if got := aptIndexVersions(t, s, packages, "curl"); !slices.Equal(got, []string{"8.5-3"}) {
+		t.Errorf("once the archive finished publishing, the rewrite lists curl %v, want 8.5-3: the Release cached mid-sync kept failing the digest check", got)
+	}
+}
