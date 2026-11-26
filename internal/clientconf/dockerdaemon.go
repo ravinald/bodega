@@ -1133,3 +1133,34 @@ func dockerHasPriorDriver(dataRoot string) bool {
 	}
 	return false
 }
+
+// DockerHubHostsPath is the hosts.toml dockerd on the containerd image store
+// reads for Docker Hub, and DockerHubCertsDir the directory holding it.
+const (
+	DockerHubCertsDir  = DockerCertsDir + "/docker.io"
+	DockerHubHostsPath = DockerHubCertsDir + "/hosts.toml"
+)
+
+// DockerHubLegacy is how dockerd on the containerd image store applies
+// registry-mirrors and insecure-registries to docker.io, given hub, the
+// docker.io hosts.toml its resolver loads (nil for none, or one it
+// discards). It is RegistryHosts and mergeLegacyConfig in daemon/hosts.go at
+// moby docker-v29.5.3, over ConfigureHosts in core/remotes/docker/config
+// at containerd v2.2.4, the version that tag pins. A hosts.toml resolving
+// more than one host is a mirror configuration already, which dockerd leaves
+// as containerd built it, so neither setting applies and merged is false.
+// Otherwise the mirrors are copies of docker.io's one host and share its
+// transport, whose TLS containerd has already set: server, the hosts.toml's
+// single host, where hub is one, and with no hosts.toml the *.crt files of
+// DockerHubCertsDir on the system roots (loadCertFiles). The transport's TLS
+// configuration is never nil there, so mergeLegacyConfig's own certs.d read
+// never runs, and the mirror host's certs.d directory is not read at all.
+func DockerHubLegacy(hub *ContainerdHostsFile) (merged bool, server *ContainerdRegistryHost) {
+	if hub == nil {
+		return true, nil
+	}
+	if len(hub.Hosts) != 1 {
+		return false, nil
+	}
+	return true, &hub.Hosts[0]
+}

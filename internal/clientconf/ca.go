@@ -775,6 +775,8 @@ func (h CAHost) dockerDaemonReads(changes []Change) error {
 			path, data, err = c.Target, c.New, nil
 		}
 	}
+	mirrorCA := h.dockerMirrorCA(changes)
+	byHand := "Add the CA to " + mirrorCA.byHand + " by hand"
 	switch {
 	case os.IsNotExist(err):
 		return nil
@@ -788,18 +790,27 @@ func (h CAHost) dockerDaemonReads(changes []Change) error {
 				"Nothing was written. Repair what the error names (dockerd --validate does not repeat it; starting dockerd does), then re-run", manifest.TypeOCI, path, doc.StartError)
 		case doc.StartUnmodeled != "":
 			return fmt.Errorf("%s: %s sets %s, which dockerd acts on against this host as it starts and may exit over, and this command reads no such host state, so whether dockerd runs to use the CA this command installs could not be verified. "+
-				"Nothing was written, and the key is left as it is. Add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path, doc.StartUnmodeled)
+				"Nothing was written, and the key is left as it is. %s", manifest.TypeOCI, path, doc.StartUnmodeled, byHand)
 		case doc.TLSUnmodeled != "":
 			return fmt.Errorf("%s: %s sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to use the CA this command installs could not be verified. "+
-				"Nothing was written, and the key is left as it is. Add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path, doc.TLSUnmodeled)
+				"Nothing was written, and the key is left as it is. %s", manifest.TypeOCI, path, doc.TLSUnmodeled, byHand)
+		}
+		// Neither insecure-registries nor the mirror's certs.d reaches a
+		// dockerd whose docker.io hosts.toml names its hosts: the hosts.toml
+		// files this plan writes carry the TLS, judged by hostsFilesRead.
+		if mirrorCA.dir == "" {
+			break
 		}
 		if base, perr := url.Parse(h.Base); err == nil && perr == nil && doc.Insecure(base) != "" {
 			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", path, doc.Insecure(base)), filepath.Join(filepath.Dir(path), "certs.d"))
 		}
-		// dockerd looks up certs.d by the mirror's host as spelled, and this
-		// command writes only certs.d/<bodega's host>: another spelling of
-		// bodega reads a directory without the CA.
-		if base, perr := url.Parse(h.Base); err == nil && perr == nil {
+		if mirrorCA.hub != "" {
+			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s names one host for Docker Hub, whose TLS settings dockerd verifies registry-mirrors with in place of any certs.d file", mirrorCA.hub), mirrorCA.hub)
+		}
+		// On overlay2 dockerd looks up certs.d by the mirror's host as
+		// spelled, and this command writes only certs.d/<bodega's host>:
+		// another spelling of bodega reads a directory without the CA.
+		if base, perr := url.Parse(h.Base); err == nil && perr == nil && !mirrorCA.containerd {
 			for _, m := range doc.Mirrors {
 				if p, perr := url.Parse(m); perr == nil && namesBodega(m, base) && p.Host != base.Host {
 					return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists the mirror %s, which reaches bodega under another spelling of %s, and dockerd reads certificates for it from certs.d/%s, not the certs.d/%s this command writes", path, m, base.Host, p.Host, base.Host), filepath.Join(filepath.Dir(path), "certs.d"))
@@ -814,14 +825,66 @@ func (h CAHost) dockerDaemonReads(changes []Change) error {
 	// The certs.d directory the ca.crt goes into, loaded whole as dockerd
 	// loads it for the mirror: a client certificate there with no key stops
 	// dockerd configuring TLS for the host at all.
-	if base, err := url.Parse(h.Base); err == nil && base.Host != "" {
-		dir := filepath.Join(filepath.Dir(path), "certs.d", base.Host)
-		if err := DockerCertsDirError(dir, "ca.crt"); err != nil {
+	if mirrorCA.dir != "" {
+		if err := DockerCertsDirError(mirrorCA.dir, "ca.crt"); err != nil {
 			return fmt.Errorf("%s: dockerd does not load the certificates in %s (%w) and sends that host nothing while it cannot, so it would not use the CA this command installs there, and the install could not be verified. "+
-				"Nothing was written. Repair what the error names (a CA certificate takes the extension .crt, a client certificate a .cert with its .key beside it), then re-run", manifest.TypeOCI, dir, err)
+				"Nothing was written. Repair what the error names (a CA certificate takes the extension .crt, a client certificate a .cert with its .key beside it), then re-run", manifest.TypeOCI, mirrorCA.dir, err)
 		}
 	}
 	return nil
+}
+
+// dockerMirror is where dockerd, as the plan leaves it, reads the CA it
+// verifies a registry-mirrors host with.
+type dockerMirror struct {
+	// containerd reports the containerd image store.
+	containerd bool
+	// dir is the certs.d directory whose *.crt files dockerd adds to the
+	// system roots for the mirror, "" where registry-mirrors and
+	// insecure-registries do not apply (DockerHubLegacy).
+	dir string
+	// hub is a docker.io hosts.toml with one host, whose TLS settings
+	// stand in for dir's files.
+	hub string
+	// byHand is where an operator adds the CA by hand.
+	byHand string
+}
+
+// dockerMirrorCA decides dockerMirror for the plan: on overlay2 the mirror's
+// certs.d/<bodega's host>, and on the containerd image store what
+// DockerHubLegacy says of the docker.io hosts.toml the plan writes, else the
+// host's. The image store is the host's, since the plan's daemon.json
+// changes registry-mirrors alone.
+func (h CAHost) dockerMirrorCA(changes []Change) dockerMirror {
+	root := h.Root
+	for _, c := range changes {
+		if c.Record.System == manifest.TypeOCI && strings.HasSuffix(c.Target, DockerDaemonPath) {
+			root = strings.TrimSuffix(c.Target, DockerDaemonPath)
+		}
+	}
+	host := "<bodega host>"
+	if base, err := url.Parse(h.Base); err == nil && base.Host != "" {
+		host = base.Host
+	}
+	containerd, err := DockerContainerdStore(root)
+	if err != nil || !containerd {
+		return dockerMirror{dir: filepath.Join(root, DockerCertsDir, host), byHand: DockerCertsDir + "/" + host + "/ca.crt"}
+	}
+	hubPath := filepath.Join(root, DockerHubHostsPath)
+	hub, _ := LoadContainerdHostsFile(hubPath)
+	for _, c := range changes {
+		if c.Target == hubPath {
+			hub, _ = ParseContainerdHostsFile(filepath.Dir(hubPath), c.New)
+		}
+	}
+	merged, server := DockerHubLegacy(hub)
+	switch {
+	case !merged:
+		return dockerMirror{containerd: true, byHand: "the ca of bodega's host table in each " + DockerCertsDir + "/<registry>/hosts.toml"}
+	case server != nil:
+		return dockerMirror{containerd: true, dir: filepath.Join(root, DockerHubCertsDir), hub: hubPath, byHand: "the ca of the one host in " + DockerHubHostsPath}
+	}
+	return dockerMirror{containerd: true, dir: filepath.Join(root, DockerHubCertsDir), byHand: DockerHubCertsDir + "/ca.crt"}
 }
 
 // containerdReads refuses a plan that writes containerd's hosts.toml on a
@@ -1364,9 +1427,14 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			header = "[host." + jsonString(trim(h.Base)) + "]"
 			line = func(caPath string) string { return "  ca = " + jsonString(caPath) }
 		case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimeDocker:
-			// Docker reads certs.d beside daemon.json, keyed by the host and
-			// port of the registry or mirror it is talking to.
-			if err := addFile(rec.System, filepath.Join(filepath.Dir(c.Target), "certs.d", base.Host, "ca.crt"), ca.PEM); err != nil {
+			// Docker reads certs.d beside daemon.json, keyed on overlay2 by
+			// the host and port of the mirror, and on the containerd image
+			// store by docker.io, whose transport the mirror shares.
+			dir := filepath.Join(filepath.Dir(c.Target), "certs.d", base.Host)
+			if m := h.dockerMirrorCA(changes); m.containerd && m.dir != "" {
+				dir = m.dir
+			}
+			if err := addFile(rec.System, filepath.Join(dir, "ca.crt"), ca.PEM); err != nil {
 				return CAInstall{}, err
 			}
 		}

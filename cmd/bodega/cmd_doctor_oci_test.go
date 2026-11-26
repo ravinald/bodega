@@ -367,3 +367,37 @@ func TestB200ReviewDockerCAInstallRejectsSkipVerify(t *testing.T) {
 		})
 	}
 }
+
+func TestB200ReviewDockerCAInstallUsesEffectiveTLS(t *testing.T) {
+	for _, snapshotter := range []bool{true, false} {
+		t.Run(strconv.FormatBool(snapshotter), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			stubRuntimes(t, "dockerd")
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+			daemon := filepath.Join(home, "etc/docker/daemon.json")
+			body := `{"features":{"containerd-snapshotter":` + strconv.FormatBool(snapshotter) + `},"insecure-registries":["` + strings.TrimPrefix(srv.URL, "https://") + `"]}`
+			for path, content := range map[string]string{caFile: string(caPEM), daemon: body} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+			if snapshotter {
+				if err != nil {
+					t.Fatalf("explicit hosts.toml TLS overrides legacy insecure-registries; install refused: %v\n%s", err, out)
+				}
+				got, err := os.ReadFile(filepath.Join(home, "etc/docker/certs.d/docker.io/hosts.toml"))
+				if err != nil || !strings.Contains(string(got), "  ca = ") || strings.Contains(string(got), "skip_verify = true") {
+					t.Fatalf("want verifying hosts.toml with its CA; got %q, %v", got, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "insecure-registries") {
+				t.Fatalf("overlay2 must retain its legacy TLS refusal: %v\n%s", err, out)
+			}
+		})
+	}
+}

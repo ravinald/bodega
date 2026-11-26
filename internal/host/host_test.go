@@ -1279,3 +1279,31 @@ func TestCheckDockerMirrorUnreadRegistries(t *testing.T) {
 		})
 	}
 }
+
+// B200 R2: on the containerd image store a docker.io hosts.toml resolving
+// more than one host supersedes registry-mirrors, so a mirror naming bodega
+// does not route Docker Hub when that file sends it elsewhere.
+func TestCheckDockerMirrorHubHostsSupersedeMirrors(t *testing.T) {
+	root := t.TempDir()
+	const base = "https://bodega.example.com"
+	write := func(name, body string) {
+		t.Helper()
+		p := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("etc/docker/daemon.json", `{"features":{"containerd-snapshotter":true},"registry-mirrors":["`+base+`/"]}`)
+	write("etc/docker/certs.d/docker.io/hosts.toml", "server = \"https://registry-1.docker.io\"\n[host.\"https://mirror.example\"]\n  capabilities = [\"pull\", \"resolve\"]\n")
+	f := checkDockerMirror(root, "bodega.example.com", []string{"docker.io"}, "")
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "docker.io (") || !strings.Contains(f.Detail, "which dockerd does not apply") {
+		t.Fatalf("want WARN naming docker.io and the unapplied mirror: %+v", f)
+	}
+	write("etc/docker/certs.d/docker.io/hosts.toml", clientconf.ContainerdHosts(base, "docker.io", "https://registry-1.docker.io").Content)
+	if f := checkDockerMirror(root, "bodega.example.com", []string{"docker.io"}, ""); f.Status != StatusOK {
+		t.Fatalf("want OK where docker.io's hosts.toml names bodega: %+v", f)
+	}
+}

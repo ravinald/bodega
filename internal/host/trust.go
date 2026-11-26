@@ -244,37 +244,67 @@ var trustRows = map[string]trustRow{
 
 // dockerHandCheck is the remediation for a daemon.json key doctor does not
 // decide on: the key stays, since dockerd may need it, and the operator
-// verifies bodega's certificate against what dockerd reads, the system
-// store and certs.d/<host>/ca.crt, with openssl instead. -servername only
-// sets SNI; -verify_hostname or -verify_ip is what checks the peer's name.
-func dockerHandCheck(t TrustProbe, u *url.URL, key string) string {
+// verifies bodega's certificate with openssl against each set of roots
+// dockerd would verify it with, which is eff, the stores the image store in
+// use reads. A store with files is the system roots plus those files, and
+// openssl takes one -CAfile at a time, so each file is its own command and
+// any one returning 0 is a pass for that store. -servername only sets SNI;
+// -verify_hostname or -verify_ip is what checks the peer's name.
+func dockerHandCheck(t TrustProbe, u *url.URL, key string, eff []trustStore) string {
 	port := u.Port()
 	if port == "" {
 		port = "443"
-	}
-	ca := ""
-	p := filepath.Join(clientconf.DockerCertsDir, u.Host, "ca.crt")
-	if _, err := plannedfs.Stat(filepath.Join(t.Root, p)); err == nil {
-		ca = " -CAfile " + p
 	}
 	name := "-verify_hostname " + u.Hostname()
 	if net.ParseIP(u.Hostname()) != nil {
 		name = "-verify_ip " + u.Hostname()
 	}
-	return fmt.Sprintf("keep %s if dockerd needs it: doctor cannot verify dockerd's trust while %s is set in %s. Check bodega's certificate by hand against the stores dockerd reads: openssl s_client -connect %s -servername %s %s -verify_return_error%s </dev/null, which ends with \"Verify return code: 0 (ok)\" when dockerd would accept it",
-		key, key, clientconf.DockerDaemonPath, net.JoinHostPort(u.Hostname(), port), u.Hostname(), name, ca)
+	cmd := func(ca string) string {
+		if ca != "" {
+			ca = " -CAfile " + ca
+		}
+		return fmt.Sprintf("openssl s_client -connect %s -servername %s %s -verify_return_error%s </dev/null", net.JoinHostPort(u.Hostname(), port), u.Hostname(), name, ca)
+	}
+	var checks []string
+	for _, s := range eff {
+		if s.blind != "" {
+			continue
+		}
+		if len(s.files) == 0 {
+			checks = append(checks, "for "+s.name+": "+cmd(""))
+			continue
+		}
+		var each []string
+		for _, f := range s.files {
+			// certs.d paths are rooted for the probe; a ca a hosts.toml
+			// names by absolute path is the one dockerd opens.
+			if certs := filepath.Join(t.Root, clientconf.DockerCertsDir); t.Root != "" && strings.HasPrefix(f, certs+string(filepath.Separator)) {
+				f = clientconf.DockerCertsDir + strings.TrimPrefix(f, certs)
+			}
+			each = append(each, cmd(f))
+		}
+		checks = append(checks, "for "+s.name+": "+strings.Join(each, " or "))
+	}
+	if len(checks) == 0 {
+		checks = []string{cmd("")}
+	}
+	return fmt.Sprintf("keep %s if dockerd needs it: doctor cannot verify dockerd's trust while %s is set in %s. Check bodega's certificate by hand against the stores dockerd reads, %s; each ends with \"Verify return code: 0 (ok)\" when dockerd would accept bodega's certificate through that store",
+		key, key, clientconf.DockerDaemonPath, strings.Join(checks, "; "))
 }
 
-// dockerStores is the certs.d directory dockerd reads for bodega at u when a
-// registry-mirrors entry of the daemon.json it loads names that host, and on
-// the containerd image store every hosts.toml under /etc/docker/certs.d that
-// names bodega, whose TLS settings containerd's resolver applies for dockerd
-// as it does for containerd (moby v29.5.3 daemon/hosts.go). The
-// file is loaded whole, as dockerd loads it: one dockerd refuses, over any
-// key, is one it does not start with, so the mirror and the directory are
-// settings nothing runs with and Docker Engine is left unchecked. A file it
-// loads and then exits on as it starts is the same, and so is one holding a
-// key whose effect at start is the host's to decide.
+// dockerStores is what dockerd verifies bodega at u with, for the image store
+// it uses. On overlay2 that is the certs.d directory of each registry-mirrors
+// entry naming bodega, by the host the mirror spells. On the containerd image
+// store it is every hosts.toml under /etc/docker/certs.d naming bodega, whose
+// TLS settings containerd's resolver applies for dockerd as it does for
+// containerd, and registry-mirrors only where DockerHubLegacy says dockerd
+// merges it into docker.io's hosts, verified with docker.io's own TLS.
+// insecure-registries reaches bodega only along that same merge. The file is
+// loaded whole, as dockerd loads it: one dockerd refuses, over any key, is one
+// it does not start with, so the mirror and the directory are settings nothing
+// runs with and Docker Engine is left unchecked. A file it loads and then
+// exits on as it starts is the same, and so is one holding a key whose effect
+// at start is the host's to decide.
 func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	doc, err := clientconf.LoadDockerDaemonFile(filepath.Join(t.Root, clientconf.DockerDaemonPath))
 	switch {
@@ -287,24 +317,39 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	if err != nil {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd exits as it starts choosing its image store (%v), so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
 	}
-	mirrored := doc != nil && slices.ContainsFunc(doc.Mirrors, func(m string) bool { return clientconf.NamesBodega(m, u) })
-	var hosts []trustStore
-	if containerd {
-		hosts = hostsFileStores(t, u, "dockerd", []string{clientconf.DockerCertsDir})
-	}
-	switch {
-	case !mirrored && len(hosts) == 0:
-		return nil
-	case doc == nil:
-		return hosts
+	eff := dockerEffectiveStores(t, u, doc, containerd)
+	if len(eff) == 0 || doc == nil {
+		return eff
 	}
 	if doc.StartUnmodeled != "" {
-		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.StartUnmodeled), blind: fmt.Sprintf("dockerd's configuration sets %s, which dockerd acts on against this host as it starts and may exit over, and doctor reads no such host state, so whether dockerd runs to verify bodega's certificate is unchecked", doc.StartUnmodeled)}}
+		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.StartUnmodeled, eff), blind: fmt.Sprintf("dockerd's configuration sets %s, which dockerd acts on against this host as it starts and may exit over, and doctor reads no such host state, so whether dockerd runs to verify bodega's certificate is unchecked", doc.StartUnmodeled)}}
 	}
 	if doc.TLSUnmodeled != "" {
-		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.TLSUnmodeled), blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
+		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.TLSUnmodeled, eff), blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
 	}
-	if !mirrored || len(hosts) == 1 && hosts[0].blind != "" {
+	return eff
+}
+
+// dockerEffectiveStores is dockerStores for a daemon.json dockerd starts
+// with, before the keys it may not start over are weighed.
+func dockerEffectiveStores(t TrustProbe, u *url.URL, doc *clientconf.DockerDaemonFile, containerd bool) []trustStore {
+	mirrored := doc != nil && slices.ContainsFunc(doc.Mirrors, func(m string) bool { return clientconf.NamesBodega(m, u) })
+	var hosts []trustStore
+	var hub *clientconf.ContainerdRegistryHost
+	if containerd {
+		hosts = hostsFileStores(t, u, "dockerd", []string{clientconf.DockerCertsDir})
+		if len(hosts) == 1 && hosts[0].blind != "" {
+			return hosts
+		}
+		hubDoc, err := clientconf.LoadContainerdHostsFile(filepath.Join(t.Root, clientconf.DockerHubHostsPath))
+		if err != nil {
+			hubDoc = nil
+		}
+		merged := false
+		merged, hub = clientconf.DockerHubLegacy(hubDoc)
+		mirrored = mirrored && merged
+	}
+	if !mirrored {
 		return hosts
 	}
 	if route := plainRoute(doc.Mirrors, u); route != "" {
@@ -312,6 +357,25 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	if entry := doc.Insecure(u); entry != "" {
 		return uncertified("dockerd", fmt.Sprintf("dockerd's configuration lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents", entry))
+	}
+	if containerd {
+		if hub != nil {
+			path := filepath.Join(t.Root, clientconf.DockerHubHostsPath)
+			if hub.SkipVerify != nil && *hub.SkipVerify {
+				return uncertified("dockerd", fmt.Sprintf("%s sets skip_verify = true for its one host, whose transport dockerd sends registry-mirrors through: dockerd then accepts any certificate bodega presents", path))
+			}
+			if err := (&clientconf.ContainerdHostsFile{Hosts: []clientconf.ContainerdRegistryHost{*hub}}).TLSError(""); err != nil {
+				return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd cannot load a certificate %s names (%v) and resolves no host for Docker Hub while it cannot, its mirrors included, so whether dockerd reaches bodega or verifies its certificate is unchecked", path, err)}}
+			}
+			return append(hosts, trustStore{name: "the TLS settings of " + path + ", which dockerd verifies registry-mirrors with", system: true, files: hub.CA, note: loopbackNote("dockerd", u)})
+		}
+		dir := filepath.Join(t.Root, clientconf.DockerHubCertsDir)
+		if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
+			return []trustStore{{name: dir, blind: fmt.Sprintf("dockerd does not load the certificates in %s (%v) and sends Docker Hub's mirrors nothing while it cannot, so whether dockerd verifies bodega's certificate is unchecked", dir, err)}}
+		}
+		s := certsDir(dir)
+		s.note = loopbackNote("dockerd", u)
+		return append(hosts, s)
 	}
 	// dockerd looks up certs.d by the mirror's host as the mirror spells
 	// it, so each spelling of bodega's endpoint owes its own directory.
@@ -332,7 +396,7 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		s.note = loopbackNote("dockerd", u)
 		out = append(out, s)
 	}
-	return append(out, hosts...)
+	return out
 }
 
 // aptStores is the store apt verifies bodega at u against, for a host one of

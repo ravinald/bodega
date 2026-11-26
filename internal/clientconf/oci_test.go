@@ -1317,3 +1317,70 @@ func TestDockerHostsRecordsCopiesContainerdHosts(t *testing.T) {
 		t.Errorf("a plan with no hosts.toml grew to %d records", n)
 	}
 }
+
+// B200 R4: on the containerd image store the CA install follows the Docker
+// Hub hosts dockerd uses. A docker.io hosts.toml in the plan supersedes
+// insecure-registries and the mirror's certs.d; without one, the mirror
+// shares docker.io's transport and its ca.crt goes to certs.d/docker.io; a
+// single-host docker.io hosts.toml on the host carries that TLS itself, so no
+// ca.crt decides it. overlay2 keeps certs.d/<bodega host> and the refusal.
+func TestDockerCAInstallFollowsDockerHubHosts(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := strings.TrimPrefix(testBase, "https://")
+	hub := ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")
+	hub.Paths = map[string]string{OSLinux: DockerHubHostsPath}
+	for _, tc := range []struct {
+		name, daemon, onDisk string
+		withHub              bool
+		wantCA, refuse       string
+	}{
+		{name: "containerd, hosts.toml for docker.io, stale insecure entry", daemon: `{"features":{"containerd-snapshotter":true},"insecure-registries":["` + host + `"]}`, withHub: true, wantCA: "etc/docker/certs.d/" + host + "/ca.crt"},
+		{name: "containerd, mirror alone", daemon: `{"features":{"containerd-snapshotter":true}}`, wantCA: "etc/docker/certs.d/docker.io/ca.crt"},
+		{name: "containerd, mirror alone, insecure entry", daemon: `{"features":{"containerd-snapshotter":true},"insecure-registries":["` + host + `"]}`, refuse: "insecure-registries"},
+		{name: "containerd, single-host docker.io hosts.toml", daemon: `{"features":{"containerd-snapshotter":true}}`, onDisk: "server = \"https://registry-1.docker.io\"\n", refuse: "names one host for Docker Hub"},
+		{name: "overlay2", daemon: `{"features":{"containerd-snapshotter":false}}`, withHub: true, wantCA: "etc/docker/certs.d/" + host + "/ca.crt"},
+		{name: "overlay2, insecure entry", daemon: `{"features":{"containerd-snapshotter":false},"insecure-registries":["` + host + `"]}`, withHub: true, refuse: "insecure-registries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			files := map[string]string{"etc/docker/daemon.json": tc.daemon}
+			if tc.onDisk != "" {
+				files["etc/docker/certs.d/docker.io/hosts.toml"] = tc.onDisk
+			}
+			for name, body := range files {
+				if err := os.MkdirAll(filepath.Join(home, filepath.Dir(name)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(home, name), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			plan := []File{DockerDaemon(testBase, nil)}
+			if tc.withHub {
+				plan = append(plan, hub)
+			}
+			in, err := AddCA(caPlan(t, home, plan...), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if tc.refuse != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.refuse) {
+					t.Fatalf("want a refusal naming %q; got %v", tc.refuse, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(home, tc.wantCA)
+			if !slices.ContainsFunc(in.Changes, func(c Change) bool { return c.Target == want }) {
+				var got []string
+				for _, c := range in.Changes {
+					got = append(got, c.Target)
+				}
+				t.Fatalf("no change writes %s; the plan writes %v", want, got)
+			}
+		})
+	}
+}

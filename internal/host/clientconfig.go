@@ -1020,7 +1020,14 @@ func checkDockerMirror(root, host string, registries []string, scopeErr string) 
 		case mirror == "":
 			lead = path + " mirrors Docker Hub through " + strings.Join(mirrors, ", ") + ", none of them bodega at " + host
 		}
-		f := checkDockerHostsFiles(root, host, registries, mirror != "", lead)
+		// registry-mirrors reaches dockerd's docker.io hosts only where a
+		// hosts.toml for docker.io has not already named its own.
+		hub, _ := clientconf.LoadContainerdHostsFile(filepath.Join(root, clientconf.DockerHubHostsPath))
+		merged, _ := clientconf.DockerHubLegacy(hub)
+		if mirror != "" && !merged {
+			lead += ", which dockerd does not apply: " + filepath.Join(root, clientconf.DockerHubHostsPath) + " names Docker Hub's hosts itself"
+		}
+		f := checkDockerHostsFiles(root, host, registries, mirror != "" && merged, lead)
 		if unchecked != "" {
 			f.Detail += unchecked
 			if f.Status == StatusOK {
@@ -1047,9 +1054,10 @@ func checkDockerMirror(root, host string, registries []string, scopeErr string) 
 
 // checkDockerHostsFiles judges, for a dockerd on the containerd image store,
 // the hosts.toml it reads for each registry under /etc/docker/certs.d, and
-// docker.io's only where registry-mirrors does not already name bodega. A
-// file routes the registry through bodega when its first host that may pull
-// is bodega and may resolve too, which is the first request of a pull by tag.
+// docker.io's only where registry-mirrors names bodega and dockerd applies
+// it (clientconf.DockerHubLegacy). A file routes the registry through
+// bodega when its first host that may pull is bodega and may resolve too,
+// which is the first request of a pull by tag.
 func checkDockerHostsFiles(root, host string, registries []string, mirrored bool, lead string) Finding {
 	var routed, bypass []string
 	for _, r := range registries {
