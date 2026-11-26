@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -68,9 +69,10 @@ func TestOCIClientRendersEachRuntimeForBothSchemes(t *testing.T) {
 			t.Errorf("%s daemon.json = %q (runtime %s, key %q), want %q", c.base, daemon.Content, daemon.Runtime, daemon.Key, c.daemon)
 		}
 		notes := strings.Join(daemon.Notes, ". ")
-		if !strings.Contains(notes, "covers Docker Hub only") || !strings.Contains(notes, "ghcr.io or quay.io") ||
-			!strings.Contains(notes, "/etc/containerd/certs.d/<registry>/hosts.toml") || !strings.Contains(notes, RegistriesConfDropIn) {
-			t.Errorf("%s daemon.json notes do not name the Docker Hub limit and the other files: %q", c.base, notes)
+		if !strings.Contains(notes, "containerd image store") || !strings.Contains(notes, DockerCertsDir+"/<registry>/hosts.toml for every registry") ||
+			!strings.Contains(notes, "overlay2 image store registry-mirrors covers Docker Hub only") || !strings.Contains(notes, "ghcr.io or quay.io") ||
+			!strings.Contains(notes, "pulled and recreated") {
+			t.Errorf("%s daemon.json notes do not say what each image store covers: %q", c.base, notes)
 		}
 		if got := strings.Contains(notes, "insecure-registries"); got != c.insecureNote {
 			t.Errorf("%s daemon.json notes mention insecure-registries = %v, want %v", c.base, got, c.insecureNote)
@@ -1200,7 +1202,10 @@ func TestDockerStartValidityFollowsNewDaemon(t *testing.T) {
 		{"live restore", `{"live-restore":true}`, "", "live-restore"},
 		{"data root", `{"data-root":"/srv/docker"}`, "", "data-root"},
 		{"rootless", `{"rootless":true,"exec-opts":["native.cgroupdriver=systemd"]}`, "", "rootless"},
-		{"a feature", `{"features":{"containerd-snapshotter":true}}`, "", "features"},
+		{"the image store feature alone", `{"features":{"containerd-snapshotter":true}}`, "", ""},
+		{"the image store feature off", `{"features":{"containerd-snapshotter":false}}`, "", ""},
+		{"another feature", `{"features":{"cdi":true}}`, "", "features"},
+		{"another feature beside the image store", `{"features":{"containerd-snapshotter":true,"cdi":true}}`, "", "features"},
 		{"a listener", `{"hosts":["unix:///var/run/docker.sock"]}`, "", "hosts"},
 		{"a proxy in its group", `{"proxies":{"https-proxy":"http://proxy.internal:3128"}}`, "", "https-proxy"},
 		{"a default turned off", `{"userland-proxy":false}`, "", "userland-proxy"},
@@ -1225,5 +1230,247 @@ func TestDockerStartValidityFollowsNewDaemon(t *testing.T) {
 		if err != nil || !strings.Contains(string(out), "https://bodega.internal/") {
 			t.Errorf("%s: a configure that installs no CA must still edit the file: %v\n%s", c.name, err, out)
 		}
+	}
+}
+
+// B200 R1, R7: DockerContainerdStore is determineImageStoreChoice in
+// daemon/image_store_choice.go at moby docker-v29.5.3, with
+// graphdriver.HasPriorDriver (daemon/graphdriver/driver.go) for the prior
+// driver: features.containerd-snapshotter where set, else containerd unless
+// data-root holds a non-empty non-vfs driver directory or storage-driver
+// names a registered graphdriver.
+func TestDockerContainerdStorePortsDetermineImageStoreChoice(t *testing.T) {
+	for _, c := range []struct {
+		name, daemon string
+		dirs         []string
+		files        []string
+		want         bool
+		err          string
+	}{
+		{name: "no daemon.json, fresh host", want: true},
+		{name: "unset, fresh host", daemon: `{}`, want: true},
+		{name: "unset, a prior overlay2 directory", daemon: `{}`, files: []string{"var/lib/docker/overlay2/l/x"}, want: false},
+		{name: "unset, an empty overlay2 directory", daemon: `{}`, dirs: []string{"var/lib/docker/overlay2"}, want: true},
+		{name: "unset, a prior vfs directory", daemon: `{}`, files: []string{"var/lib/docker/vfs/dir/x"}, want: true},
+		{name: "unset, a prior driver under another data-root", daemon: `{"data-root":"/srv/docker"}`, files: []string{"srv/docker/btrfs/x"}, want: false},
+		{name: "unset, a prior driver outside data-root", daemon: `{"data-root":"/srv/docker"}`, files: []string{"var/lib/docker/overlay2/x"}, want: true},
+		{name: "true", daemon: `{"features":{"containerd-snapshotter":true}}`, want: true},
+		{name: "true over a prior driver", daemon: `{"features":{"containerd-snapshotter":true}}`, files: []string{"var/lib/docker/overlay2/x"}, want: true},
+		{name: "true beside storage-driver overlay2", daemon: `{"features":{"containerd-snapshotter":true},"storage-driver":"overlay2"}`, want: true},
+		{name: "false", daemon: `{"features":{"containerd-snapshotter":false}}`, want: false},
+		{name: "false beside a snapshotter name", daemon: `{"features":{"containerd-snapshotter":false},"storage-driver":"overlayfs"}`, err: `"overlayfs" is not registered`},
+		{name: "unset, storage-driver a graphdriver", daemon: `{"storage-driver":"overlay2"}`, want: false},
+		{name: "unset, storage-driver a snapshotter", daemon: `{"storage-driver":"overlayfs"}`, want: true},
+		{name: "another feature alone", daemon: `{"features":{"cdi":true}}`, want: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			if c.daemon != "" {
+				writeUnder(t, root, map[string]string{DockerDaemonPath: c.daemon})
+			}
+			for _, d := range c.dirs {
+				if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, f := range c.files {
+				writeUnder(t, root, map[string]string{f: "x"})
+			}
+			got, err := DockerContainerdStore(root)
+			if c.err != "" {
+				if err == nil || !strings.Contains(err.Error(), c.err) {
+					t.Fatalf("err = %v, want %q", err, c.err)
+				}
+				return
+			}
+			if err != nil || got != c.want {
+				t.Errorf("DockerContainerdStore = %v, %v; want %v", got, err, c.want)
+			}
+		})
+	}
+}
+
+// B200 R4: a containerd-store dockerd gets each containerd hosts.toml again
+// under /etc/docker/certs.d, fetched from the same file and placed after
+// daemon.json; a plan without one is returned as it came.
+func TestDockerHostsRecordsCopiesContainerdHosts(t *testing.T) {
+	var records []PlanRecord
+	for _, f := range OCIClient("https://bodega.internal", map[string]string{"docker.io": "https://registry-1.docker.io", "ghcr.io": "https://ghcr.io"}) {
+		records = append(records, PlanRecord{System: manifest.TypeOCI, Action: PlanInstall, Path: "~" + f.Path(OSLinux), URL: "u/" + f.Key, SHA256: f.Key})
+	}
+	got := DockerHostsRecords(records)
+	var paths []string
+	for _, r := range got {
+		paths = append(paths, strings.TrimPrefix(r.Path, "~"))
+	}
+	want := []string{DockerDaemonPath, "/etc/docker/certs.d/docker.io/hosts.toml", "/etc/docker/certs.d/ghcr.io/hosts.toml",
+		"/etc/containerd/certs.d/docker.io/hosts.toml", "/etc/containerd/certs.d/ghcr.io/hosts.toml", ContainerdConfigPath, RegistriesConfDropIn}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+	if got[2].URL != "u/"+OCIHostsFileKey("ghcr.io") || got[2].SHA256 != OCIHostsFileKey("ghcr.io") {
+		t.Errorf("docker's ghcr.io record fetches %s (%s), not containerd's file", got[2].URL, got[2].SHA256)
+	}
+	if OCIRuntimeOf(got[2].Path) != RuntimeDocker {
+		t.Errorf("OCIRuntimeOf(%s) = %q, want docker", got[2].Path, OCIRuntimeOf(got[2].Path))
+	}
+	if n := len(DockerHostsRecords(records[:1])); n != 1 {
+		t.Errorf("a plan with no hosts.toml grew to %d records", n)
+	}
+}
+
+// B200 R4: on the containerd image store the CA install follows the Docker
+// Hub hosts dockerd uses. A docker.io hosts.toml in the plan supersedes
+// insecure-registries and the mirror's certs.d; without one, the mirror
+// shares docker.io's transport and its ca.crt goes to certs.d/docker.io; a
+// single-host docker.io hosts.toml on the host carries that TLS itself, so no
+// ca.crt decides it. overlay2 keeps certs.d/<bodega host> and the refusal.
+func TestDockerCAInstallFollowsDockerHubHosts(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := strings.TrimPrefix(testBase, "https://")
+	hub := ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")
+	hub.Paths = map[string]string{OSLinux: DockerHubHostsPath}
+	for _, tc := range []struct {
+		name, daemon, onDisk string
+		withHub              bool
+		wantCA, refuse       string
+	}{
+		{name: "containerd, hosts.toml for docker.io, stale insecure entry", daemon: `{"features":{"containerd-snapshotter":true},"insecure-registries":["` + host + `"]}`, withHub: true, wantCA: "etc/docker/certs.d/" + host + "/ca.crt"},
+		{name: "containerd, mirror alone", daemon: `{"features":{"containerd-snapshotter":true}}`, wantCA: "etc/docker/certs.d/docker.io/ca.crt"},
+		{name: "containerd, mirror alone, insecure entry", daemon: `{"features":{"containerd-snapshotter":true},"insecure-registries":["` + host + `"]}`, refuse: "insecure-registries"},
+		{name: "containerd, single-host docker.io hosts.toml", daemon: `{"features":{"containerd-snapshotter":true}}`, onDisk: "server = \"https://registry-1.docker.io\"\n", refuse: "names one host for Docker Hub"},
+		{name: "overlay2", daemon: `{"features":{"containerd-snapshotter":false}}`, withHub: true, wantCA: "etc/docker/certs.d/" + host + "/ca.crt"},
+		{name: "overlay2, insecure entry", daemon: `{"features":{"containerd-snapshotter":false},"insecure-registries":["` + host + `"]}`, withHub: true, refuse: "insecure-registries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			files := map[string]string{"etc/docker/daemon.json": tc.daemon}
+			if tc.onDisk != "" {
+				files["etc/docker/certs.d/docker.io/hosts.toml"] = tc.onDisk
+			}
+			for name, body := range files {
+				if err := os.MkdirAll(filepath.Join(home, filepath.Dir(name)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(home, name), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			plan := []File{DockerDaemon(testBase, nil)}
+			if tc.withHub {
+				plan = append(plan, hub)
+			}
+			in, err := AddCA(caPlan(t, home, plan...), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if tc.refuse != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.refuse) {
+					t.Fatalf("want a refusal naming %q; got %v", tc.refuse, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(home, tc.wantCA)
+			if !slices.ContainsFunc(in.Changes, func(c Change) bool { return c.Target == want }) {
+				var got []string
+				for _, c := range in.Changes {
+					got = append(got, c.Target)
+				}
+				t.Fatalf("no change writes %s; the plan writes %v", want, got)
+			}
+		})
+	}
+}
+
+// B200 R2/R4: ResolveDockerRegistry follows containerd v2.2.4's directory
+// selection and certificate-file loader and moby docker-v29.5.3's legacy
+// merge.
+func TestResolveDockerRegistry(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.internal")
+	certs := func(root string) string { return filepath.Join(root, DockerCertsDir) }
+	hostsFor := func(server string) string {
+		return "server = \"https://upstream.example\"\n\n[host.\"" + server + "\"]\n  capabilities = [\"pull\", \"resolve\"]\n"
+	}
+
+	t.Run("directory precedence", func(t *testing.T) {
+		root := t.TempDir()
+		reg := "registry.example:5000"
+		if r := ResolveDockerRegistry(root, nil, reg); r.Dir != "" || len(r.Hosts) != 1 || !r.Hosts[0].Implicit || r.Hosts[0].Host != reg {
+			t.Fatalf("no directory: want the registry's own server, got %+v", r)
+		}
+		for i, dir := range []string{"_default", reg, "registry.example_5000_"} {
+			mirror := "mirror" + strconv.Itoa(i) + ".example"
+			writeFile(t, filepath.Join(certs(root), dir, "hosts.toml"), hostsFor("https://"+mirror))
+			r := ResolveDockerRegistry(root, nil, reg)
+			if r.Dir != filepath.Join(certs(root), dir) || r.Hosts[0].Host != mirror {
+				t.Fatalf("with %s present: want it selected, got %+v", dir, r)
+			}
+		}
+		if got := DockerRegistries(certs(root), nil); !slices.Equal(got, []string{"_default", "docker.io", reg}) {
+			t.Fatalf("DockerRegistries = %v", got)
+		}
+	})
+
+	t.Run("certificate files", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(certs(root), "ghcr.io")
+		writeFile(t, filepath.Join(dir, "ca.crt"), string(caPEM))
+		writeFile(t, filepath.Join(dir, "unused.key"), "not a key")
+		r := ResolveDockerRegistry(root, nil, "ghcr.io")
+		if r.TLSErr != nil || len(r.Hosts) != 1 || !slices.Equal(r.Hosts[0].CA, []string{filepath.Join(dir, "ca.crt")}) {
+			t.Fatalf("an orphan .key is not read: %+v", r)
+		}
+		writeFile(t, filepath.Join(dir, "hosts.toml"), "server = 1\n")
+		if r := ResolveDockerRegistry(root, nil, "ghcr.io"); r.Discarded == nil || r.TLSErr != nil || len(r.Hosts[0].CA) != 1 {
+			t.Fatalf("a discarded hosts.toml falls back to the certificate files: %+v", r)
+		}
+		writeFile(t, filepath.Join(dir, "broken.crt"), "not a certificate")
+		if r := ResolveDockerRegistry(root, nil, "ghcr.io"); r.TLSErr == nil {
+			t.Fatalf("a .crt with no PEM certificate fails the registry: %+v", r)
+		}
+	})
+
+	t.Run("legacy merge", func(t *testing.T) {
+		root := t.TempDir()
+		daemon := &DockerDaemonFile{Mirrors: []string{"https://bodega.internal:8443/"}, InsecureRegistries: []string{"bodega.internal:8443"}}
+		writeFile(t, filepath.Join(certs(root), "ghcr.io", "hosts.toml"), "server = \"https://bodega.internal:8443\"\n")
+		r := ResolveDockerRegistry(root, daemon, "ghcr.io")
+		if !r.Legacy || len(r.Hosts) != 1 || r.Hosts[0].Insecure != "bodega.internal:8443" {
+			t.Fatalf("one host: insecure-registries applies to it with no Docker Hub mirror: %+v", r)
+		}
+		writeFile(t, filepath.Join(certs(root), "docker.io", "ca.crt"), string(caPEM))
+		r = ResolveDockerRegistry(root, daemon, "docker.io")
+		if !r.Legacy || len(r.Hosts) != 2 || !r.Hosts[0].Mirror || r.Hosts[0].Host != "bodega.internal:8443" || r.Hosts[0].Path != "/v2" || len(r.Hosts[0].CA) != 1 || r.Hosts[1].Host != "registry-1.docker.io" {
+			t.Fatalf("docker.io: the mirror goes first and shares its host's TLS: %+v", r)
+		}
+		writeFile(t, filepath.Join(certs(root), "_default", "hosts.toml"), hostsFor("https://elsewhere.example"))
+		if r := ResolveDockerRegistry(root, daemon, "quay.io"); r.Legacy || len(r.Hosts) != 2 || r.Hosts[0].Host != "elsewhere.example" || r.Hosts[0].Insecure != "" {
+			t.Fatalf("two hosts from _default: no legacy merge: %+v", r)
+		}
+	})
+}
+
+func TestB200ReviewDockerCAPlanSharedLegacyTransport(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshotter := range []string{"true", "false"} {
+		t.Run(snapshotter, func(t *testing.T) {
+			root := t.TempDir()
+			writeFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"insecure-registries":["registry-1.docker.io"]}`)
+			_, err := AddCA(caPlan(t, root, DockerDaemon(testBase, nil)), ca, CAHost{Base: testBase, Home: root, Root: root, GOOS: OSLinux})
+			if snapshotter == "true" && (err == nil || !strings.Contains(err.Error(), "insecure")) {
+				t.Fatalf("CA plan must refuse the shared Docker Hub transport that skips verification at bodega; got %v", err)
+			}
+			if snapshotter == "false" && err != nil {
+				t.Fatalf("overlay2 has separate transports and must retain its working CA install: %v", err)
+			}
+		})
 	}
 }

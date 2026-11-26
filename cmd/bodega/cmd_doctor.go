@@ -327,7 +327,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
+			registries, registriesUnread := doctorOCIRegistries(base, token, allowPlaintext)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF"), Registries: registries, RegistriesUnread: registriesUnread}.Check(base)...)
 			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
 			}
@@ -723,6 +724,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		return err
 	}
+	records = dockerStoreRecords(records)
 	if records, err = keepPresentRuntimes(records, slices.Contains(req.systems, manifest.TypeOCI)); err != nil {
 		return err
 	}
@@ -759,6 +761,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			return err
 		}
 		changes = append(changes, c)
+	}
+	if err := clientconf.DockerHostsShadowed(changes); err != nil {
+		return err
 	}
 	var caStep []string
 	var caOSStore []string
@@ -1261,6 +1266,31 @@ func rpmDisableStep(changes []clientconf.Change) ([]string, error) {
 	return append([]string{"dnf", "config-manager", "--set-disabled"}, ids...), nil
 }
 
+// dockerStoreRecords adds Docker's hosts.toml records where dockerd is on
+// PATH and keeps its images in the containerd image store, judged under the
+// root the plan's daemon.json is written beneath. A daemon.json dockerd
+// refuses adds nothing: the merge into it refuses the run on its own.
+func dockerStoreRecords(records []clientconf.PlanRecord) []clientconf.PlanRecord {
+	if !runtimePresent(clientconf.RuntimeDocker) {
+		return records
+	}
+	home, _ := os.UserHomeDir()
+	for _, r := range records {
+		if r.System != manifest.TypeOCI || !strings.HasSuffix(r.Path, clientconf.DockerDaemonPath) {
+			continue
+		}
+		target, err := clientconf.TargetPath(r.Path, home)
+		if err != nil {
+			return records
+		}
+		if containerd, err := clientconf.DockerContainerdStore(strings.TrimSuffix(target, clientconf.DockerDaemonPath)); err == nil && containerd {
+			return clientconf.DockerHostsRecords(records)
+		}
+		return records
+	}
+	return records
+}
+
 // runtimePresent reports whether any of rt's commands is on PATH.
 func runtimePresent(rt string) bool {
 	for _, bin := range clientconf.RuntimeBinaries[rt] {
@@ -1335,6 +1365,44 @@ func printRuntimeRestarts(changes []clientconf.Change) {
 			}
 		}
 	}
+}
+
+// doctorOCIRegistries is the registries bodega at base serves this host,
+// one per containerd hosts.toml record of its plan: the server renders one
+// for each oci_upstreams key, so the record paths name its registry set. A
+// client's own config is not the server's, so nothing local stands in for
+// it; the string says why the set could not be read. The plan's oci paths
+// are Linux paths, which is where dockerd reads them. Asked only where
+// dockerd is on PATH, the one row that reads the set.
+func doctorOCIRegistries(base, token string, allowPlaintext bool) ([]string, string) {
+	if !runtimePresent(clientconf.RuntimeDocker) {
+		return nil, ""
+	}
+	if base == "" {
+		return nil, "doctor knows no bodega URL; pass --url"
+	}
+	client, err := NewClient(base, token, allowPlaintext)
+	if err != nil {
+		return nil, err.Error()
+	}
+	client.HTTP.Timeout = 10 * time.Second
+	var plan clientconf.Plan
+	if err := getJSON(client, "/client/plan?"+url.Values{"os": {clientconf.OSLinux}}.Encode(), &plan); err != nil {
+		return nil, err.Error()
+	}
+	var regs []string
+	for _, r := range plan.Records {
+		if r.System != manifest.TypeOCI || r.Action != clientconf.PlanInstall {
+			continue
+		}
+		if _, rest, ok := strings.Cut(r.Path, clientconf.ContainerdCertsDir+"/"); ok {
+			if reg, ok := strings.CutSuffix(rest, "/hosts.toml"); ok && !strings.Contains(reg, "/") && !slices.Contains(regs, reg) {
+				regs = append(regs, reg)
+			}
+		}
+	}
+	slices.Sort(regs)
+	return regs, ""
 }
 
 // doctorBaseURL is the bodega URL doctor's report compares a client's

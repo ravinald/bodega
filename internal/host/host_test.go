@@ -2,6 +2,7 @@ package host
 
 import (
 	"errors"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1156,5 +1157,153 @@ func TestDockerLookupDocumentation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// B200 R2, R3, R7: the oci-docker row follows the image store dockerd picks.
+// Under the containerd store it judges /etc/docker/certs.d/<registry>/hosts.toml
+// for every oci_upstreams registry, docker.io's only where registry-mirrors
+// does not name bodega; under overlay2 it says the other registries bypass
+// bodega, whatever hosts.toml files sit there, and what switching costs.
+func TestCheckDockerMirrorFollowsImageStore(t *testing.T) {
+	registries := []string{"docker.io", "ghcr.io", "quay.io"}
+	bodega := func(reg string) string {
+		return clientconf.ContainerdHosts("https://bodega.internal", reg, "https://"+reg).Content
+	}
+	elsewhere := "server = \"https://ghcr.io\"\n\n[host.\"https://other.internal\"]\n  capabilities = [\"pull\", \"resolve\"]\n"
+	pullOnly := "server = \"https://ghcr.io\"\n\n[host.\"https://bodega.internal\"]\n  capabilities = [\"pull\"]\n"
+	mirrored := `{"registry-mirrors":["https://bodega.internal/"]}`
+	prior := "var/lib/docker/overlay2/l/ABC"
+	all := map[string]string{
+		"etc/docker/certs.d/ghcr.io/hosts.toml": bodega("ghcr.io"),
+		"etc/docker/certs.d/quay.io/hosts.toml": bodega("quay.io"),
+	}
+	with := func(extra map[string]string, drop ...string) map[string]string {
+		out := maps.Clone(all)
+		maps.Copy(out, extra)
+		for _, d := range drop {
+			delete(out, d)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name, daemon string
+		files        map[string]string
+		status       Status
+		want, not    []string
+	}{
+		{name: "containerd store, every file at bodega", daemon: mirrored, files: all, status: StatusOK,
+			want: []string{"containerd image store", "ghcr.io, quay.io routed through bodega", "mirrors Docker Hub through https://bodega.internal/"}},
+		{name: "containerd store, ghcr.io missing", daemon: mirrored, files: with(nil, "etc/docker/certs.d/ghcr.io/hosts.toml"), status: StatusWarn,
+			want: []string{"ghcr.io (no ", "quay.io routed through bodega", "bypasses bodega's registry"}, not: []string{"quay.io (no"}},
+		{name: "containerd store, ghcr.io names another host", daemon: mirrored, files: with(map[string]string{"etc/docker/certs.d/ghcr.io/hosts.toml": elsewhere}), status: StatusWarn,
+			want: []string{"ghcr.io (", "sends pulls to https://other.internal before bodega", "bypasses bodega's registry"}},
+		{name: "containerd store, bodega without resolve", daemon: mirrored, files: with(map[string]string{"etc/docker/certs.d/ghcr.io/hosts.toml": pullOnly}), status: StatusWarn,
+			want: []string{"ghcr.io (", "that may pull and resolve"}},
+		{name: "containerd store, no mirror and no docker.io file", daemon: `{}`, files: all, status: StatusWarn,
+			want: []string{"docker.io (no ", "ghcr.io, quay.io routed"}},
+		{name: "containerd store, no mirror and docker.io's file at bodega", daemon: `{}`, files: with(map[string]string{"etc/docker/certs.d/docker.io/hosts.toml": bodega("docker.io")}), status: StatusOK,
+			want: []string{"docker.io, ghcr.io, quay.io routed through bodega"}},
+		{name: "containerd store named by features", daemon: `{"registry-mirrors":["https://bodega.internal/"],"features":{"containerd-snapshotter":true}}`, files: with(map[string]string{prior: "x"}), status: StatusOK,
+			want: []string{"containerd image store", "ghcr.io, quay.io routed"}},
+		{name: "overlay2 by features, hosts.toml files present", daemon: `{"registry-mirrors":["https://bodega.internal/"],"features":{"containerd-snapshotter":false}}`, files: all, status: StatusOK,
+			want: []string{"graphdriver such as overlay2", "(ghcr.io, quay.io) pull from their own registry", "containerd-snapshotter", "pulled and recreated"}, not: []string{"routed through bodega"}},
+		{name: "overlay2 from a prior driver, no hosts.toml files", daemon: mirrored, files: map[string]string{prior: "x"}, status: StatusOK,
+			want: []string{"graphdriver such as overlay2", "(ghcr.io, quay.io) pull from their own registry", "hides every image and container"}},
+		{name: "overlay2 with no bodega mirror", daemon: `{"storage-driver":"overlay2"}`, files: all, status: StatusWarn,
+			want: []string{"sets no registry-mirrors", "pull from their own registry"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, write := ociFixture(t)
+			write(clientconf.DockerDaemonPath, c.daemon)
+			for p, body := range c.files {
+				write(p, body)
+			}
+			f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), Registries: registries}, "oci-docker")
+			if f.Status != c.status {
+				t.Errorf("status = %s, want %s: %s", f.Status, c.status, f.Detail)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(f.Detail, w) {
+					t.Errorf("detail lacks %q: %s", w, f.Detail)
+				}
+			}
+			for _, n := range c.not {
+				if strings.Contains(f.Detail, n) {
+					t.Errorf("detail holds %q: %s", n, f.Detail)
+				}
+			}
+		})
+	}
+}
+
+// B200: a registry set the server could not be asked for is not certified.
+// Under the containerd store an OK on Docker Hub alone becomes a skip naming
+// the error; a warning stays a warning; overlay2 says which registries it
+// could not name.
+func TestCheckDockerMirrorUnreadRegistries(t *testing.T) {
+	hub := clientconf.ContainerdHosts("https://bodega.internal", "docker.io", "https://registry-1.docker.io").Content
+	for _, c := range []struct {
+		name, daemon string
+		files        map[string]string
+		status       Status
+		want         []string
+	}{
+		{name: "containerd store, hub mirrored", daemon: `{"registry-mirrors":["https://bodega.internal/"]}`, status: StatusSkip,
+			want: []string{"could not be read (connection refused)", "registries other than Docker Hub are unchecked"}},
+		{name: "containerd store, hub through hosts.toml", daemon: `{}`, files: map[string]string{"etc/docker/certs.d/docker.io/hosts.toml": hub}, status: StatusSkip,
+			want: []string{"docker.io routed through bodega", "unchecked"}},
+		{name: "containerd store, hub bypassing", daemon: `{}`, status: StatusWarn,
+			want: []string{"docker.io (no ", "unchecked"}},
+		{name: "overlay2", daemon: `{"registry-mirrors":["https://bodega.internal/"],"features":{"containerd-snapshotter":false}}`, status: StatusOK,
+			want: []string{"any registry other than Docker Hub (which ones bodega serves could not be read: connection refused)"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, write := ociFixture(t)
+			write(clientconf.DockerDaemonPath, c.daemon)
+			for p, body := range c.files {
+				write(p, body)
+			}
+			f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), Registries: []string{"docker.io", "ghcr.io"}, RegistriesUnread: "connection refused"}, "oci-docker")
+			if f.Status != c.status {
+				t.Errorf("status = %s, want %s: %s", f.Status, c.status, f.Detail)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(f.Detail, w) {
+					t.Errorf("detail lacks %q: %s", w, f.Detail)
+				}
+			}
+			if strings.Contains(f.Detail, "ghcr.io") {
+				t.Errorf("detail names ghcr.io from a set nobody served: %s", f.Detail)
+			}
+		})
+	}
+}
+
+// B200 R2: on the containerd image store a docker.io hosts.toml resolving
+// more than one host supersedes registry-mirrors, so a mirror naming bodega
+// does not route Docker Hub when that file sends it elsewhere.
+func TestCheckDockerMirrorHubHostsSupersedeMirrors(t *testing.T) {
+	root := t.TempDir()
+	const base = "https://bodega.example.com"
+	write := func(name, body string) {
+		t.Helper()
+		p := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("etc/docker/daemon.json", `{"features":{"containerd-snapshotter":true},"registry-mirrors":["`+base+`/"]}`)
+	write("etc/docker/certs.d/docker.io/hosts.toml", "server = \"https://registry-1.docker.io\"\n[host.\"https://mirror.example\"]\n  capabilities = [\"pull\", \"resolve\"]\n")
+	f := checkDockerMirror(root, "bodega.example.com", []string{"docker.io"}, "")
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "docker.io (") || !strings.Contains(f.Detail, "which dockerd does not apply") {
+		t.Fatalf("want WARN naming docker.io and the unapplied mirror: %+v", f)
+	}
+	write("etc/docker/certs.d/docker.io/hosts.toml", clientconf.ContainerdHosts(base, "docker.io", "https://registry-1.docker.io").Content)
+	if f := checkDockerMirror(root, "bodega.example.com", []string{"docker.io"}, ""); f.Status != StatusOK {
+		t.Fatalf("want OK where docker.io's hosts.toml names bodega: %+v", f)
 	}
 }

@@ -613,6 +613,13 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 	}
 	home, root := t.TempDir(), t.TempDir()
 	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\nID_LIKE=debian\n")}
+	// overlay2, where dockerd reads the mirror's ca.crt by bodega's host.
+	if err := os.MkdirAll(filepath.Join(home, "etc/docker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "etc/docker/daemon.json"), []byte(`{"features":{"containerd-snapshotter":false}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	plan := func() []Change {
 		oci := OCIClient(testBase, map[string]string{"docker.io": "https://registry-1.docker.io"})
 		files := []File{
@@ -2810,7 +2817,7 @@ func TestAudit23EndpointValuesRefuseCAPlan(t *testing.T) {
 		{name: "helm, a repository in a scheme with no getter", plan: Helm(testBase),
 			files: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: other\n  url: ftp://charts.example/\n"}, names: "could not find protocol handler for: ftp"},
 		{name: "docker, a client certificate with no key", plan: DockerDaemon(testBase, nil),
-			files: map[string]string{"etc/docker/certs.d/bodega.example.com/client.cert": string(caPEM)}, names: "missing key client.key"},
+			files: map[string]string{"etc/docker/daemon.json": `{"features":{"containerd-snapshotter":false}}`, "etc/docker/certs.d/bodega.example.com/client.cert": string(caPEM)}, names: "missing key client.key"},
 		{name: "containerd, a ca another host of the file names and nothing holds", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
 			files: map[string]string{"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n\n[host.\"https://mirror.example\"]\n  ca = \"/missing/mirror-ca.pem\"\n"}, names: "unable to read CA cert"},
 	} {

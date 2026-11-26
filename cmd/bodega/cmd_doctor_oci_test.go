@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -161,5 +162,383 @@ func TestDoctorReportsDockerWithNoMirror(t *testing.T) {
 	}
 	if strings.Contains(out, "oci-containerd") || strings.Contains(out, "oci-podman") {
 		t.Errorf("a runtime not on PATH got a row:\n%s", out)
+	}
+}
+
+// B200 R4: --configure oci --apply on a dockerd keeping the containerd image
+// store writes a hosts.toml per oci_upstreams registry under
+// /etc/docker/certs.d, ContainerdHosts' rendering, beside registry-mirrors;
+// on overlay2 it writes none for Docker.
+func TestDoctorConfigureOCIWritesDockerHostsByImageStore(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		prior bool
+		want  bool
+	}{
+		{name: "containerd store", want: true},
+		{name: "overlay2", prior: true, want: false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			stubRuntimes(t, "dockerd")
+			srv := ociPlanServer(t, "http://bodega.internal:8080")
+			files := map[string]string{"etc/docker/daemon.json": `{"log-driver":"journald"}`}
+			if c.prior {
+				files["var/lib/docker/overlay2/l/ABC"] = "x"
+			}
+			for p, body := range files {
+				full := filepath.Join(home, p)
+				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := runDoctor(t, "--configure", "oci", "--url", srv.URL, "--allow-plaintext", "--apply")
+			if err != nil {
+				t.Fatalf("--apply = %v:\n%s", err, out)
+			}
+			if got, _ := os.ReadFile(filepath.Join(home, "etc/docker/daemon.json")); !strings.Contains(string(got), `"http://bodega.internal:8080/"`) {
+				t.Errorf("daemon.json after --apply = %s", got)
+			}
+			for _, reg := range []string{"docker.io", "ghcr.io"} {
+				p := filepath.Join(home, "etc/docker/certs.d", reg, "hosts.toml")
+				got, err := os.ReadFile(p)
+				switch {
+				case c.want && string(got) != clientconf.ContainerdHosts("http://bodega.internal:8080", reg, map[string]string{"docker.io": "https://registry-1.docker.io", "ghcr.io": "https://ghcr.io"}[reg]).Content:
+					t.Errorf("%s = %q, %v; want ContainerdHosts' file", p, got, err)
+				case !c.want && !errors.Is(err, os.ErrNotExist):
+					t.Errorf("%s written on an overlay2 dockerd: %v", p, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(home, "etc/containerd/certs.d")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("containerd's files were written with no containerd on PATH: %v", err)
+			}
+			out, err = runDoctor(t, "--configure", "oci", "--url", srv.URL, "--allow-plaintext", "--apply")
+			if err != nil || !strings.Contains(out, "Nothing to change") {
+				t.Errorf("second --apply = %v:\n%s", err, out)
+			}
+		})
+	}
+}
+
+// B200 R4: --ca-file gives Docker's hosts.toml the ca line it gives
+// containerd's, under bodega's host table.
+func TestDoctorConfigureOCICAReachesDockerHosts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	daemon := filepath.Join(home, "etc/docker/daemon.json")
+	for path, content := range map[string]string{caFile: string(caPEM), daemon: `{"log-driver":"journald"}`} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+	out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	got, _ := os.ReadFile(filepath.Join(home, "etc/docker/certs.d/docker.io/hosts.toml"))
+	if !strings.Contains(string(got), "[host."+strconv.Quote(srv.URL)+"]") || !strings.Contains(string(got), `  ca = "`+userCA+`"`) {
+		t.Errorf("Docker's docker.io hosts.toml after --apply = %q, want bodega's host with ca = %s", got, userCA)
+	}
+}
+
+func TestB200ReviewDoctorUsesServerRegistries(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		snapshotter bool
+		registries  []string
+		want        string
+		status      string
+	}{
+		{"subset", true, []string{"docker.io", "ghcr.io"}, "ghcr.io routed through bodega", "OK"},
+		{"custom missing", true, []string{"docker.io", "ghcr.io", "quay.io", "registry.k8s.io"}, "registry.k8s.io", "WARN"},
+		{"overlay2 custom", false, []string{"docker.io", "registry.k8s.io"}, "registry.k8s.io", "OK"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			stubRuntimes(t, "dockerd")
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/client/plan" {
+					http.NotFound(w, r)
+					return
+				}
+				upstreams := map[string]string{}
+				for _, reg := range tc.registries {
+					upstreams[reg] = "https://" + reg
+				}
+				var plan clientconf.Plan
+				for _, f := range clientconf.OCIClient(srv.URL, upstreams) {
+					sum := sha256.Sum256([]byte(f.Content))
+					plan.Records = append(plan.Records, clientconf.PlanRecord{System: manifest.TypeOCI, Action: clientconf.PlanInstall, Path: f.Path(clientconf.OSLinux), URL: srv.URL + "/client/oci?file=" + f.Key, SHA256: hex.EncodeToString(sum[:])})
+				}
+				_ = json.NewEncoder(w).Encode(plan)
+			}))
+			t.Cleanup(srv.Close)
+			write := func(p, body string) {
+				p = filepath.Join(root, p)
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("etc/docker/daemon.json", `{"registry-mirrors":["`+srv.URL+`/"],"features":{"containerd-snapshotter":`+strconv.FormatBool(tc.snapshotter)+`}}`)
+			for _, reg := range tc.registries {
+				if reg != "registry.k8s.io" {
+					write("etc/docker/certs.d/"+reg+"/hosts.toml", clientconf.ContainerdHosts(srv.URL, reg, "https://"+reg).Content)
+				}
+			}
+			oldRoot, oldExit := doctorOCIRoot, doctorExit
+			doctorOCIRoot, doctorExit = root, func(int) {}
+			t.Cleanup(func() { doctorOCIRoot, doctorExit = oldRoot, oldExit })
+			out, err := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var row string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "oci-docker ") {
+					row = line
+					break
+				}
+			}
+			if !strings.Contains(row, tc.want) || !strings.Contains(row, tc.status) {
+				t.Fatalf("want %s naming %q; got %s", tc.status, tc.want, row)
+			}
+			for _, absent := range []string{"ghcr.io", "quay.io"} {
+				served := false
+				for _, reg := range tc.registries {
+					if reg == absent {
+						served = true
+					}
+				}
+				if !served && strings.Contains(row, absent) {
+					t.Errorf("server does not serve %s; got %s", absent, row)
+				}
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerCAInstallRejectsSkipVerify(t *testing.T) {
+	for _, rt := range []string{"docker", "containerd"} {
+		t.Run(rt, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			bin := rt
+			if rt == "docker" {
+				bin = "dockerd"
+			}
+			stubRuntimes(t, bin)
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+			daemon := filepath.Join(home, "etc/docker/daemon.json")
+			hosts := filepath.Join(home, "etc", rt, "certs.d/docker.io/hosts.toml")
+			original := clientconf.ContainerdHosts(srv.URL, "docker.io", "https://registry-1.docker.io").Content + "  skip_verify = true\n"
+			for path, content := range map[string]string{caFile: string(caPEM), daemon: `{"features":{"containerd-snapshotter":true}}`, hosts: original} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+			if err == nil || !strings.Contains(err.Error(), "skip_verify") {
+				got, _ := os.ReadFile(hosts)
+				t.Fatalf("want refusal naming skip_verify before writing; got err=%v, hosts=%s", err, got)
+			}
+			if got, _ := os.ReadFile(hosts); string(got) != original {
+				t.Fatalf("refusal wrote hosts.toml: %s", got)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerCAInstallUsesEffectiveTLS(t *testing.T) {
+	for _, snapshotter := range []bool{true, false} {
+		t.Run(strconv.FormatBool(snapshotter), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			stubRuntimes(t, "dockerd")
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+			daemon := filepath.Join(home, "etc/docker/daemon.json")
+			body := `{"features":{"containerd-snapshotter":` + strconv.FormatBool(snapshotter) + `},"insecure-registries":["` + strings.TrimPrefix(srv.URL, "https://") + `"]}`
+			for path, content := range map[string]string{caFile: string(caPEM), daemon: body} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+			if snapshotter {
+				if err != nil {
+					t.Fatalf("explicit hosts.toml TLS overrides legacy insecure-registries; install refused: %v\n%s", err, out)
+				}
+				got, err := os.ReadFile(filepath.Join(home, "etc/docker/certs.d/docker.io/hosts.toml"))
+				if err != nil || !strings.Contains(string(got), "  ca = ") || strings.Contains(string(got), "skip_verify = true") {
+					t.Fatalf("want verifying hosts.toml with its CA; got %q, %v", got, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "insecure-registries") {
+				t.Fatalf("overlay2 must retain its legacy TLS refusal: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerCAInstallReachesSelectedDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd")
+	srv, caPEM, _ := caPlanServer(t)
+	reg := "registry.example:5000"
+	files := clientconf.OCIClient(srv.URL, map[string]string{"docker.io": "https://registry-1.docker.io", reg: "https://" + reg})
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/client/plan" {
+			var plan clientconf.Plan
+			for _, f := range files {
+				sum := sha256.Sum256([]byte(f.Content))
+				plan.Records = append(plan.Records, clientconf.PlanRecord{System: manifest.TypeOCI, Action: clientconf.PlanInstall, Path: "~" + f.Path(clientconf.OSLinux), URL: srv.URL + "/client/oci?file=" + f.Key, SHA256: hex.EncodeToString(sum[:])})
+			}
+			_ = json.NewEncoder(w).Encode(plan)
+			return
+		}
+		for _, f := range files {
+			if f.Key == r.URL.Query().Get("file") {
+				_, _ = io.WriteString(w, f.Content)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	caFile := filepath.Join(home, "input-ca.pem")
+	selected := filepath.Join(home, "etc/docker/certs.d/registry.example_5000_/hosts.toml")
+	original := clientconf.ContainerdHosts("https://elsewhere.example", reg, "https://"+reg).Content
+	for path, body := range map[string]string{
+		caFile: string(caPEM),
+		filepath.Join(home, "etc/docker/daemon.json"): `{"features":{"containerd-snapshotter":true}}`,
+		selected: original,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err != nil {
+		return
+	}
+	got, readErr := os.ReadFile(selected)
+	if readErr != nil || !strings.Contains(string(got), srv.URL) || !strings.Contains(string(got), "  ca = ") || strings.Contains(string(got), "elsewhere.example") {
+		t.Fatalf("install claimed success while the hosts.toml Docker selects still bypasses bodega: %q, %v\n%s", got, readErr, out)
+	}
+}
+
+// B200 R4: a Docker hosts.toml that a "_port_" directory outranks is refused
+// before anything is written, with or without --ca-file, naming the
+// directory dockerd reads instead.
+func TestDockerHostsRefusedWhereShadowed(t *testing.T) {
+	for _, withCA := range []bool{false, true} {
+		t.Run(strconv.FormatBool(withCA), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			stubRuntimes(t, "dockerd")
+			srv, caPEM, _ := caPlanServer(t)
+			if !withCA {
+				srv = httptest.NewServer(nil)
+				t.Cleanup(srv.Close)
+			}
+			reg := "registry.example:5000"
+			files := clientconf.OCIClient(srv.URL, map[string]string{"docker.io": "https://registry-1.docker.io", reg: "https://" + reg})
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/client/plan" {
+					var plan clientconf.Plan
+					for _, f := range files {
+						sum := sha256.Sum256([]byte(f.Content))
+						plan.Records = append(plan.Records, clientconf.PlanRecord{System: manifest.TypeOCI, Action: clientconf.PlanInstall, Path: "~" + f.Path(clientconf.OSLinux), URL: srv.URL + "/client/oci?file=" + f.Key, SHA256: hex.EncodeToString(sum[:])})
+					}
+					_ = json.NewEncoder(w).Encode(plan)
+					return
+				}
+				for _, f := range files {
+					if f.Key == r.URL.Query().Get("file") {
+						_, _ = io.WriteString(w, f.Content)
+						return
+					}
+				}
+				http.NotFound(w, r)
+			})
+			caFile := filepath.Join(home, "input-ca.pem")
+			selected := filepath.Join(home, "etc/docker/certs.d/registry.example_5000_/hosts.toml")
+			for path, body := range map[string]string{
+				caFile: string(caPEM),
+				filepath.Join(home, "etc/docker/daemon.json"): `{"features":{"containerd-snapshotter":true}}`,
+				selected: clientconf.ContainerdHosts("https://elsewhere.example", reg, "https://"+reg).Content,
+			} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"--configure", "oci", "--url", srv.URL, "--apply"}
+			if withCA {
+				args = append(args, "--ca-file", caFile)
+			} else {
+				args = append(args, "--allow-plaintext")
+			}
+			out, err := runDoctor(t, args...)
+			if err == nil || !strings.Contains(err.Error(), "registry.example_5000_") || !strings.Contains(err.Error(), "Nothing was written") {
+				t.Fatalf("want a refusal naming the directory dockerd reads; got %v\n%s", err, out)
+			}
+			if _, err := os.Stat(filepath.Join(home, "etc/docker/certs.d", reg, "hosts.toml")); !os.IsNotExist(err) {
+				t.Fatalf("the shadowed hosts.toml was written: %v", err)
+			}
+		})
+	}
+}
+
+// B200 R6: the usage page says which image store covers which registries
+// for Docker Engine, in the doctor section and in the OCI recipe.
+func TestUsageDocDescribesDockerImageStores(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := string(data)
+	for _, want := range []string{
+		"Docker Engine on the containerd image store, the default on a fresh Docker 29 install, covers every registry",
+		"On the overlay2 image store `registry-mirrors` covers Docker Hub only",
+		"hides every image and container `dockerd` already holds until each is pulled and recreated, so doctor never sets it",
+		"every other registry only on the containerd image store, where `dockerd` reads `/etc/docker/certs.d/<registry>/hosts.toml`",
+		"here `/etc/docker/certs.d/ghcr.io/hosts.toml`, which sends `docker pull ghcr.io/<image>` through bodega",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("docs/usage.md lacks %q", want)
+		}
+	}
+	for _, stale := range []string{"Docker Engine's `registry-mirrors` covers Docker Hub only", "Docker Engine mirrors Docker Hub and nothing else"} {
+		if strings.Contains(usage, stale) {
+			t.Errorf("docs/usage.md still says %q", stale)
+		}
 	}
 }

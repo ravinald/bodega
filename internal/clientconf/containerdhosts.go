@@ -53,6 +53,10 @@ type ContainerdRegistryHost struct {
 	// Pull reports whether containerd pulls from this host: capabilities
 	// names pull, or names nothing and so grants everything.
 	Pull bool
+	// Resolve reports whether containerd resolves a tag to a digest at this
+	// host, which is the first request of every pull by tag: capabilities
+	// names resolve, or names nothing.
+	Resolve bool
 	// CA is the files containerd adds to the system roots for this host,
 	// each absolute.
 	CA []string
@@ -192,11 +196,14 @@ func containerdHost(server, dir string, c containerdHostFile) (ContainerdRegistr
 		h.Path = u.Path
 	}
 	h.Pull = len(c.Capabilities) == 0
+	h.Resolve = h.Pull
 	for _, capability := range c.Capabilities {
 		switch strings.ToLower(capability) {
 		case "pull":
 			h.Pull = true
-		case "resolve", "push", "referrers":
+		case "resolve":
+			h.Resolve = true
+		case "push", "referrers":
 		default:
 			return h, fmt.Errorf("unknown capability %v", capability)
 		}
