@@ -994,3 +994,133 @@ func TestMirroredHideReachesEveryArchiveListingTheVersion(t *testing.T) {
 		t.Errorf("GET the filtered resolute-web Packages at /apt/ubuntu/ = %d, want 200 carrying nginx without the hidden htop:\n%s", code, filtered)
 	}
 }
+
+func TestReviewB201RewriteMustBeDurableBeforeItIsServed(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	rel := "dists/" + hideGroupBase + "/Release"
+	original, _ := archive.object(rel)
+	archive.setObject(rel, "Date: "+time.Now().UTC().Add(-200*24*time.Hour).Format(time.RFC1123Z)+"\n"+original)
+	s.rebuildAptSnapshot(t.Context())
+	db, err := sql.Open("sqlite", s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER review_b201_fail_date BEFORE INSERT ON apt_mirror_rewrite_dates
+        BEGIN SELECT RAISE(FAIL, 'temporary rewrite date write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(t.Context())
+	published := s.aptMirrorRewritten(hideGroupBase)
+	if published {
+		date, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := s.auditDB.AptMirrorRewriteDates(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored[hideGroupBase].Equal(date) {
+			t.Errorf("served rewrite Date %s without its durable record (stored %s)", date, stored[hideGroupBase])
+		}
+	}
+	if _, err := db.Exec("DROP TRIGGER review_b201_fail_date"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.auditDB.DeleteAptMirrorHide(t.Context(), "htop", "1.0-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(t.Context())
+	if published && !s.aptMirrorRewritten(hideGroupBase) {
+		t.Error("the first rebuild after write recovery and unhide returned the frozen codename to proxy although a client can hold its filtered rewrite")
+	}
+	restarted := restartMirrorServer(t, s)
+	restarted.rebuildAptSnapshot(t.Context())
+	if published && !restarted.aptMirrorRewritten(hideGroupBase) {
+		t.Error("restart forgot the served rewrite and proxied the older upstream Release")
+	}
+}
+
+// A rewrite is served only once its Date is on record. A rebuild whose write
+// fails keeps serving the group's previous rewrite, whose Date is on record,
+// and the record never moves back to an earlier Date.
+func TestMirroredRewriteWhoseDateWriteFailsKeepsThePreviousRewrite(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	rel := "dists/" + hideGroupBase + "/Release"
+	original, _ := archive.object(rel)
+	archive.setObject(rel, "Date: "+time.Now().UTC().Add(-200*24*time.Hour).Format(time.RFC1123Z)+"\n"+original)
+	ctx := t.Context()
+	packages := "/apt/dists/" + hideGroupBase + "/main/binary-amd64/Packages"
+	servedMatchesRecord := func(stage string) time.Time {
+		t.Helper()
+		if !s.aptMirrorRewritten(hideGroupBase) {
+			t.Fatalf("%s: the codename is proxied", stage)
+		}
+		date, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := s.auditDB.AptMirrorRewriteDates(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored[hideGroupBase].Equal(date) {
+			t.Fatalf("%s: served rewrite Date %s, recorded %s", stage, date, stored[hideGroupBase])
+		}
+		return date
+	}
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(ctx)
+	hiddenDate := servedMatchesRecord("after the hide")
+
+	db, err := sql.Open("sqlite", s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER fail_rewrite_date BEFORE INSERT ON apt_mirror_rewrite_dates
+        BEGIN SELECT RAISE(FAIL, 'rewrite date write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	if d := servedMatchesRecord("unhide with the write failing"); !d.Equal(hiddenDate) {
+		t.Errorf("unhide with the write failing served a new rewrite dated %s", d)
+	}
+	if got := aptIndexVersions(t, s, packages, "htop"); len(got) != 0 {
+		t.Errorf("the carried rewrite lists htop %v, want the previous rewrite's bytes", got)
+	}
+
+	if _, err := db.Exec("DROP TRIGGER fail_rewrite_date"); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	servedMatchesRecord("after the write recovered")
+	if got := aptIndexVersions(t, s, packages, "htop"); !slices.Equal(got, []string{"1.0-1"}) {
+		t.Errorf("after the write recovered the rewrite lists htop %v, want 1.0-1", got)
+	}
+
+	recorded, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.RecordAptMirrorRewriteDate(ctx, hideGroupBase, hiddenDate.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after[hideGroupBase].Equal(recorded[hideGroupBase]) {
+		t.Errorf("an earlier write moved the record from %s to %s", recorded[hideGroupBase], after[hideGroupBase])
+	}
+}

@@ -368,7 +368,6 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 	s.retryAptMirrorEvidence(ctx, prevIndexes)
 	out := map[string]*aptSuiteIndex{}
 	reusable := map[aptMirrorIndexKey]aptMirrorIndex{}
-	record := map[string]bool{}
 	for _, group := range s.aptMirrorGroups() {
 		if len(hidden) == 0 && !aptMirrorMayHold(group, served, servedKnown, prev) {
 			continue
@@ -396,11 +395,9 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 			dropped += d
 			refiltered += n
 		}
-		switch {
-		case failed != nil:
+		carry := func(reason string, err error) {
 			carried := prev.mirrorGroup(group)
-			s.logger.Error("could not rewrite a mirrored apt group to drop its hidden versions; the previous rewrite keeps serving if there was one, otherwise the archive's index is proxied and the pool refuses the hidden versions",
-				"group", strings.Join(group, " "), "carried", carried != nil, "error", failed)
+			s.logger.Error(reason, "group", strings.Join(group, " "), "carried", carried != nil, "error", err)
 			for codename, idx := range carried {
 				out[codename] = idx
 			}
@@ -411,31 +408,34 @@ func (s *Server) aptMirrorRewrites(ctx context.Context, hidden aptHidesByArchive
 					}
 				}
 			}
+		}
+		publish := func() {
+			if err := s.recordAptMirrorRewriteDates(ctx, group, date); err != nil {
+				carry("could not record the date of a mirrored apt rewrite, so it is not served: a rebuild or restart that forgot it would proxy an upstream Release older than what hosts hold; the previous rewrite keeps serving if there was one, otherwise the archive's index is proxied",
+					err)
+				return
+			}
+			for codename, idx := range indexes {
+				out[codename] = idx
+			}
+			maps.Copy(reusable, built)
+		}
+		switch {
+		case failed != nil:
+			carry("could not rewrite a mirrored apt group to drop its hidden versions; the previous rewrite keeps serving if there was one, otherwise the archive's index is proxied and the pool refuses the hidden versions",
+				failed)
 		case dropped > 0:
 			s.logger.Info("rewrote and re-signed a mirrored apt group to drop hidden versions",
 				"group", strings.Join(group, " "), "dropped", dropped, "refiltered", refiltered)
-			for codename, idx := range indexes {
-				out[codename] = idx
-				record[codename] = true
-			}
-			maps.Copy(reusable, built)
+			publish()
 		case aptMirrorHeld(group, served, servedKnown, prev, upstreamDates):
 			s.logger.Info("kept a mirrored apt group bodega-signed with nothing hidden, because its upstream Release is not newer than the rewrite hosts may hold",
 				"group", strings.Join(group, " "))
-			for codename, idx := range indexes {
-				out[codename] = idx
-				record[codename] = true
-			}
-			maps.Copy(reusable, built)
+			publish()
 		default:
-			for _, codename := range group {
-				if _, ok := served[codename]; ok {
-					record[codename] = false
-				}
-			}
+			s.clearAptMirrorRewriteDates(ctx, group, served)
 		}
 	}
-	s.recordAptMirrorRewriteDates(ctx, record, date)
 	return out, reusable
 }
 
@@ -494,23 +494,39 @@ func aptMirrorHeld(group []string, served map[string]time.Time, servedKnown bool
 	return false
 }
 
-// recordAptMirrorRewriteDates stores date for every codename record marks
-// true and clears every one it marks false. A failed write is logged: the next
-// rebuild that serves the codename writes it again.
-func (s *Server) recordAptMirrorRewriteDates(ctx context.Context, record map[string]bool, date time.Time) {
+// recordAptMirrorRewriteDates stores date for every codename in group, before
+// any of the group's rewrites dated date is served. The record is what a later
+// rebuild or a restart holds the group against, so a rewrite whose date is not
+// on it would be one the server forgets it served. A member whose write fails
+// stops the group; members already written keep a date later than what is
+// served, which holds the group longer and strands no host.
+func (s *Server) recordAptMirrorRewriteDates(ctx context.Context, group []string, date time.Time) error {
+	if s.auditDB == nil {
+		return nil
+	}
+	for _, codename := range group {
+		if err := s.auditDB.RecordAptMirrorRewriteDate(ctx, codename, date); err != nil {
+			return fmt.Errorf("%s: %w", codename, err)
+		}
+	}
+	return nil
+}
+
+// clearAptMirrorRewriteDates forgets the rewrite date of every member of a
+// group going back to proxy. A failed clear is only logged: the stale record
+// is older than the upstream Release that sent the group to proxy, so it holds
+// nothing, and the next rebuild clears it again.
+func (s *Server) clearAptMirrorRewriteDates(ctx context.Context, group []string, served map[string]time.Time) {
 	if s.auditDB == nil {
 		return
 	}
-	for codename, servedNow := range record {
-		var err error
-		if servedNow {
-			err = s.auditDB.RecordAptMirrorRewriteDate(ctx, codename, date)
-		} else {
-			err = s.auditDB.ClearAptMirrorRewriteDate(ctx, codename)
+	for _, codename := range group {
+		if _, ok := served[codename]; !ok {
+			continue
 		}
-		if err != nil {
-			s.logger.Error("could not record the date of a mirrored apt rewrite; a restart before the next rebuild could return the codename to proxy while hosts hold a newer rewrite",
-				"codename", codename, "served", servedNow, "error", err)
+		if err := s.auditDB.ClearAptMirrorRewriteDate(ctx, codename); err != nil {
+			s.logger.Error("could not clear the date of a mirrored apt rewrite for a codename back on proxy; the next rebuild clears it again",
+				"codename", codename, "error", err)
 		}
 	}
 }

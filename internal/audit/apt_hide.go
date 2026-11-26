@@ -122,11 +122,14 @@ func (a *DB) AptMirrorRewriteDates(ctx context.Context) (map[string]time.Time, e
 }
 
 // RecordAptMirrorRewriteDate sets the Date of the latest rewrite served for
-// codename, at the one-second precision a Release carries.
+// codename, at the one-second precision a Release carries. The record only
+// moves forward: a second server on the same store, or a clock stepped back,
+// writing an earlier date would release a hold on a rewrite hosts still have.
+// The RFC 3339 UTC form compares in date order as text.
 func (a *DB) RecordAptMirrorRewriteDate(ctx context.Context, codename string, date time.Time) error {
 	_, err := a.writer().ExecContext(ctx,
 		`INSERT INTO apt_mirror_rewrite_dates (codename, served_date) VALUES (?, ?)
-		 ON CONFLICT (codename) DO UPDATE SET served_date = excluded.served_date`,
+		 ON CONFLICT (codename) DO UPDATE SET served_date = max(served_date, excluded.served_date)`,
 		codename, date.UTC().Truncate(time.Second).Format(time.RFC3339))
 	return err
 }
