@@ -117,6 +117,7 @@ Every command takes `--help`, with examples. [Usage](docs/usage.md#commands) cov
 ## Documentation
 
 - [Quick start](docs/quickstart.md): one package from nothing to a client install.
+- [Connecting clients](docs/clients.md): for each package manager and service, the configuration that puts bodega in its place, how to confirm it took, and what goes wrong.
 - [Usage](docs/usage.md): the operational reference, covering every command, the config file, policy, the REST API, the audit trail, and running under systemd or rc.d.
 - [Design](docs/design.md): the architecture, and why the proxy and cache sit where they do.
 - [Threat model](docs/threat-model.md): what bodega protects against, what it doesn't, and what each scope can reach.

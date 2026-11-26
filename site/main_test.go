@@ -518,3 +518,25 @@ func TestCoverageVerdictCarriesItsReasonBelowUsable(t *testing.T) {
 		t.Error("a Ready row's verdict cell carries its reason; only Partial and Not yet should")
 	}
 }
+
+// docs/clients.md is a page of its own, listed under Install and deploy
+// right after Configuration, where an operator moving a host goes next.
+func TestSitePublishesConnectingClients(t *testing.T) {
+	out := buildSite(t)
+	wantAll(t, "docs/clients.html", readPage(t, out, "docs/clients.html"), map[string]string{
+		"the page title":      ">Connecting clients</h1>",
+		"the Docker section":  ">Docker Engine</h2>",
+		"the doctor link out": `href="/docs/usage/commands.html#bodega-doctor-`,
+	})
+	index := readPage(t, out, "docs/index.html")
+	_, group, ok := strings.Cut(index, "<h2>Install and deploy</h2>")
+	if !ok {
+		t.Fatal("the docs index has no Install and deploy group")
+	}
+	group, _, _ = strings.Cut(group, "<h2>")
+	config := strings.Index(group, ">Configuration</a>")
+	clients := strings.Index(group, `<a href="/docs/clients.html">Connecting clients</a>`)
+	if clients < 0 || config < 0 || clients < config {
+		t.Errorf("Install and deploy lists Configuration at %d and Connecting clients at %d, want the page right after Configuration:\n%s", config, clients, group)
+	}
+}

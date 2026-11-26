@@ -78,6 +78,7 @@ var contents = []source{
 	{"Install and deploy", "docs/quickstart.md", ""},
 	{"Install and deploy", "docs/usage.md", "Platforms"},
 	{"Install and deploy", "docs/usage.md", "Configuration"},
+	{"Install and deploy", "docs/clients.md", ""},
 	{"Install and deploy", "docs/usage.md", "Running under systemd"},
 	{"Install and deploy", "docs/usage.md", "Running under rc.d"},
 	{"Install and deploy", "docs/usage.md", "HTTP Server"},

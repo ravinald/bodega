@@ -1535,3 +1535,34 @@ func copyTree(t *testing.T, src, dir string) string {
 	}
 	return dst
 }
+
+// A distfile a client fetched leaves a serve_fetch row under distfiles, named
+// as the manifest entry names it, so `bodega audit events --type serve_fetch
+// --pkg-type distfiles` shows the port's fetch went through bodega.
+func TestDistfilesFetchWritesServeFetchRow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	ts, _, _ := distfilesFixtureIn(t, distfilesPortsTree(t), distfileBody, func(c *config.Config) { c.AuditDB = dbPath })
+	if code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code != http.StatusOK {
+		t.Fatalf("GET = %d %q, want 200", code, body)
+	}
+	adb, err := audit.OpenReadOnly(dbPath)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = adb.Close() }()
+	rows, err := adb.Query(t.Context(), audit.Filter{EventType: audit.EventServeFetch, PkgType: manifest.TypeDistfiles})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(rows) != 1 || rows[0].PkgName != "pcpustat/1.6.tar.bz2" {
+		t.Fatalf("serve_fetch rows under distfiles = %+v, want one naming pcpustat/1.6.tar.bz2", rows)
+	}
+	for path, want := range map[string]string{
+		"/distfiles/@b5f3/pcpustat/1.6.tar.bz2": "pcpustat/1.6.tar.bz2",
+		"/distfiles/@environment.mk":            clientCheckPath,
+	} {
+		if typ, name, _ := parsePackagePath(path); typ != manifest.TypeDistfiles || name != want {
+			t.Errorf("parsePackagePath(%q) = %q %q, want distfiles %q", path, typ, name, want)
+		}
+	}
+}
