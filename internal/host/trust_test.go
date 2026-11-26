@@ -3321,3 +3321,79 @@ func TestDockerHandCheckFollowsImageStore(t *testing.T) {
 		})
 	}
 }
+
+func TestB200ReviewDockerEffectiveDirectory(t *testing.T) {
+	for _, mode := range []string{"default-over-mirror", "encoded-over-literal"} {
+		t.Run(mode, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"registry-mirrors":["`+base+`/"]}`)
+			reg, dir := "docker.io", "_default"
+			if mode == "encoded-over-literal" {
+				reg, dir = "registry.example:5000", "registry.example_5000_"
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", reg, "hosts.toml"), clientconf.ContainerdHosts(base, reg, "https://"+reg).Content)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, "hosts.toml"), clientconf.ContainerdHosts("https://elsewhere.example", reg, "https://"+reg).Content)
+			f := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{reg}}).Check(base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, reg) {
+				t.Fatalf("the selected %s configuration bypasses bodega; want WARN naming %s, got %+v", dir, reg, f)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerCertificateDirectoryUsesContainerdRules(t *testing.T) {
+	for _, snapshotter := range []string{"true", "false"} {
+		for _, mode := range []string{"bad-crt", "orphan-key"} {
+			t.Run(snapshotter+"/"+mode, func(t *testing.T) {
+				p, ca, base := reviewTrust(t)
+				pem, err := os.ReadFile(ca)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"registry-mirrors":["`+base+`/"]}`)
+				dir := "docker.io"
+				if snapshotter == "false" {
+					dir = "bodega.internal:8443"
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, "ca.crt"), string(pem))
+				filename, want := "broken.crt", TrustUnchecked
+				if mode == "orphan-key" {
+					filename, want = "unused.key", TrustVerified
+				}
+				if snapshotter == "false" {
+					want = TrustVerified
+					if mode == "orphan-key" {
+						want = TrustUnchecked
+					}
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, filename), "not a certificate or key")
+				vs, err := p.Judge([]string{"oci-docker"}, base)
+				if err != nil || len(vs) != 1 || vs[0].State != want {
+					t.Fatalf("want %v from the selected runtime's cert-file loader; got %+v, %v", want, vs, err)
+				}
+			})
+		}
+	}
+}
+
+func TestB200ReviewDockerSingleHostLegacyInsecure(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"insecure-registries":["bodega.internal:8443"]}`)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), "server = \""+base+"\"\ncapabilities = [\"pull\", \"resolve\"]\nca = \""+ca+"\"\n")
+	vs, err := p.Judge([]string{"oci-docker"}, base)
+	if err != nil || len(vs) != 1 || vs[0].State != TrustUnchecked || !strings.Contains(vs[0].Detail, "insecure") {
+		t.Fatalf("Moby merges insecure-registries into a single resolved host for ghcr.io; got %+v, %v", vs, err)
+	}
+}
+
+func TestB200ReviewDockerHandCheckDoesNotDropBrokenHostsCA(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	missing := filepath.Join(p.Root, "missing-ca.pem")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"fixed-cidr-v6":"2001:db8::/64"}`)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), clientconf.ContainerdHosts(base, "ghcr.io", "https://ghcr.io").Content+"  ca = \""+missing+"\"\n")
+	rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"ghcr.io"}}).Check(base)
+	f := p.Apply(rows, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "keep fixed-cidr-v6") || !strings.Contains(f.Detail+f.Remediation, missing) {
+		t.Fatalf("cannot replace an unread active hosts CA with a system-only hand check: %+v", f)
+	}
+}

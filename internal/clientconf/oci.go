@@ -191,6 +191,41 @@ func DockerHostsRecords(records []PlanRecord) []PlanRecord {
 	return slices.Concat(records[:at+1], docker, records[at+1:])
 }
 
+// DockerHostsShadowed refuses a plan writing a Docker hosts.toml that
+// dockerd would not read once the plan is applied: one for a registry with a
+// port whose "_port_" directory exists beside it, which DockerHostDir
+// selects first. Writing it would leave that directory routing the
+// registry's pulls while the plan reports bodega's file written.
+func DockerHostsShadowed(changes []Change) error {
+	files := map[string][]byte{}
+	var targets []string
+	for _, c := range changes {
+		if c.New != nil {
+			files[c.Target] = c.New
+		}
+		if c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeDocker && filepath.Base(c.Target) == "hosts.toml" {
+			targets = append(targets, c.Target)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	return plannedfs.With(files, func() error {
+		for _, t := range targets {
+			dir := filepath.Dir(t)
+			selected, err := DockerHostDir(filepath.Dir(dir), filepath.Base(dir))
+			if err != nil {
+				return fmt.Errorf("%s: which directory dockerd reads for %s could not be checked (%w). Nothing was written. Run doctor as root, then re-run", manifest.TypeOCI, filepath.Base(dir), err)
+			}
+			if selected != dir {
+				return fmt.Errorf("%s: dockerd reads %s for %s, which comes before the %s this plan writes, so dockerd would go on pulling as that directory says and never read bodega's file. "+
+					"Nothing was written. Move bodega's host table into %s, or move that directory aside, then re-run", manifest.TypeOCI, selected, filepath.Base(dir), t, filepath.Join(selected, "hosts.toml"))
+			}
+		}
+		return nil
+	})
+}
+
 // ContainerdHosts renders the hosts.toml for one registry: server is the
 // upstream, so a reader of the file sees which registry it mirrors, and
 // bodega is the one host containerd asks first. containerd appends /v2/ and

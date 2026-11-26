@@ -762,6 +762,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		changes = append(changes, c)
 	}
+	if err := clientconf.DockerHostsShadowed(changes); err != nil {
+		return err
+	}
 	var caStep []string
 	var caOSStore []string
 	caOwed := owedTrustChecks(records)

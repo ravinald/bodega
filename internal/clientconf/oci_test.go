@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1383,4 +1384,72 @@ func TestDockerCAInstallFollowsDockerHubHosts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// B200 R2/R4: ResolveDockerRegistry follows containerd v2.2.4's directory
+// selection and certificate-file loader and moby docker-v29.5.3's legacy
+// merge.
+func TestResolveDockerRegistry(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.internal")
+	certs := func(root string) string { return filepath.Join(root, DockerCertsDir) }
+	hostsFor := func(server string) string {
+		return "server = \"https://upstream.example\"\n\n[host.\"" + server + "\"]\n  capabilities = [\"pull\", \"resolve\"]\n"
+	}
+
+	t.Run("directory precedence", func(t *testing.T) {
+		root := t.TempDir()
+		reg := "registry.example:5000"
+		if r := ResolveDockerRegistry(root, nil, reg); r.Dir != "" || len(r.Hosts) != 1 || !r.Hosts[0].Implicit || r.Hosts[0].Host != reg {
+			t.Fatalf("no directory: want the registry's own server, got %+v", r)
+		}
+		for i, dir := range []string{"_default", reg, "registry.example_5000_"} {
+			mirror := "mirror" + strconv.Itoa(i) + ".example"
+			writeFile(t, filepath.Join(certs(root), dir, "hosts.toml"), hostsFor("https://"+mirror))
+			r := ResolveDockerRegistry(root, nil, reg)
+			if r.Dir != filepath.Join(certs(root), dir) || r.Hosts[0].Host != mirror {
+				t.Fatalf("with %s present: want it selected, got %+v", dir, r)
+			}
+		}
+		if got := DockerRegistries(certs(root), nil); !slices.Equal(got, []string{"_default", "docker.io", reg}) {
+			t.Fatalf("DockerRegistries = %v", got)
+		}
+	})
+
+	t.Run("certificate files", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(certs(root), "ghcr.io")
+		writeFile(t, filepath.Join(dir, "ca.crt"), string(caPEM))
+		writeFile(t, filepath.Join(dir, "unused.key"), "not a key")
+		r := ResolveDockerRegistry(root, nil, "ghcr.io")
+		if r.TLSErr != nil || len(r.Hosts) != 1 || !slices.Equal(r.Hosts[0].CA, []string{filepath.Join(dir, "ca.crt")}) {
+			t.Fatalf("an orphan .key is not read: %+v", r)
+		}
+		writeFile(t, filepath.Join(dir, "hosts.toml"), "server = 1\n")
+		if r := ResolveDockerRegistry(root, nil, "ghcr.io"); r.Discarded == nil || r.TLSErr != nil || len(r.Hosts[0].CA) != 1 {
+			t.Fatalf("a discarded hosts.toml falls back to the certificate files: %+v", r)
+		}
+		writeFile(t, filepath.Join(dir, "broken.crt"), "not a certificate")
+		if r := ResolveDockerRegistry(root, nil, "ghcr.io"); r.TLSErr == nil {
+			t.Fatalf("a .crt with no PEM certificate fails the registry: %+v", r)
+		}
+	})
+
+	t.Run("legacy merge", func(t *testing.T) {
+		root := t.TempDir()
+		daemon := &DockerDaemonFile{Mirrors: []string{"https://bodega.internal:8443/"}, InsecureRegistries: []string{"bodega.internal:8443"}}
+		writeFile(t, filepath.Join(certs(root), "ghcr.io", "hosts.toml"), "server = \"https://bodega.internal:8443\"\n")
+		r := ResolveDockerRegistry(root, daemon, "ghcr.io")
+		if !r.Legacy || len(r.Hosts) != 1 || r.Hosts[0].Insecure != "bodega.internal:8443" {
+			t.Fatalf("one host: insecure-registries applies to it with no Docker Hub mirror: %+v", r)
+		}
+		writeFile(t, filepath.Join(certs(root), "docker.io", "ca.crt"), string(caPEM))
+		r = ResolveDockerRegistry(root, daemon, "docker.io")
+		if !r.Legacy || len(r.Hosts) != 2 || !r.Hosts[0].Mirror || r.Hosts[0].Host != "bodega.internal:8443" || r.Hosts[0].Path != "/v2" || len(r.Hosts[0].CA) != 1 || r.Hosts[1].Host != "registry-1.docker.io" {
+			t.Fatalf("docker.io: the mirror goes first and shares its host's TLS: %+v", r)
+		}
+		writeFile(t, filepath.Join(certs(root), "_default", "hosts.toml"), hostsFor("https://elsewhere.example"))
+		if r := ResolveDockerRegistry(root, daemon, "quay.io"); r.Legacy || len(r.Hosts) != 2 || r.Hosts[0].Host != "elsewhere.example" || r.Hosts[0].Insecure != "" {
+			t.Fatalf("two hosts from _default: no legacy merge: %+v", r)
+		}
+	})
 }

@@ -2,6 +2,7 @@ package host
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -1020,14 +1021,12 @@ func checkDockerMirror(root, host string, registries []string, scopeErr string) 
 		case mirror == "":
 			lead = path + " mirrors Docker Hub through " + strings.Join(mirrors, ", ") + ", none of them bodega at " + host
 		}
-		// registry-mirrors reaches dockerd's docker.io hosts only where a
-		// hosts.toml for docker.io has not already named its own.
-		hub, _ := clientconf.LoadContainerdHostsFile(filepath.Join(root, clientconf.DockerHubHostsPath))
-		merged, _ := clientconf.DockerHubLegacy(hub)
-		if mirror != "" && !merged {
-			lead += ", which dockerd does not apply: " + filepath.Join(root, clientconf.DockerHubHostsPath) + " names Docker Hub's hosts itself"
+		// registry-mirrors reaches dockerd's docker.io hosts only where the
+		// configuration it selects for docker.io resolves one host.
+		if hub := clientconf.ResolveDockerRegistry(root, doc, "docker.io"); mirror != "" && hub.Unread == nil && !hub.Legacy {
+			lead += ", which dockerd does not apply: " + hub.Source + " names Docker Hub's hosts itself"
 		}
-		f := checkDockerHostsFiles(root, host, registries, mirror != "" && merged, lead)
+		f := checkDockerHostsFiles(root, host, doc, registries, lead)
 		if unchecked != "" {
 			f.Detail += unchecked
 			if f.Status == StatusOK {
@@ -1053,47 +1052,45 @@ func checkDockerMirror(root, host string, registries []string, scopeErr string) 
 }
 
 // checkDockerHostsFiles judges, for a dockerd on the containerd image store,
-// the hosts.toml it reads for each registry under /etc/docker/certs.d, and
-// docker.io's only where registry-mirrors names bodega and dockerd applies
-// it (clientconf.DockerHubLegacy). A file routes the registry through
-// bodega when its first host that may pull is bodega and may resolve too,
-// which is the first request of a pull by tag.
-func checkDockerHostsFiles(root, host string, registries []string, mirrored bool, lead string) Finding {
+// where it pulls each registry from: the configuration it resolves for that
+// registry (clientconf.ResolveDockerRegistry), from the directory under
+// /etc/docker/certs.d it selects, with registry-mirrors merged in where that
+// resolves one host. A registry routes through bodega when its first host
+// that may pull is bodega and may resolve too, which is the first request of
+// a pull by tag.
+func checkDockerHostsFiles(root, host string, doc *clientconf.DockerDaemonFile, registries []string, lead string) Finding {
 	var routed, bypass []string
+	mirrored := false
 	for _, r := range registries {
-		if r == "docker.io" && mirrored {
+		cfg := clientconf.ResolveDockerRegistry(root, doc, r)
+		if cfg.Unread != nil {
+			return Finding{Status: StatusSkip, Detail: "what dockerd reads for " + r + " under " + filepath.Join(root, clientconf.DockerCertsDir) + " could not be read: " + cfg.Unread.Error(), Remediation: "run doctor as root, which owns " + clientconf.DockerCertsDir}
+		}
+		if cfg.TLSErr != nil {
+			bypass = append(bypass, r+" (dockerd cannot load a certificate "+cfg.Source+" names ("+cfg.TLSErr.Error()+") and resolves no host for it, so every pull of it fails)")
 			continue
 		}
-		file := filepath.Join(root, clientconf.DockerCertsDir, r, "hosts.toml")
-		doc, err := clientconf.LoadContainerdHostsFile(file)
-		var unread *fs.PathError
-		switch {
-		case errors.As(err, &unread):
-			return Finding{Status: StatusSkip, Detail: file + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + file}
-		case err != nil:
-			bypass = append(bypass, r+" ("+file+" is one dockerd discards: "+err.Error()+")")
-			continue
-		case doc == nil:
-			bypass = append(bypass, r+" (no "+file+")")
-			continue
-		}
-		first := ""
-		for _, h := range doc.Hosts {
-			if !h.Server && h.Pull {
-				first = h.Key
-				if mirrorIsBodega(h.Key, host) && !h.Resolve {
-					first = ""
-				}
+		var first *clientconf.DockerRegistryHost
+		for i, h := range cfg.Hosts {
+			if h.Pull {
+				first = &cfg.Hosts[i]
 				break
 			}
 		}
+		source := cfg.Source
+		if cfg.Discarded != nil {
+			source += ", in place of a hosts.toml dockerd discards (" + cfg.Discarded.Error() + ")"
+		}
 		switch {
-		case first != "" && mirrorIsBodega(first, host):
+		case first != nil && mirrorIsBodega(first.Host, host) && first.Resolve:
 			routed = append(routed, r)
-		case first == "":
-			bypass = append(bypass, r+" ("+file+" names no host at bodega"+inHost(host)+" that may pull and resolve)")
+			mirrored = mirrored || first.Mirror
+		case cfg.Dir == "":
+			bypass = append(bypass, r+" (no "+filepath.Join(root, clientconf.DockerCertsDir, r, "hosts.toml")+")")
+		case first == nil || first.Implicit || mirrorIsBodega(first.Host, host):
+			bypass = append(bypass, r+" ("+source+" names no host at bodega"+inHost(host)+" that may pull and resolve)")
 		default:
-			bypass = append(bypass, r+" ("+file+" sends pulls to "+first+" before bodega"+inHost(host)+")")
+			bypass = append(bypass, r+" ("+source+" sends pulls to "+cmp.Or(first.Key, first.URL())+" before bodega"+inHost(host)+")")
 		}
 	}
 	detail := lead + "; dockerd keeps its images in the containerd image store and reads " + clientconf.DockerCertsDir + "/<registry>/hosts.toml for every registry"
