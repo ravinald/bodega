@@ -3437,3 +3437,42 @@ func TestB200ReviewDockerDistinctHostTLSIsNotDeduplicated(t *testing.T) {
 		t.Fatalf("the pull host has its own wrong CA even though the resolve host verifies the same peer; got %+v", f)
 	}
 }
+
+func TestB200ReviewDockerHandCheckPreservesCAPath(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	pem, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca = filepath.Join(p.Root, "Corporate Root CA.pem")
+	writeTrustFile(t, ca, string(pem))
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"fixed-cidr-v6":"2001:db8::/64"}`)
+	body := clientconf.ContainerdHosts(base, "ghcr.io", "https://ghcr.io").Content + "  ca = \"" + ca + "\"\n"
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), body)
+	f := p.Apply([]Finding{{Check: "oci-docker", Status: StatusOK}}, base)[0]
+	_, command, ok := strings.Cut(f.Remediation, "openssl s_client ")
+	if !ok {
+		t.Fatalf("missing hand check: %+v", f)
+	}
+	command, _, ok = strings.Cut(command, " </dev/null")
+	if !ok {
+		t.Fatalf("missing command end: %+v", f)
+	}
+	script := `openssl() { while [ "$#" -gt 0 ]; do if [ "$1" = "-CAfile" ]; then printf '%s\n' "$2"; return; fi; shift; done; }; openssl s_client ` + command + " </dev/null"
+	got, err := exec.Command("sh", "-c", script).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(got)) != ca {
+		t.Fatalf("hand check must pass the active CA path as one argument; got %q, %v; want %q; command: %s", got, err, ca, command)
+	}
+}
+
+// Every dynamic word of the hand check reaches openssl as itself: a CA path
+// carrying quotes, expansions and globs, and an IPv6 -connect address that
+// sh and zsh would otherwise read as a bracket glob.
+func TestDockerHandCheckWordsSurviveTheShell(t *testing.T) {
+	for _, s := range []string{"/etc/docker/certs.d/bodega.internal:8443/ca.crt", "[2001:db8::10]:443", "/ca/it's $(id) `id` *.pem", "/ca/tab\there\nnewline", ""} {
+		got, err := exec.Command("sh", "-c", `printf '%s' `+shellWord(s)).Output()
+		if err != nil || string(got) != s {
+			t.Errorf("shellWord(%q) = %s; sh read %q, %v", s, shellWord(s), got, err)
+		}
+	}
+}

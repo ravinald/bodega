@@ -230,6 +230,20 @@ func uncertified(client, what string) []trustStore {
 	return []trustStore{{name: client + "'s configuration", blind: fmt.Sprintf("%s, so whether %s verifies bodega's certificate is unchecked; remove the setting or return it to the client's default, or leave it and add the CA to that client's trust by hand", what, client)}}
 }
 
+// shellWord renders s as one sh or zsh word for a command the operator
+// pastes. A word of plain path and host characters stays bare so the command
+// reads as typed; anything else is single-quoted, which keeps every byte but
+// the quote itself, so a CA file named with spaces stays one -CAfile argument
+// and an IPv6 -connect address is not read as a glob.
+func shellWord(s string) string {
+	if s != "" && !strings.ContainsFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_./:@%+=,-", r))
+	}) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // trustRows maps a row's check name to its client.
 var trustRows = map[string]trustRow{
 	"apt-sources": {system: manifest.TypeApt, stores: aptStores},
@@ -262,15 +276,16 @@ func dockerHandCheck(t TrustProbe, u *url.URL, key string, eff []trustStore) str
 	if port == "" {
 		port = "443"
 	}
-	name := "-verify_hostname " + u.Hostname()
+	host := shellWord(u.Hostname())
+	name := "-verify_hostname " + host
 	if net.ParseIP(u.Hostname()) != nil {
-		name = "-verify_ip " + u.Hostname()
+		name = "-verify_ip " + host
 	}
 	cmd := func(ca string) string {
 		if ca != "" {
-			ca = " -CAfile " + ca
+			ca = " -CAfile " + shellWord(ca)
 		}
-		return fmt.Sprintf("openssl s_client -connect %s -servername %s %s -verify_return_error%s </dev/null", net.JoinHostPort(u.Hostname(), port), u.Hostname(), name, ca)
+		return fmt.Sprintf("openssl s_client -connect %s -servername %s %s -verify_return_error%s </dev/null", shellWord(net.JoinHostPort(u.Hostname(), port)), host, name, ca)
 	}
 	check := func(s trustStore) string {
 		if len(s.files) == 0 {
