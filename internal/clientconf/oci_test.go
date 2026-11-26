@@ -68,9 +68,10 @@ func TestOCIClientRendersEachRuntimeForBothSchemes(t *testing.T) {
 			t.Errorf("%s daemon.json = %q (runtime %s, key %q), want %q", c.base, daemon.Content, daemon.Runtime, daemon.Key, c.daemon)
 		}
 		notes := strings.Join(daemon.Notes, ". ")
-		if !strings.Contains(notes, "covers Docker Hub only") || !strings.Contains(notes, "ghcr.io or quay.io") ||
-			!strings.Contains(notes, "/etc/containerd/certs.d/<registry>/hosts.toml") || !strings.Contains(notes, RegistriesConfDropIn) {
-			t.Errorf("%s daemon.json notes do not name the Docker Hub limit and the other files: %q", c.base, notes)
+		if !strings.Contains(notes, "containerd image store") || !strings.Contains(notes, DockerCertsDir+"/<registry>/hosts.toml for every registry") ||
+			!strings.Contains(notes, "overlay2 image store registry-mirrors covers Docker Hub only") || !strings.Contains(notes, "ghcr.io or quay.io") ||
+			!strings.Contains(notes, "pulled and recreated") {
+			t.Errorf("%s daemon.json notes do not say what each image store covers: %q", c.base, notes)
 		}
 		if got := strings.Contains(notes, "insecure-registries"); got != c.insecureNote {
 			t.Errorf("%s daemon.json notes mention insecure-registries = %v, want %v", c.base, got, c.insecureNote)
@@ -1200,7 +1201,10 @@ func TestDockerStartValidityFollowsNewDaemon(t *testing.T) {
 		{"live restore", `{"live-restore":true}`, "", "live-restore"},
 		{"data root", `{"data-root":"/srv/docker"}`, "", "data-root"},
 		{"rootless", `{"rootless":true,"exec-opts":["native.cgroupdriver=systemd"]}`, "", "rootless"},
-		{"a feature", `{"features":{"containerd-snapshotter":true}}`, "", "features"},
+		{"the image store feature alone", `{"features":{"containerd-snapshotter":true}}`, "", ""},
+		{"the image store feature off", `{"features":{"containerd-snapshotter":false}}`, "", ""},
+		{"another feature", `{"features":{"cdi":true}}`, "", "features"},
+		{"another feature beside the image store", `{"features":{"containerd-snapshotter":true,"cdi":true}}`, "", "features"},
 		{"a listener", `{"hosts":["unix:///var/run/docker.sock"]}`, "", "hosts"},
 		{"a proxy in its group", `{"proxies":{"https-proxy":"http://proxy.internal:3128"}}`, "", "https-proxy"},
 		{"a default turned off", `{"userland-proxy":false}`, "", "userland-proxy"},
@@ -1225,5 +1229,91 @@ func TestDockerStartValidityFollowsNewDaemon(t *testing.T) {
 		if err != nil || !strings.Contains(string(out), "https://bodega.internal/") {
 			t.Errorf("%s: a configure that installs no CA must still edit the file: %v\n%s", c.name, err, out)
 		}
+	}
+}
+
+// B200 R1, R7: DockerContainerdStore is determineImageStoreChoice in
+// daemon/image_store_choice.go at moby docker-v29.5.3, with
+// graphdriver.HasPriorDriver (daemon/graphdriver/driver.go) for the prior
+// driver: features.containerd-snapshotter where set, else containerd unless
+// data-root holds a non-empty non-vfs driver directory or storage-driver
+// names a registered graphdriver.
+func TestDockerContainerdStorePortsDetermineImageStoreChoice(t *testing.T) {
+	for _, c := range []struct {
+		name, daemon string
+		dirs         []string
+		files        []string
+		want         bool
+		err          string
+	}{
+		{name: "no daemon.json, fresh host", want: true},
+		{name: "unset, fresh host", daemon: `{}`, want: true},
+		{name: "unset, a prior overlay2 directory", daemon: `{}`, files: []string{"var/lib/docker/overlay2/l/x"}, want: false},
+		{name: "unset, an empty overlay2 directory", daemon: `{}`, dirs: []string{"var/lib/docker/overlay2"}, want: true},
+		{name: "unset, a prior vfs directory", daemon: `{}`, files: []string{"var/lib/docker/vfs/dir/x"}, want: true},
+		{name: "unset, a prior driver under another data-root", daemon: `{"data-root":"/srv/docker"}`, files: []string{"srv/docker/btrfs/x"}, want: false},
+		{name: "unset, a prior driver outside data-root", daemon: `{"data-root":"/srv/docker"}`, files: []string{"var/lib/docker/overlay2/x"}, want: true},
+		{name: "true", daemon: `{"features":{"containerd-snapshotter":true}}`, want: true},
+		{name: "true over a prior driver", daemon: `{"features":{"containerd-snapshotter":true}}`, files: []string{"var/lib/docker/overlay2/x"}, want: true},
+		{name: "true beside storage-driver overlay2", daemon: `{"features":{"containerd-snapshotter":true},"storage-driver":"overlay2"}`, want: true},
+		{name: "false", daemon: `{"features":{"containerd-snapshotter":false}}`, want: false},
+		{name: "false beside a snapshotter name", daemon: `{"features":{"containerd-snapshotter":false},"storage-driver":"overlayfs"}`, err: `"overlayfs" is not registered`},
+		{name: "unset, storage-driver a graphdriver", daemon: `{"storage-driver":"overlay2"}`, want: false},
+		{name: "unset, storage-driver a snapshotter", daemon: `{"storage-driver":"overlayfs"}`, want: true},
+		{name: "another feature alone", daemon: `{"features":{"cdi":true}}`, want: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			if c.daemon != "" {
+				writeUnder(t, root, map[string]string{DockerDaemonPath: c.daemon})
+			}
+			for _, d := range c.dirs {
+				if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, f := range c.files {
+				writeUnder(t, root, map[string]string{f: "x"})
+			}
+			got, err := DockerContainerdStore(root)
+			if c.err != "" {
+				if err == nil || !strings.Contains(err.Error(), c.err) {
+					t.Fatalf("err = %v, want %q", err, c.err)
+				}
+				return
+			}
+			if err != nil || got != c.want {
+				t.Errorf("DockerContainerdStore = %v, %v; want %v", got, err, c.want)
+			}
+		})
+	}
+}
+
+// B200 R4: a containerd-store dockerd gets each containerd hosts.toml again
+// under /etc/docker/certs.d, fetched from the same file and placed after
+// daemon.json; a plan without one is returned as it came.
+func TestDockerHostsRecordsCopiesContainerdHosts(t *testing.T) {
+	var records []PlanRecord
+	for _, f := range OCIClient("https://bodega.internal", map[string]string{"docker.io": "https://registry-1.docker.io", "ghcr.io": "https://ghcr.io"}) {
+		records = append(records, PlanRecord{System: manifest.TypeOCI, Action: PlanInstall, Path: "~" + f.Path(OSLinux), URL: "u/" + f.Key, SHA256: f.Key})
+	}
+	got := DockerHostsRecords(records)
+	var paths []string
+	for _, r := range got {
+		paths = append(paths, strings.TrimPrefix(r.Path, "~"))
+	}
+	want := []string{DockerDaemonPath, "/etc/docker/certs.d/docker.io/hosts.toml", "/etc/docker/certs.d/ghcr.io/hosts.toml",
+		"/etc/containerd/certs.d/docker.io/hosts.toml", "/etc/containerd/certs.d/ghcr.io/hosts.toml", ContainerdConfigPath, RegistriesConfDropIn}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+	if got[2].URL != "u/"+OCIHostsFileKey("ghcr.io") || got[2].SHA256 != OCIHostsFileKey("ghcr.io") {
+		t.Errorf("docker's ghcr.io record fetches %s (%s), not containerd's file", got[2].URL, got[2].SHA256)
+	}
+	if OCIRuntimeOf(got[2].Path) != RuntimeDocker {
+		t.Errorf("OCIRuntimeOf(%s) = %q, want docker", got[2].Path, OCIRuntimeOf(got[2].Path))
+	}
+	if n := len(DockerHostsRecords(records[:1])); n != 1 {
+		t.Errorf("a plan with no hosts.toml grew to %d records", n)
 	}
 }

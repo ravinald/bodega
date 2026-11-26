@@ -3113,3 +3113,33 @@ func TestAptArchiveRootReachesBodegaForTheCACheck(t *testing.T) {
 		})
 	}
 }
+
+// B200 R5: a daemon.json key doctor does not decide on keeps doctor from
+// judging Docker's trust, and the remediation names the key, says why, and
+// hands over the openssl check rather than telling the operator to remove it.
+func TestDockerUndecidedKeyRemediationKeepsTheKey(t *testing.T) {
+	for _, c := range []struct{ key, daemon string }{
+		{"fixed-cidr-v6", `{"registry-mirrors":["BASE/"],"fixed-cidr-v6":"2001:db8::/64"}`},
+		{"ip6tables", `{"registry-mirrors":["BASE/"],"ip6tables":false}`},
+		{"tlskey", `{"registry-mirrors":["BASE/"],"tlskey":"/client.key"}`},
+	} {
+		t.Run(c.key, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), strings.ReplaceAll(c.daemon, "BASE", base))
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/bodega.internal:8443/ca.crt"), "PEM")
+			f := p.Apply([]Finding{{Check: "oci-docker", Status: StatusOK}}, base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, c.key) {
+				t.Fatalf("row = %+v; want WARN naming %s", f, c.key)
+			}
+			for _, want := range []string{"keep " + c.key, "doctor cannot verify dockerd's trust while " + c.key + " is set",
+				"openssl s_client -connect bodega.internal:8443 -servername bodega.internal -verify_return_error -CAfile /etc/docker/certs.d/bodega.internal:8443/ca.crt"} {
+				if !strings.Contains(f.Remediation, want) {
+					t.Errorf("remediation lacks %q: %s", want, f.Remediation)
+				}
+			}
+			if strings.Contains(f.Remediation, "remove") {
+				t.Errorf("remediation tells the operator to remove something: %s", f.Remediation)
+			}
+		})
+	}
+}

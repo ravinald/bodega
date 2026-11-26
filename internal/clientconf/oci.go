@@ -32,7 +32,10 @@ const (
 
 // Where each runtime reads its registry configuration on Linux.
 const (
-	DockerDaemonPath     = "/etc/docker/daemon.json"
+	DockerDaemonPath = "/etc/docker/daemon.json"
+	// DockerCertsDir is where dockerd on the containerd image store reads a
+	// hosts.toml per registry, in containerd's format.
+	DockerCertsDir       = "/etc/docker/certs.d"
 	ContainerdConfigPath = "/etc/containerd/config.toml"
 	ContainerdCertsDir   = "/etc/containerd/certs.d"
 	// RegistriesConfDropIn sorts after the distribution's own drop-ins
@@ -105,7 +108,7 @@ func OCIClient(base string, upstreams map[string]string) []OCIFile {
 // the whole path so a test can root the plan under a scratch home.
 func OCIRuntimeOf(p string) string {
 	switch {
-	case strings.HasSuffix(p, "/docker/daemon.json"):
+	case strings.HasSuffix(p, "/docker/daemon.json"), strings.Contains(p, "/docker/certs.d/") && strings.HasSuffix(p, "/hosts.toml"):
 		return RuntimeDocker
 	case strings.Contains(p, "/containerd/"):
 		return RuntimeContainerd
@@ -128,8 +131,8 @@ func ociPlaintext(base string) string {
 // DockerDaemon renders the daemon.json keys bodega sets. dockerd stores a
 // mirror with one trailing slash whatever it is given, so this is the form
 // `docker info` prints back. MergeDockerDaemon writes them into a host's
-// existing file. registries is what the other runtimes cover, for the note
-// saying Docker Engine covers none of them but Docker Hub.
+// existing file. registries is oci_upstreams' names, for the note saying
+// which of them Docker Engine reaches bodega for under each image store.
 func DockerDaemon(base string, registries []string) File {
 	b := trim(base)
 	doc := []member{{"registry-mirrors", json.RawMessage("[" + jsonString(b+"/") + "]")}}
@@ -144,8 +147,8 @@ func DockerDaemon(base string, registries []string) File {
 		scope = "an image from " + strings.Join(others, " or ")
 	}
 	notes := []string{
-		"Docker Engine's registry-mirrors covers Docker Hub only: " + scope + " still pulls from its own registry. " +
-			"containerd's " + ContainerdCertsDir + "/<registry>/hosts.toml and podman's " + RegistriesConfDropIn + " route the rest through bodega",
+		"Docker Engine on the containerd image store (the default on a fresh Docker 29 install) reads " + DockerCertsDir + "/<registry>/hosts.toml for every registry, and doctor writes one per registry beside this file there; " +
+			"on the overlay2 image store registry-mirrors covers Docker Hub only and " + scope + " still pulls from its own registry, until the containerd image store is turned on, which hides every image and container dockerd already holds until each is pulled and recreated",
 		"An existing daemon.json keeps every other key; registry-mirrors is replaced, since a second mirror is one Docker may pull from instead of bodega",
 	}
 	if hp := ociPlaintext(b); hp != "" {
@@ -160,6 +163,32 @@ func DockerDaemon(base string, registries []string) File {
 		Content: string(content),
 		Notes:   notes,
 	}
+}
+
+// DockerHostsRecords adds, after the daemon.json record, a copy of each
+// containerd hosts.toml record at the same registry's path under
+// DockerCertsDir, for a dockerd on the containerd image store. The copy
+// fetches the file containerd's record names: dockerd reads it through
+// containerd's resolver, so ContainerdHosts' rendering is the one it needs.
+// Paths match on their trailing directories, as OCIRuntimeOf's do.
+func DockerHostsRecords(records []PlanRecord) []PlanRecord {
+	var docker []PlanRecord
+	for _, r := range records {
+		if r.System != manifest.TypeOCI || r.Action != PlanInstall || !strings.HasSuffix(r.Path, "/hosts.toml") {
+			continue
+		}
+		if prefix, reg, ok := strings.Cut(r.Path, ContainerdCertsDir+"/"); ok {
+			r.Path = prefix + DockerCertsDir + "/" + reg
+			docker = append(docker, r)
+		}
+	}
+	at := slices.IndexFunc(records, func(r PlanRecord) bool {
+		return r.System == manifest.TypeOCI && strings.HasSuffix(r.Path, DockerDaemonPath)
+	})
+	if len(docker) == 0 || at < 0 {
+		return records
+	}
+	return slices.Concat(records[:at+1], docker, records[at+1:])
 }
 
 // ContainerdHosts renders the hosts.toml for one registry: server is the

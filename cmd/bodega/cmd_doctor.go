@@ -327,7 +327,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF"), Registries: doctorOCIRegistries(gf)}.Check(base)...)
 			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
 			}
@@ -723,6 +723,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		return err
 	}
+	records = dockerStoreRecords(records)
 	if records, err = keepPresentRuntimes(records, slices.Contains(req.systems, manifest.TypeOCI)); err != nil {
 		return err
 	}
@@ -1261,6 +1262,31 @@ func rpmDisableStep(changes []clientconf.Change) ([]string, error) {
 	return append([]string{"dnf", "config-manager", "--set-disabled"}, ids...), nil
 }
 
+// dockerStoreRecords adds Docker's hosts.toml records where dockerd is on
+// PATH and keeps its images in the containerd image store, judged under the
+// root the plan's daemon.json is written beneath. A daemon.json dockerd
+// refuses adds nothing: the merge into it refuses the run on its own.
+func dockerStoreRecords(records []clientconf.PlanRecord) []clientconf.PlanRecord {
+	if !runtimePresent(clientconf.RuntimeDocker) {
+		return records
+	}
+	home, _ := os.UserHomeDir()
+	for _, r := range records {
+		if r.System != manifest.TypeOCI || !strings.HasSuffix(r.Path, clientconf.DockerDaemonPath) {
+			continue
+		}
+		target, err := clientconf.TargetPath(r.Path, home)
+		if err != nil {
+			return records
+		}
+		if containerd, err := clientconf.DockerContainerdStore(strings.TrimSuffix(target, clientconf.DockerDaemonPath)); err == nil && containerd {
+			return clientconf.DockerHostsRecords(records)
+		}
+		return records
+	}
+	return records
+}
+
 // runtimePresent reports whether any of rt's commands is on PATH.
 func runtimePresent(rt string) bool {
 	for _, bin := range clientconf.RuntimeBinaries[rt] {
@@ -1335,6 +1361,18 @@ func printRuntimeRestarts(changes []clientconf.Change) {
 			}
 		}
 	}
+}
+
+// doctorOCIRegistries is the oci_upstreams names the report checks Docker
+// Engine's hosts.toml files for: this host's config where it loads, else
+// bodega's defaults, which is what a client host with no config of its own
+// is served unless the server's operator changed them.
+func doctorOCIRegistries(gf *globalFlags) []string {
+	upstreams := config.DefaultOCIUpstreams
+	if cfg, err := loadConfig(gf); err == nil && len(cfg.OCIUpstreams) > 0 {
+		upstreams = cfg.OCIUpstreams
+	}
+	return slices.Sorted(maps.Keys(upstreams))
 }
 
 // doctorBaseURL is the bodega URL doctor's report compares a client's

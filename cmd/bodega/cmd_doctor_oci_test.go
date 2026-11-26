@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -161,5 +162,92 @@ func TestDoctorReportsDockerWithNoMirror(t *testing.T) {
 	}
 	if strings.Contains(out, "oci-containerd") || strings.Contains(out, "oci-podman") {
 		t.Errorf("a runtime not on PATH got a row:\n%s", out)
+	}
+}
+
+// B200 R4: --configure oci --apply on a dockerd keeping the containerd image
+// store writes a hosts.toml per oci_upstreams registry under
+// /etc/docker/certs.d, ContainerdHosts' rendering, beside registry-mirrors;
+// on overlay2 it writes none for Docker.
+func TestDoctorConfigureOCIWritesDockerHostsByImageStore(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		prior bool
+		want  bool
+	}{
+		{name: "containerd store", want: true},
+		{name: "overlay2", prior: true, want: false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			stubRuntimes(t, "dockerd")
+			srv := ociPlanServer(t, "http://bodega.internal:8080")
+			files := map[string]string{"etc/docker/daemon.json": `{"log-driver":"journald"}`}
+			if c.prior {
+				files["var/lib/docker/overlay2/l/ABC"] = "x"
+			}
+			for p, body := range files {
+				full := filepath.Join(home, p)
+				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := runDoctor(t, "--configure", "oci", "--url", srv.URL, "--allow-plaintext", "--apply")
+			if err != nil {
+				t.Fatalf("--apply = %v:\n%s", err, out)
+			}
+			if got, _ := os.ReadFile(filepath.Join(home, "etc/docker/daemon.json")); !strings.Contains(string(got), `"http://bodega.internal:8080/"`) {
+				t.Errorf("daemon.json after --apply = %s", got)
+			}
+			for _, reg := range []string{"docker.io", "ghcr.io"} {
+				p := filepath.Join(home, "etc/docker/certs.d", reg, "hosts.toml")
+				got, err := os.ReadFile(p)
+				switch {
+				case c.want && string(got) != clientconf.ContainerdHosts("http://bodega.internal:8080", reg, map[string]string{"docker.io": "https://registry-1.docker.io", "ghcr.io": "https://ghcr.io"}[reg]).Content:
+					t.Errorf("%s = %q, %v; want ContainerdHosts' file", p, got, err)
+				case !c.want && !errors.Is(err, os.ErrNotExist):
+					t.Errorf("%s written on an overlay2 dockerd: %v", p, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(home, "etc/containerd/certs.d")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("containerd's files were written with no containerd on PATH: %v", err)
+			}
+			out, err = runDoctor(t, "--configure", "oci", "--url", srv.URL, "--allow-plaintext", "--apply")
+			if err != nil || !strings.Contains(out, "Nothing to change") {
+				t.Errorf("second --apply = %v:\n%s", err, out)
+			}
+		})
+	}
+}
+
+// B200 R4: --ca-file gives Docker's hosts.toml the ca line it gives
+// containerd's, under bodega's host table.
+func TestDoctorConfigureOCICAReachesDockerHosts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	daemon := filepath.Join(home, "etc/docker/daemon.json")
+	for path, content := range map[string]string{caFile: string(caPEM), daemon: `{"log-driver":"journald"}`} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+	out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	got, _ := os.ReadFile(filepath.Join(home, "etc/docker/certs.d/docker.io/hosts.toml"))
+	if !strings.Contains(string(got), "[host."+strconv.Quote(srv.URL)+"]") || !strings.Contains(string(got), `  ca = "`+userCA+`"`) {
+		t.Errorf("Docker's docker.io hosts.toml after --apply = %q, want bodega's host with ca = %s", got, userCA)
 	}
 }

@@ -439,6 +439,12 @@ type DockerDaemonFile struct {
 	// for none. Nothing here reads that host state, so a CA is not certified
 	// for a dockerd holding one.
 	StartUnmodeled string
+	// Snapshotter is features.containerd-snapshotter, nil where the file
+	// does not set it. StorageDriver is storage-driver and DataRoot
+	// data-root, each "" where unset. DockerContainerdStore reads them.
+	Snapshotter   *bool
+	StorageDriver string
+	DataRoot      string
 }
 
 // ParseDockerDaemonFile loads a daemon.json as dockerd v28.5.2 does with no flag
@@ -497,7 +503,10 @@ func ParseDockerDaemonFile(data []byte) (*DockerDaemonFile, error) {
 	if err := conf.validate(); err != nil {
 		return nil, err
 	}
-	d := &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries}
+	d := &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries, StorageDriver: conf.GraphDriver, DataRoot: conf.Root}
+	if on, ok := conf.Features[dockerSnapshotterFeature]; ok {
+		d.Snapshotter = &on
+	}
 	if err := conf.startError(set); err != nil {
 		d.StartError = err.Error()
 	}
@@ -870,6 +879,11 @@ func (conf *dockerDaemonConfig) startUnmodeled(set map[string]any) string {
 		if dockerStartModeled[key] {
 			continue
 		}
+		// The image store dockerd picks with containerd-snapshotter is one
+		// it starts with either way, and DockerContainerdStore decides it.
+		if f, ok := set[key].(map[string]any); ok && key == "features" && len(f) == 1 && f[dockerSnapshotterFeature] != nil {
+			continue
+		}
 		switch v := set[key].(type) {
 		case nil:
 			continue
@@ -1045,4 +1059,77 @@ func DockerCertsDirError(dir, planned string) error {
 		}
 	}
 	return nil
+}
+
+const dockerSnapshotterFeature = "containerd-snapshotter"
+
+// dockerGraphdrivers is the set graphdriver.IsRegistered answers from in a
+// linux dockerd v29.5.3 built without exclude tags: the drivers
+// daemon/graphdriver/register registers.
+var dockerGraphdrivers = map[string]bool{"btrfs": true, "fuse-overlayfs": true, "overlay2": true, "vfs": true, "zfs": true}
+
+// DockerContainerdStore reports whether the dockerd reading the daemon.json
+// under root keeps its images in the containerd image store, where it reads
+// /etc/docker/certs.d/<registry>/hosts.toml for every registry, rather than
+// a graphdriver such as overlay2, where registry-mirrors covers Docker Hub
+// alone. It is determineImageStoreChoice in daemon/image_store_choice.go at
+// moby docker-v29.5.3 for linux: features.containerd-snapshotter where set,
+// else the containerd store unless data-root holds a prior graphdriver's
+// directory (graphdriver.HasPriorDriver) or storage-driver names a
+// graphdriver. DOCKER_DRIVER and TEST_INTEGRATION_USE_GRAPHDRIVER in
+// dockerd's own environment outrank the file there and are not read: they
+// live in the service manager's unit, not in anything this reads.
+//
+// The error is the one dockerd exits on: containerd-snapshotter false with
+// a storage-driver no graphdriver registers. A daemon.json dockerd refuses
+// to load is LoadDockerDaemonFile's error.
+func DockerContainerdStore(root string) (bool, error) {
+	doc, err := LoadDockerDaemonFile(filepath.Join(root, DockerDaemonPath))
+	if err != nil {
+		return false, err
+	}
+	if doc == nil {
+		doc = &DockerDaemonFile{}
+	}
+	dataRoot := doc.DataRoot
+	if dataRoot == "" {
+		dataRoot = dockerStartDefaults["data-root"].(string)
+	}
+	containerd, explicit := true, doc.Snapshotter != nil
+	if explicit {
+		containerd = *doc.Snapshotter
+	}
+	if containerd && !explicit && dockerHasPriorDriver(filepath.Join(root, dataRoot)) {
+		return false, nil
+	}
+	if driver := doc.StorageDriver; driver != "" {
+		registered := dockerGraphdrivers[driver]
+		switch {
+		case !explicit && registered, !containerd && registered:
+			return false, nil
+		case !containerd:
+			return false, fmt.Errorf("graphdriver is explicitly enabled but %q is not registered", driver)
+		}
+		return true, nil
+	}
+	return containerd, nil
+}
+
+// dockerHasPriorDriver is graphdriver.HasPriorDriver: a directory under
+// dataRoot named for a registered driver other than vfs, holding anything
+// or unreadable, says dockerd has run with that graphdriver.
+func dockerHasPriorDriver(dataRoot string) bool {
+	for driver := range dockerGraphdrivers {
+		if driver == "vfs" {
+			continue
+		}
+		p := filepath.Join(dataRoot, driver)
+		if _, err := plannedfs.Stat(p); err != nil {
+			continue
+		}
+		if entries, err := plannedfs.ReadDir(p); err != nil || len(entries) > 0 {
+			return true
+		}
+	}
+	return false
 }

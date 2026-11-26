@@ -111,6 +111,10 @@ type trustStore struct {
 	// note qualifies a store that verifies: what the verdict does not cover
 	// for it, carried into the row and the verdict's detail.
 	note string
+	// keep is the remediation for a blind store whose input the operator
+	// keeps on purpose, in place of removing it: a daemon.json key dockerd
+	// needs, which doctor cannot decide on.
+	keep string
 }
 
 // loopbackNote is the note on a Docker or containerd store when bodega is at
@@ -238,6 +242,24 @@ var trustRows = map[string]trustRow{
 	"oci-" + clientconf.RuntimeDocker:     {system: manifest.TypeOCI, stores: dockerStores},
 }
 
+// dockerHandCheck is the remediation for a daemon.json key doctor does not
+// decide on: the key stays, since dockerd may need it, and the operator
+// verifies bodega's certificate against what dockerd reads, the system
+// store and certs.d/<host>/ca.crt, with openssl instead.
+func dockerHandCheck(t TrustProbe, u *url.URL, key string) string {
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	ca := ""
+	p := filepath.Join(clientconf.DockerCertsDir, u.Host, "ca.crt")
+	if _, err := plannedfs.Stat(filepath.Join(t.Root, p)); err == nil {
+		ca = " -CAfile " + p
+	}
+	return fmt.Sprintf("keep %s if dockerd needs it: doctor cannot verify dockerd's trust while %s is set in %s. Check bodega's certificate by hand against the stores dockerd reads: openssl s_client -connect %s -servername %s -verify_return_error%s </dev/null, which ends with \"Verify return code: 0 (ok)\" when dockerd would accept it",
+		key, key, clientconf.DockerDaemonPath, net.JoinHostPort(u.Hostname(), port), u.Hostname(), ca)
+}
+
 // dockerStores is the certs.d directory dockerd reads for bodega at u when a
 // registry-mirrors entry of the daemon.json it loads names that host. The
 // file is loaded whole, as dockerd loads it: one dockerd refuses, over any
@@ -256,10 +278,10 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		return nil
 	}
 	if doc.StartUnmodeled != "" {
-		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which dockerd acts on against this host as it starts and may exit over, and doctor reads no such host state, so whether dockerd runs to verify bodega's certificate is unchecked", doc.StartUnmodeled)}}
+		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.StartUnmodeled), blind: fmt.Sprintf("dockerd's configuration sets %s, which dockerd acts on against this host as it starts and may exit over, and doctor reads no such host state, so whether dockerd runs to verify bodega's certificate is unchecked", doc.StartUnmodeled)}}
 	}
 	if doc.TLSUnmodeled != "" {
-		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
+		return []trustStore{{name: "dockerd's configuration", keep: dockerHandCheck(t, u, doc.TLSUnmodeled), blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
 	}
 	if route := plainRoute(doc.Mirrors, u); route != "" {
 		return plainUncertified("dockerd", "a registry mirror", route)
@@ -1201,6 +1223,9 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 		install := fmt.Sprintf("bodega doctor --configure %s --ca-file <CA certificate PEM> --apply --url %s", row.system, strings.TrimRight(base, "/"))
 		detail := strings.Join(unread, "; ")
 		remedy := "remove what keeps doctor from reading this client's trust (named above) and re-run doctor; where the client then refuses bodega's certificate, install the CA that issued it: " + install
+		if i := slices.IndexFunc(stores, func(s trustStore) bool { return s.keep != "" }); i >= 0 {
+			remedy = stores[i].keep + "; where it does not, install the CA that issued it: " + install
+		}
 		if len(failed) > 0 {
 			detail = strings.TrimPrefix(detail+"; ", "; ") + fmt.Sprintf("configured for bodega at %s, and %s, so every fetch fails on the certificate", u.Host, strings.Join(failed, "; and "))
 			remedy = "install the CA that issued bodega's certificate: " + install
