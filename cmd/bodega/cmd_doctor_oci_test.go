@@ -542,3 +542,116 @@ func TestUsageDocDescribesDockerImageStores(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewF124DockerSwitchInstallsMirrorsBeforePull(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "clients.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(doc), "## Docker Engine\n")
+	if !ok {
+		t.Fatal("Docker Engine section missing")
+	}
+	section, _, _ = strings.Cut(section, "\n## containerd\n")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd")
+	srv := ociPlanServer(t, "https://bodega.example")
+	daemon := filepath.Join(home, "etc/docker/daemon.json")
+	if err := os.MkdirAll(filepath.Dir(daemon), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(daemon, []byte(`{"features":{"containerd-snapshotter":false}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	switched, configured, checked := false, false, false
+	for _, line := range strings.Split(section, "\n") {
+		if strings.Contains(line, `"containerd-snapshotter": true`) {
+			data, err := os.ReadFile(daemon)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var state map[string]any
+			if err := json.Unmarshal(data, &state); err != nil {
+				t.Fatal(err)
+			}
+			state["features"] = map[string]bool{"containerd-snapshotter": true}
+			data, err = json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(daemon, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			switched = true
+		}
+		if strings.HasPrefix(line, "sudo bodega doctor --configure oci ") {
+			out, err := runDoctor(t, "--configure", "oci", "--url", srv.URL, "--allow-plaintext", "--apply")
+			if err != nil {
+				t.Fatalf("documented doctor command: %v\n%s", err, out)
+			}
+			configured = true
+		}
+		if strings.HasPrefix(line, "docker compose pull") {
+			if !switched || !configured {
+				t.Fatal("fixture did not follow the configure and store-switch steps")
+			}
+			p := filepath.Join(home, "etc/docker/certs.d/ghcr.io/hosts.toml")
+			got, err := os.ReadFile(p)
+			want := clientconf.ContainerdHosts("https://bodega.example", "ghcr.io", "https://ghcr.io").Content
+			if err != nil || string(got) != want {
+				t.Fatalf("at the documented compose pull, ghcr.io has no bodega mirror: hosts.toml=%q, err=%v; run doctor after enabling the containerd store and before pulling", got, err)
+			}
+			checked = true
+			break
+		}
+	}
+	if !checked {
+		t.Fatal("no documented compose pull checked")
+	}
+}
+
+func TestReviewF124ContainerdCustomPathTrapMatchesDoctor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "containerd")
+	srv := ociPlanServer(t, "https://bodega.example")
+	custom := filepath.Join(home, "etc/containerd/custom-certs.d")
+	config := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(config), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = " + strconv.Quote(custom) + "\n"
+	if err := os.WriteFile(config, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runDoctor(t, "--configure", "oci", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err != nil {
+		t.Fatalf("doctor: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := clientconf.ReadContainerdConfig(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registry.ConfigPath != custom {
+		t.Fatalf("doctor changed the operator's config_path to %q", registry.ConfigPath)
+	}
+	_, customErr := os.Stat(filepath.Join(custom, "ghcr.io/hosts.toml"))
+	_, defaultErr := os.Stat(filepath.Join(home, "etc/containerd/certs.d/ghcr.io/hosts.toml"))
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "clients.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(doc), "## containerd\n")
+	if !ok {
+		t.Fatal("containerd section missing")
+	}
+	section, _, _ = strings.Cut(section, "\n## podman\n")
+	if strings.Contains(section, "hosts files go where it points") && customErr != nil {
+		t.Fatalf("page promises files at the preserved config_path, but doctor writes the default: custom hosts.toml=%v; default hosts.toml=%v; document the bypass and the manual remedy", customErr, defaultErr)
+	}
+}

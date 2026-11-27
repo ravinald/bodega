@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -125,6 +126,44 @@ func TestApplyBacksUpWritesAndSkipsUnchanged(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "same.bodega-test")); err == nil {
 		t.Error("an unchanged file was backed up")
+	}
+}
+
+// Two applies in the same second share a suffix. The second still writes,
+// and the first backup, the operator's own file, stays as it was.
+func TestApplyTwiceInOneSecondKeepsTheFirstBackup(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "conf")
+	if err := os.WriteFile(target, []byte("operator\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i, content := range []string{"first\n", "second\n", "third\n"} {
+		rec := PlanRecord{System: "x", Action: PlanInstall, Path: "~/conf", SHA256: digest(content)}
+		c, err := NewChange(rec, []byte(content), home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applied, err := Apply([]Change{c}, ".bodega-same")
+		if err != nil {
+			t.Fatalf("apply %d: %v", i+1, err)
+		}
+		want := target + ".bodega-same"
+		if i > 0 {
+			want += "." + strconv.Itoa(i)
+		}
+		if len(applied) != 1 || applied[0].Backup != want {
+			t.Errorf("apply %d backed up to %+v, want %s", i+1, applied, want)
+		}
+	}
+	for path, want := range map[string]string{
+		"conf":               "third\n",
+		"conf.bodega-same":   "operator\n",
+		"conf.bodega-same.1": "first\n",
+		"conf.bodega-same.2": "second\n",
+	} {
+		if got, err := os.ReadFile(filepath.Join(home, path)); err != nil || string(got) != want {
+			t.Errorf("%s = %q, %v; want %q", path, got, err, want)
+		}
 	}
 }
 

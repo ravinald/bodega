@@ -910,6 +910,14 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 			return "freebsd", parts[1], parts[0]
 		}
 		return "freebsd", "", ""
+	case strings.HasPrefix(path, "/distfiles/"):
+		// The name handleDistfiles admits, with the @<environment> segment
+		// the client measured dropped, as the manifest entry names it.
+		name := strings.TrimPrefix(path, "/distfiles/")
+		if rest, ok := strings.CutPrefix(name, "@"); ok && name != clientCheckPath {
+			_, name, _ = strings.Cut(rest, "/")
+		}
+		return manifest.TypeDistfiles, name, ""
 	}
 	return "", "", ""
 }

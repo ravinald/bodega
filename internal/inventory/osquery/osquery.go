@@ -325,6 +325,7 @@ func (s *Source) serveConfig(w http.ResponseWriter, r *http.Request, env *invent
 		"schedule":                Schedule(s.dirsFor(n.Identity), s.interval, s.origins),
 		"auto_table_construction": AutoTables(s.origins),
 	})
+	env.Served(r, n.Identity, map[string]string{"route": env.Route.Path, "host_identifier": n.HostIdentifier})
 }
 
 // Covers is what the schedule reads on identity's host: the system package

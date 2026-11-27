@@ -37,6 +37,13 @@ type Frame struct {
 	// refused, so the refusal lands in the same audit table as every other.
 	OnRefusal func(r *http.Request, reason string, details map[string]string)
 
+	// OnServed, when set, is told about a remote API request a source
+	// answered for a known client, so the client's fetch leaves a row where
+	// its refusals do. identity is the binding the source resolved, which a
+	// route authenticated by its own credential knows and the request does
+	// not carry.
+	OnServed func(r *http.Request, identity string, details map[string]string)
+
 	// OnReport, when set, is handed each report once it is stored, with the
 	// ID, Seq and chain fields the store assigned. Reconciliation hangs off
 	// it. It runs inside Ingest, after the report is committed, so its
@@ -241,6 +248,18 @@ func (e *RouteEnv) Refuse(r *http.Request, reason string, details map[string]str
 	details["instance"] = e.Instance.Name
 	if e.f.OnRefusal != nil {
 		e.f.OnRefusal(r, reason, details)
+	}
+}
+
+// Served records a request the route answered for identity's host. details
+// gains the instance, as Refuse's do.
+func (e *RouteEnv) Served(r *http.Request, identity string, details map[string]string) {
+	if details == nil {
+		details = map[string]string{}
+	}
+	details["instance"] = e.Instance.Name
+	if e.f.OnServed != nil {
+		e.f.OnServed(r, identity, details)
 	}
 }
 

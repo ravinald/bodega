@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -820,7 +821,9 @@ func (s *Server) planAptArchives(r *http.Request, h *clientHost, onHost map[aptS
 }
 
 func (s *Server) aptArchiveFile(h *clientHost, codename string) clientconf.File {
-	return clientconf.AptArchiveIn(h.base, s.cfg.AptArchiveOf(codename), codename, s.cfg.AptComponentsFor(codename))
+	return clientconf.ForType(manifest.TypeApt, clientconf.Inputs{Base: h.base, AptArchives: []clientconf.AptArchiveRef{
+		{Archive: s.cfg.AptArchiveOf(codename), Key: codename, Components: s.cfg.AptComponentsFor(codename)},
+	}})[0]
 }
 
 // aptPocketBase names the mirrored base a mirrored suite is a pocket of. A
@@ -993,14 +996,15 @@ func (s *Server) planRpm(h *clientHost, one func(clientconf.File) []planFile) []
 	if len(key) == 0 {
 		return skip("every section sets repo_gpgcheck=1, and this server holds no signing key to sign repomd.xml with; an operator runs `bodega apt key generate`")
 	}
-	f, kept := clientconf.RpmHost(h.base, d, func(up string) bool { _, ok := s.cfg.RpmUpstreams[up]; return ok })
-	if len(kept) == 0 {
+	files := clientconf.ForType(manifest.TypeRpm, clientconf.Inputs{Base: h.base, RpmRepos: slices.Collect(maps.Keys(s.cfg.RpmUpstreams)), RpmDistro: &d})
+	if len(files) == 0 {
 		names := make([]string, len(d.Repos))
 		for i, r := range d.Repos {
 			names[i] = r.Upstream
 		}
 		return skip(fmt.Sprintf("%s reads %s, and rpm_upstreams on this server configures none of them", d.Name(), strings.Join(names, ", ")))
 	}
+	f := files[0]
 	out := one(f)
 	out[0].reason = strings.Join(f.Notes, ". ")
 	return append(out, planFile{system: manifest.TypeRpm, action: planInstall, path: clientconf.RpmKeyPath,

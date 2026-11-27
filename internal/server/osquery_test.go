@@ -359,3 +359,42 @@ func testOsqMergeKeepsTheAutoloadFile(t *testing.T, plan string) {
 		}
 	}
 }
+
+func TestReviewF124OsquerySuccessfulConfigHasAuditEvidence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		AptCodename: "noble", LogDir: dir, StoragePath: dir, AuditDB: filepath.Join(dir, "audit.db"),
+		AdminPermitCIDR: []string{"10.0.0.0/8"}, AllowPlaintext: true, InventorySources: osquerySources,
+	}
+	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if s.auditDB == nil || s.inventory == nil {
+		t.Fatalf("fixture: inventoryErr=%v", s.inventoryErr)
+	}
+	t.Cleanup(func() { _ = s.auditDB.Close() })
+	s.pepper = invPepper
+	secret := addEnrollSecret(t, s, "osq", "web-01")
+	rec := send(s, http.MethodPost, "/api/v1/inventory/sources/osq/enroll", outsideAddr, "", `{"enroll_secret":"`+secret+`"}`)
+	var node struct {
+		Key string `json:"node_key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &node); err != nil || rec.Code != http.StatusOK || node.Key == "" {
+		t.Fatalf("enroll = %d %s: %v", rec.Code, rec.Body, err)
+	}
+	clientIP, _, _ := strings.Cut(outsideAddr, ":")
+	filter := audit.Filter{ClientIP: clientIP}
+	before, err := s.auditDB.Query(t.Context(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = send(s, http.MethodPost, "/api/v1/inventory/sources/osq/config", outsideAddr, "", `{"node_key":"`+node.Key+`"}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"schedule"`) {
+		t.Fatalf("config = %d %s", rec.Code, rec.Body)
+	}
+	after, err := s.auditDB.Query(t.Context(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) <= len(before) {
+		t.Fatalf("successful osquery config fetch wrote no audit event: before=%d after=%d HTTP=%d", len(before), len(after), rec.Code)
+	}
+}
