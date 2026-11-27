@@ -503,18 +503,24 @@ func TestRESTAPIOffersRawDownload(t *testing.T) {
 	}
 }
 
-func TestCoverageVerdictCarriesItsReasonBelowUsable(t *testing.T) {
+func TestCoverageVerdictLinksToItsReasonBelowUsable(t *testing.T) {
 	dir := t.TempDir()
 	feed := filepath.Join(dir, "coverage.json")
 	write(feed, []byte(`{"revision":"abc","evaluatedAt":"2026-01-01T00:00:00Z","summary":"s","packages":[`+
 		`{"id":"apt","verdict":"Partial","reason":"4 of 691 primary checks are not passing","coverage":"100%","features":[{"label":"L","description":"D","value":"yes"}]},`+
 		`{"id":"npm","verdict":"Ready","reason":"green on 6 test platforms","coverage":"100%","features":[{"label":"L","description":"D","value":"yes"}]}]}`))
 	html := renderCoverage(feed, "/")
-	partial := `<td class="verdict v-partial">Partial<small class="why">4 of 691 primary checks are not passing</small></td>`
+	partial := `<a href="#apt">apt</a></th><td class="verdict v-partial"><a href="#apt-reason" title="4 of 691 primary checks are not passing">Partial</a></td>`
 	if !strings.Contains(html, partial) {
-		t.Errorf("a Partial row's verdict cell lacks its reason: want %q", partial)
+		t.Errorf("a Partial row must keep its type link and link the verdict word to the reason: want %q", partial)
 	}
-	if strings.Contains(html, "green on 6 test platforms</small>") {
-		t.Error("a Ready row's verdict cell carries its reason; only Partial and Not yet should")
+	if !strings.Contains(html, `<p id="apt-reason">4 of 691 primary checks are not passing.</p>`) {
+		t.Error("the Evidence entry carries no anchor for the reason the verdict links to")
+	}
+	if strings.Contains(html, `class="why"`) {
+		t.Error("the reason text is back in the table cell, which widens the fixed verdict column")
+	}
+	if !strings.Contains(html, `<td class="verdict v-ready">Ready</td>`) {
+		t.Error("a Ready verdict should stay plain text")
 	}
 }

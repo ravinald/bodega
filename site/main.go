@@ -666,11 +666,12 @@ func renderCoverage(file, base string) string {
 		fmt.Fprintf(&b, "<tr data-type=\"%s\" data-rank=\"%d\" data-coverage=\"%d\"><th scope=\"row\">", e(p.ID), verdictRank(p.Verdict), coveragePercent(p.Coverage))
 		// A verdict below Usable is the one a reader questions, and the cells beside it
 		// cannot answer: they rate features, and the failing runs live in the reason.
-		why := ""
+		// The reason stays in the Evidence entry so the fixed-width column keeps one word.
+		verdict := e(p.Verdict)
 		if p.Verdict == "Partial" || p.Verdict == "Not yet" {
-			why = "<small class=\"why\">" + e(capitalize(p.Reason)) + "</small>"
+			verdict = fmt.Sprintf("<a href=\"#%s-reason\" title=\"%s\">%s</a>", e(p.ID), e(capitalize(p.Reason)), verdict)
 		}
-		fmt.Fprintf(&b, "%s<a href=\"#%s\">%s</a></th><td class=\"verdict %s\">%s%s</td><td class=\"num\">%s</td>", labelIcon(base, p.ID), e(p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), why, e(p.Coverage))
+		fmt.Fprintf(&b, "%s<a href=\"#%s\">%s</a></th><td class=\"verdict %s\">%s</td><td class=\"num\">%s</td>", labelIcon(base, p.ID), e(p.ID), e(p.ID), verdictClass(p.Verdict), verdict, e(p.Coverage))
 		for _, ft := range p.Features {
 			mark, ok := marks[ft.Value]
 			if !ok {
@@ -684,7 +685,7 @@ func renderCoverage(file, base string) string {
 
 	b.WriteString("<h2 id=\"evidence\">Evidence</h2>\n<dl class=\"evidence\">\n")
 	for _, p := range f.Packages {
-		fmt.Fprintf(&b, "<dt id=\"%s\">%s%s <span class=\"verdict %s\">%s</span> <span>%s</span></dt>\n<dd><p>%s.</p>", e(p.ID), labelIcon(base, p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage), e(capitalize(p.Reason)))
+		fmt.Fprintf(&b, "<dt id=\"%s\">%s%s <span class=\"verdict %s\">%s</span> <span>%s</span></dt>\n<dd><p id=\"%s-reason\">%s.</p>", e(p.ID), labelIcon(base, p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage), e(p.ID), e(capitalize(p.Reason)))
 		if len(p.Runs) > 0 {
 			b.WriteString("<ul class=\"runs\">")
 			for _, r := range p.Runs {
