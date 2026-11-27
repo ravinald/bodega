@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -384,10 +385,11 @@ func Apply(changes []Change, suffix string) ([]Applied, error) {
 			return done, fmt.Errorf("create %s: %w", filepath.Dir(c.Target), err)
 		}
 		if c.Existed {
-			a.Backup = c.Target + suffix
-			if err := copyFile(c.Target, a.Backup); err != nil {
+			backup, err := backupFile(c.Target, c.Target+suffix)
+			if err != nil {
 				return done, fmt.Errorf("back up %s, so it was not written: %w", c.Target, err)
 			}
+			a.Backup = backup
 		}
 		// In place rather than renamed over: the file keeps its owner and
 		// mode, which a rename would replace with this process's.
@@ -422,6 +424,21 @@ func writable(path string) error {
 		dir = parent
 	}
 	return syscall.Access(dir, wOK)
+}
+
+// backupFile copies src to base, or to base.1, base.2 and so on when a run
+// in the same second already took that name. An existing backup is never
+// replaced: the first one a host gets may be the only copy of the operator's
+// own file.
+func backupFile(src, base string) (string, error) {
+	dst := base
+	for i := 1; ; i++ {
+		err := copyFile(src, dst)
+		if !errors.Is(err, fs.ErrExist) || i > 100 {
+			return dst, err
+		}
+		dst = fmt.Sprintf("%s.%d", base, i)
+	}
 }
 
 // copyFile copies src to dst with src's mode, refusing to overwrite dst.

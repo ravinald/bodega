@@ -776,19 +776,31 @@ docker info --format '{{ .DriverStatus }}'
 sudo systemctl reload docker
 ```
 
-Turning the containerd store on takes `"features": {"containerd-snapshotter": true}` in `daemon.json` and a restart, since the store is chosen when `dockerd` starts.
+Turning the containerd store on takes a restart, since the store is chosen when `dockerd` starts.
 The switch hides every image and container the daemon held: they stay on disk under the old store, and `docker ps -a` and `docker images` list none of them.
 So every compose project the daemon runs has to be pulled and recreated.
-List the projects before the restart, because `docker compose ls` finds them through the containers it is about to lose sight of:
+doctor never sets the store key for you, and it writes the `hosts.toml` files only when `daemon.json` selects the containerd store, so the doctor run from before the switch left none.
+
+List the projects first, because `docker compose ls` finds them through the containers the restart is about to hide:
 
 ```bash
 docker compose ls --all --format json > /root/compose-projects.json
+```
+
+Add the store key to `/etc/docker/daemon.json`, keeping every other key:
+
+```json
+"features": {"containerd-snapshotter": true}
+```
+
+Run doctor again, so it reads the new store and installs a `hosts.toml` for each registry, then restart the daemon and pull and recreate each project in its directory:
+
+```bash
+sudo bodega doctor --configure oci --apply --url https://bodega.example
 sudo systemctl restart docker
-# then, in each project's directory:
 docker compose pull && docker compose up -d --force-recreate
 ```
 
-doctor never sets the key for you.
 To switch back, set `"containerd-snapshotter": false` and restart again: the overlay2 images and containers reappear, the ones created under the containerd store are hidden in turn, and registries other than Docker Hub bypass bodega again.
 
 ### Files
@@ -887,8 +899,9 @@ bodega audit events --type serve_fetch --pkg-type oci --client 192.0.2.10
 
 - **`ctr` without `--hosts-dir`.** `ctr` does not read `config_path`.
   You see the pull reach the registry directly, with no row. nerdctl reads the same `certs.d` on its own.
-- **A `config_path` already set elsewhere.** doctor keeps it and the hosts files go where it points.
-  You see the `oci-containerd` row name the directory containerd reads.
+- **A `config_path` already set elsewhere.** doctor keeps the operator's `config_path` but still writes its hosts files under `/etc/containerd/certs.d`, which containerd then never reads.
+  You see CRI pulls reach each registry directly with no audit row, or fail on a locked host, while the `ctr --hosts-dir /etc/containerd/certs.d` check above passes.
+  Copy each `/etc/containerd/certs.d/{registry}/hosts.toml` into the configured directory, or point `config_path` at `/etc/containerd/certs.d`, then restart containerd.
 - **bodega down.** containerd falls back to each registry's own server.
   You see pulls succeed around bodega on an open host, and bodega's error on a locked one.
 
