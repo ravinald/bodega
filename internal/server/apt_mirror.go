@@ -880,8 +880,9 @@ type aptPoolIndex struct {
 	// is. The triple's spelling cannot say: a qualified suite stable/noble
 	// writes triples that begin with the bare suite stable's prefix.
 	owners map[string]string
-	// acquired is, per triple in indexed, when bodega read from upstream the
-	// Packages this index or one it carried from parsed for it. at is when
+	// acquired is, per triple in indexed, when upstream last confirmed the
+	// Packages this index or one it carried from parsed for it: the read of
+	// it, or a later upstream Release publishing its digest. at is when
 	// the build ran, which says nothing about how old its documents were.
 	acquired map[string]time.Time
 	// documents is, per triple in indexed, the paragraphs of that one
@@ -895,7 +896,7 @@ type aptPoolIndex struct {
 }
 
 // aptPoolDocument is the paragraphs of one Packages, for one triple, and when
-// bodega read it from upstream. broken marks a document whose parse stopped
+// upstream last confirmed it, as acquired records. broken marks a document whose parse stopped
 // partway, which holds only the paragraphs before the break.
 type aptPoolDocument struct {
 	triple  string
@@ -1219,7 +1220,7 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, prev *aptPoo
 				}
 				continue
 			}
-			doc := aptPoolDocument{triple: triple, stanzas: map[string]aptPoolStanza{}, at: read.at}
+			doc := aptPoolDocument{triple: triple, stanzas: map[string]aptPoolStanza{}, at: read.confirmed}
 			parseErr := aptPoolStanzas(read.body, archive, codename, func(key string, st aptPoolStanza) {
 				if _, seen := doc.stanzas[key]; !seen {
 					doc.stanzas[key] = st
@@ -1414,8 +1415,8 @@ func (sv *aptServedIndexes) forget(codename string, idx *aptPoolIndex) {
 // choose is, per triple of codename, the one Packages document the pool index
 // takes its paragraphs from, out of three copies: current, what this build
 // read (a cache hit included), prev's, and the newest file served to a
-// client. The copy bodega read from upstream last wins whole, with its own
-// paragraphs and its own read time, because a cached copy is not a newer
+// client. The copy upstream confirmed last wins whole, with its own
+// paragraphs and its own time, because a cached copy is not a newer
 // observation however recently it was delivered: a pool read replaying an
 // older cache entry cannot displace what prev or a client's read found, and
 // one triple's fresh read lends no standing to another's replay.

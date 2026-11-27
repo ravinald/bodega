@@ -309,8 +309,11 @@ type aptIndexRead struct {
 	// notPublished is set when the fetch 404d, which is the archive saying it
 	// does not carry that architecture rather than that its index is wrong.
 	notPublished bool
-	// at is when bodega read body from upstream, which a cached copy keeps.
-	at time.Time
+	// confirmed is the latest upstream read vouching for body: the read that
+	// fetched it, or a later Release read from upstream publishing its digest.
+	// A cached copy keeps it, so replaying the cache is never a newer
+	// observation.
+	confirmed time.Time
 }
 
 // aptFilteredPackages filters one profile's view of every component and
@@ -408,7 +411,7 @@ func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstr
 	if read, ok := cache[key]; ok {
 		return read, nil
 	}
-	body, at, err := s.aptUpstreamPackages(ctx, base, comp.index[arch], arch, release)
+	body, confirmed, err := s.aptUpstreamPackages(ctx, base, comp.index[arch], arch, release)
 	var read aptIndexRead
 	switch {
 	case errors.Is(err, errUpstreamNotFound):
@@ -418,7 +421,7 @@ func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstr
 	case err != nil:
 		return aptIndexRead{}, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", base, component, arch, err)
 	default:
-		read = aptIndexRead{body: body, at: at}
+		read = aptIndexRead{body: body, confirmed: confirmed}
 	}
 	cache[key] = read
 	return read, nil
@@ -626,20 +629,39 @@ func (s *Server) aptUpstreamRelease(ctx context.Context, base string) (map[strin
 // catches the failure a mirror produces on its own: a Packages body from one
 // sync beside a Release from the next, which would have bodega sign an index
 // whose stanzas name .deb digests the pool no longer has.
+//
+// A cached body is used only when its digest is the one release publishes. The
+// cache keys a document by path, so it can hold a Packages from another sync
+// than the Release in hand; that one is read from upstream again rather than
+// failed. A body fetched from upstream that still disagrees evicts the cached
+// Release, so the next read takes the digest list upstream serves now instead
+// of failing against a stale one until metadata_ttl runs out.
+//
+// The time returned is when upstream last confirmed the body, not when it was
+// read: a Release read after a client was served another Packages for the
+// same path, publishing this body's digest, is the newer evidence, and the
+// pool index has to weigh it as such.
 func (s *Server) aptUpstreamPackages(ctx context.Context, base, rest, arch string, release map[string]string) ([]byte, time.Time, error) {
 	want := aptReleaseDigests(release)[rest]
-	body, at, err := s.aptUpstreamFetchAt(ctx, base, rest)
-	if err != nil {
-		return nil, time.Time{}, err
+	key := base + "/" + rest
+	doc, ok := s.aptUpstreamCachedDoc(key)
+	if ok {
+		s.observeAptMirrorDists(ctx, base, rest, doc.body)
 	}
-	if want != "" {
-		if got := sha256.Sum256(body); hex.EncodeToString(got[:]) != want {
-			return nil, time.Time{}, fmt.Errorf("the %s served for %s/%s does not match the SHA256 its own Release publishes: the archive's index and its digest list are from different syncs, and signing it would vouch for stanzas naming artifacts the pool no longer has",
-				rest, base, arch)
+	if !ok || (want != "" && doc.sha256 != want) {
+		var err error
+		if doc, err = s.aptUpstreamFetchRemote(ctx, base, rest); err != nil {
+			return nil, time.Time{}, err
 		}
 	}
+	body, confirmed := doc.body, doc.confirmed
+	if want != "" && doc.sha256 != want {
+		s.aptUpstreamIdx.Delete(base + "/Release")
+		return nil, time.Time{}, fmt.Errorf("the %s served for %s/%s does not match the SHA256 its own Release publishes: the archive's index and its digest list are from different syncs, and signing it would vouch for stanzas naming artifacts the pool no longer has",
+			rest, base, arch)
+	}
 	out, err := aptDecompressIndex(base, rest, body)
-	return out, at, err
+	return out, confirmed, err
 }
 
 // aptDecompressIndex decompresses one Packages file of base by the
@@ -698,41 +720,92 @@ func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byt
 // aptUpstreamFetchAt is aptUpstreamFetch with when the body was read from
 // upstream, which for a cached body is the read that cached it.
 func (s *Server) aptUpstreamFetchAt(ctx context.Context, base, rest string) ([]byte, time.Time, error) {
-	key := base + "/" + rest
-	if doc, ok := s.aptUpstreamCachedDoc(key); ok {
+	if doc, ok := s.aptUpstreamCachedDoc(base + "/" + rest); ok {
 		s.observeAptMirrorDists(ctx, base, rest, doc.body)
 		return doc.body, doc.at, nil
 	}
+	doc, err := s.aptUpstreamFetchRemote(ctx, base, rest)
+	return doc.body, doc.at, err
+}
+
+// aptUpstreamFetchRemote reads one document from the archive, past the cache,
+// and caches it.
+func (s *Server) aptUpstreamFetchRemote(ctx context.Context, base, rest string) (aptUpstreamDoc, error) {
 	ups := s.cfg.AptUpstreams[base]
 	if len(ups) == 0 {
-		return nil, time.Time{}, fmt.Errorf("no archive is configured for %q", base)
+		return aptUpstreamDoc{}, fmt.Errorf("no archive is configured for %q", base)
 	}
 	url := ups[0].URL + "/dists/" + config.AptCodenameOf(base) + "/" + rest
 	if s.policy != nil {
 		_, violation, err := s.upstreamPolicyVerdict(ctx, manifest.TypeApt, url)
 		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("policy check for %s: %w", url, err)
+			return aptUpstreamDoc{}, fmt.Errorf("policy check for %s: %w", url, err)
 		}
 		if violation {
-			return nil, time.Time{}, fmt.Errorf("%s is off the apt allow-list, so no filtered index can be generated from it: bodega policy add apt <host>", url)
+			return aptUpstreamDoc{}, fmt.Errorf("%s is off the apt allow-list, so no filtered index can be generated from it: bodega policy add apt <host>", url)
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, aptProfileFetchTimeout)
+	fetchCtx, cancel := context.WithTimeout(ctx, aptProfileFetchTimeout)
 	defer cancel()
-	body, _, err := fetchUpstream(ctx, url)
+	body, _, err := fetchUpstream(fetchCtx, url)
 	if err != nil {
-		return nil, time.Time{}, err
+		return aptUpstreamDoc{}, err
 	}
-	at := time.Now()
-	s.aptUpstreamIdx.Store(key, aptUpstreamDoc{body: body, at: at})
-	s.observeAptMirrorDists(ctx, base, rest, body)
-	return body, at, nil
+	sum := sha256.Sum256(body)
+	doc := aptUpstreamDoc{body: body, at: time.Now(), sha256: hex.EncodeToString(sum[:])}
+	doc.confirmed = doc.at
+	s.aptUpstreamIdx.Store(base+"/"+rest, &doc)
+	if rest == "Release" {
+		s.confirmAptUpstreamIndexes(base, body, doc.at)
+	}
+	s.observeAptMirrorDists(fetchCtx, base, rest, body)
+	return doc, nil
 }
 
-// aptUpstreamDoc is one cached upstream index document and when it was read.
+// confirmAptUpstreamIndexes extends the cache life of every cached document of
+// base that a Release just read from upstream still publishes the digest of.
+//
+// Without it a Release and the Packages beside it expire on separate clocks.
+// A rebuild that refetches an expired Release and reuses a filtered index
+// without reading its Packages leaves the cached Release younger than the
+// cached Packages; once the archive republishes, the next pass that has to
+// read that Packages gets the new one from upstream and checks it against the
+// older Release still cached, and every reader of the base fails its digest
+// check until that Release expires.
+//
+// at, the time of the read, is left alone, since these bytes were not read
+// again. confirmed is what the pool index orders documents by, so a document
+// confirmed here outranks a Packages served to a client before this Release
+// was read.
+func (s *Server) confirmAptUpstreamIndexes(base string, release []byte, at time.Time) {
+	parsed, err := deb822.ParseSingle(release)
+	if err != nil {
+		return
+	}
+	for rest, sum := range aptReleaseDigests(parsed) {
+		key := base + "/" + rest
+		v, ok := s.aptUpstreamIdx.Load(key)
+		if !ok {
+			continue
+		}
+		held, ok := v.(*aptUpstreamDoc)
+		if !ok || held.sha256 != sum || !held.confirmed.Before(at) {
+			continue
+		}
+		renewed := *held
+		renewed.confirmed = at
+		s.aptUpstreamIdx.CompareAndSwap(key, held, &renewed)
+	}
+}
+
+// aptUpstreamDoc is one cached upstream index document, its SHA256, when it was
+// read, and when upstream last confirmed it: the read itself, or a later
+// Release read publishing its digest. metadata_ttl runs from confirmed.
 type aptUpstreamDoc struct {
-	body []byte
-	at   time.Time
+	body      []byte
+	sha256    string
+	at        time.Time
+	confirmed time.Time
 }
 
 // aptUpstreamCached answers from the last read while it is inside
@@ -759,11 +832,11 @@ func (s *Server) aptUpstreamCachedDoc(key string) (aptUpstreamDoc, bool) {
 	if !ok {
 		return aptUpstreamDoc{}, false
 	}
-	doc, ok := v.(aptUpstreamDoc)
-	if !ok || time.Since(doc.at) >= ttl {
+	doc, ok := v.(*aptUpstreamDoc)
+	if !ok || time.Since(doc.confirmed) >= ttl {
 		return aptUpstreamDoc{}, false
 	}
-	return doc, true
+	return *doc, true
 }
 
 // aptPackagesPath is the Release-relative path of one component and

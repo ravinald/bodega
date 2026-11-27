@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +29,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // The fixture archive's htop is the vulnerable build being withdrawn: a binary
@@ -107,6 +110,102 @@ func TestMirroredHideDropsTheStanzaAndReSignsTheCodename(t *testing.T) {
 	}
 	if stanza.Mirrored || !strings.Contains(stanza.Deb822, "Signed-By: "+aptsources.ClientKeyringPath) {
 		t.Errorf("the stanza for a rewritten codename does not name bodega's keyring:\n%s", stanza.Deb822)
+	}
+}
+
+// restartMirrorServer is a new server process on s's audit database and
+// upstreams, with nothing else carried over: no snapshot, no cached upstream
+// document, no cached dists/ object.
+func restartMirrorServer(t *testing.T, s *Server) *Server {
+	t.Helper()
+	cfg := *s.cfg
+	next := newServer(&cfg, manifest.NewLocalStore(t.TempDir()), storage.NewSingle(storage.NewMemory()),
+		"127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	next.cache = s.cache
+	t.Cleanup(func() { _ = next.auditDB.Close() })
+	if next.aptSign.Load() == nil {
+		t.Fatal("the restarted server loaded no apt signing key")
+	}
+	return next
+}
+
+// An Ubuntu release pocket's Release is dated once and never again. apt keeps
+// a stored Release over a fetched one dated earlier, so a host that read the
+// hidden rewrite would keep its filtered Packages if the codename went back to
+// the archive's Release when the hide was lifted.
+func TestMirroredUnhideKeepsAFrozenCodenameSignedUntilUpstreamRedates(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64") + hideStanza("nginx", "1.24-1", "amd64")},
+	})
+	rel := "dists/" + hideGroupBase + "/Release"
+	undated, _ := archive.object(rel)
+	frozen := time.Now().UTC().Add(-200 * 24 * time.Hour)
+	archive.setObject(rel, "Date: "+frozen.Format(time.RFC1123Z)+"\n"+undated)
+	ctx := t.Context()
+	packages := "/apt/dists/" + hideGroupBase + "/main/binary-amd64/Packages"
+	releaseDate := func(s *Server) time.Time {
+		t.Helper()
+		d, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+		if err != nil {
+			t.Fatalf("the served rewrite: %v", err)
+		}
+		return d
+	}
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(ctx)
+	if !s.aptMirrorRewritten(hideGroupBase) {
+		t.Fatal("the hide did not rewrite the codename")
+	}
+	if got := aptIndexVersions(t, s, packages, "htop"); len(got) != 0 {
+		t.Fatalf("the hidden rewrite lists htop %v", got)
+	}
+	hiddenDate := releaseDate(s)
+
+	held := func(stage string, s *Server) {
+		t.Helper()
+		if !s.aptMirrorRewritten(hideGroupBase) {
+			t.Fatalf("%s: the codename went back to proxy while its upstream Release (%s) is older than the rewrite hosts hold (%s)",
+				stage, frozen.Format(time.RFC1123Z), hiddenDate.Format(time.RFC1123Z))
+		}
+		if got := aptIndexVersions(t, s, packages, "htop"); !slices.Equal(got, []string{"1.0-1"}) {
+			t.Errorf("%s: the held rewrite lists htop %v, want the unhidden 1.0-1", stage, got)
+		}
+		if got := aptIndexVersions(t, s, packages, "nginx"); !slices.Equal(got, []string{"1.24-1"}) {
+			t.Errorf("%s: the held rewrite lists nginx %v, want 1.24-1", stage, got)
+		}
+		if d := releaseDate(s); d.Before(hiddenDate) {
+			t.Errorf("%s: the held rewrite is dated %s, earlier than the hidden rewrite's %s, so apt would keep the hidden one",
+				stage, d.Format(time.RFC1123Z), hiddenDate.Format(time.RFC1123Z))
+		}
+	}
+
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatalf("remove the hide: %v", err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	held("after the unhide", s)
+
+	restarted := restartMirrorServer(t, s)
+	restarted.rebuildAptSnapshot(ctx)
+	held("after a restart", restarted)
+
+	redated := "Date: " + time.Now().UTC().Format(time.RFC1123Z) + "\n" + undated
+	archive.setObject(rel, redated)
+	restarted.aptUpstreamIdx.Clear()
+	restarted.rebuildAptSnapshot(ctx)
+	if restarted.aptMirrorRewritten(hideGroupBase) {
+		t.Fatal("the codename stayed rewritten after its upstream Release was re-dated past the last rewrite")
+	}
+	if code, body := mirrorGet(t, restarted, "/apt/"+rel); code != http.StatusOK || string(body) != redated {
+		t.Errorf("after upstream re-dated, Release = %d, want the archive's own bytes:\n%s", code, body)
+	}
+	dates, err := restarted.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatalf("read the rewrite dates: %v", err)
+	}
+	if d, ok := dates[hideGroupBase]; ok {
+		t.Errorf("the proxied codename still has a rewrite date on record: %s", d)
 	}
 }
 
@@ -719,6 +818,30 @@ func TestUsageDocumentsMirrorRewriteCost(t *testing.T) {
 	}
 }
 
+func TestUsageDocumentsWhenAnUnhiddenCodenameReturnsToProxy(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read usage.md: %v", err)
+	}
+	_, after, ok := strings.Cut(string(raw), "\n### `bodega pkg hide")
+	if !ok {
+		t.Fatal("usage.md has no `bodega pkg hide` section")
+	}
+	section, _, _ := strings.Cut(after, "\n### ")
+	for _, want := range []string{
+		"A codename with no hidden stanza in it stays proxied byte-for-byte, unless bodega has already served a rewrite of it.",
+		"returns it to the archive's own `InRelease` at the first rebuild where every codename in the group has an upstream `Release` dated later than the last rewrite bodega served for it",
+		"apt treats a `Release` dated earlier than the one it holds as unchanged",
+		"a host that read the rewrite would keep the filtered `Packages`",
+		"once that rewrite's `Valid-Until` passed it would fail `apt update` on the codename",
+		"A frozen pocket such as an Ubuntu release pocket (`resolute`) is dated once, at release, so its group stays bodega-signed after its first hide.",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("the `bodega pkg hide` section of usage.md does not say %q", want)
+		}
+	}
+}
+
 func TestReviewE30DelayedReadKeepsSnapshotEvidence(t *testing.T) {
 	s, archive := hideGroupServer(t, map[string]map[string]string{
 		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
@@ -869,5 +992,407 @@ func TestMirroredHideReachesEveryArchiveListingTheVersion(t *testing.T) {
 	code, filtered := mirrorGet(t, s, "/apt/ubuntu/dists/resolute-web/main/binary-amd64/Packages")
 	if code != http.StatusOK || strings.Contains(string(filtered), "Package: htop") || !strings.Contains(string(filtered), "Package: nginx") {
 		t.Errorf("GET the filtered resolute-web Packages at /apt/ubuntu/ = %d, want 200 carrying nginx without the hidden htop:\n%s", code, filtered)
+	}
+}
+
+func TestReviewB201RewriteMustBeDurableBeforeItIsServed(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	rel := "dists/" + hideGroupBase + "/Release"
+	original, _ := archive.object(rel)
+	archive.setObject(rel, "Date: "+time.Now().UTC().Add(-200*24*time.Hour).Format(time.RFC1123Z)+"\n"+original)
+	s.rebuildAptSnapshot(t.Context())
+	db, err := sql.Open("sqlite", s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER review_b201_fail_date BEFORE INSERT ON apt_mirror_rewrite_dates
+        BEGIN SELECT RAISE(FAIL, 'temporary rewrite date write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(t.Context())
+	published := s.aptMirrorRewritten(hideGroupBase)
+	if published {
+		date, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := s.auditDB.AptMirrorRewriteDates(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored[hideGroupBase].Equal(date) {
+			t.Errorf("served rewrite Date %s without its durable record (stored %s)", date, stored[hideGroupBase])
+		}
+	}
+	if _, err := db.Exec("DROP TRIGGER review_b201_fail_date"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.auditDB.DeleteAptMirrorHide(t.Context(), "htop", "1.0-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(t.Context())
+	if published && !s.aptMirrorRewritten(hideGroupBase) {
+		t.Error("the first rebuild after write recovery and unhide returned the frozen codename to proxy although a client can hold its filtered rewrite")
+	}
+	restarted := restartMirrorServer(t, s)
+	restarted.rebuildAptSnapshot(t.Context())
+	if published && !restarted.aptMirrorRewritten(hideGroupBase) {
+		t.Error("restart forgot the served rewrite and proxied the older upstream Release")
+	}
+}
+
+// A rewrite is served only once its Date is on record. A rebuild whose write
+// fails keeps serving the group's previous rewrite, whose Date is on record,
+// and the record never moves back to an earlier Date.
+func TestMirroredRewriteWhoseDateWriteFailsKeepsThePreviousRewrite(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	rel := "dists/" + hideGroupBase + "/Release"
+	original, _ := archive.object(rel)
+	archive.setObject(rel, "Date: "+time.Now().UTC().Add(-200*24*time.Hour).Format(time.RFC1123Z)+"\n"+original)
+	ctx := t.Context()
+	packages := "/apt/dists/" + hideGroupBase + "/main/binary-amd64/Packages"
+	servedMatchesRecord := func(stage string) time.Time {
+		t.Helper()
+		if !s.aptMirrorRewritten(hideGroupBase) {
+			t.Fatalf("%s: the codename is proxied", stage)
+		}
+		date, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := s.auditDB.AptMirrorRewriteDates(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored[hideGroupBase].Equal(date) {
+			t.Fatalf("%s: served rewrite Date %s, recorded %s", stage, date, stored[hideGroupBase])
+		}
+		return date
+	}
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(ctx)
+	hiddenDate := servedMatchesRecord("after the hide")
+
+	db, err := sql.Open("sqlite", s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER fail_rewrite_date BEFORE INSERT ON apt_mirror_rewrite_dates
+        BEGIN SELECT RAISE(FAIL, 'rewrite date write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	if d := servedMatchesRecord("unhide with the write failing"); !d.Equal(hiddenDate) {
+		t.Errorf("unhide with the write failing served a new rewrite dated %s", d)
+	}
+	if got := aptIndexVersions(t, s, packages, "htop"); len(got) != 0 {
+		t.Errorf("the carried rewrite lists htop %v, want the previous rewrite's bytes", got)
+	}
+
+	if _, err := db.Exec("DROP TRIGGER fail_rewrite_date"); err != nil {
+		t.Fatal(err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	servedMatchesRecord("after the write recovered")
+	if got := aptIndexVersions(t, s, packages, "htop"); !slices.Equal(got, []string{"1.0-1"}) {
+		t.Errorf("after the write recovered the rewrite lists htop %v, want 1.0-1", got)
+	}
+
+	recorded, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.RecordAptMirrorRewriteDate(ctx, hideGroupBase, hiddenDate.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after[hideGroupBase].Equal(recorded[hideGroupBase]) {
+		t.Errorf("an earlier write moved the record from %s to %s", recorded[hideGroupBase], after[hideGroupBase])
+	}
+}
+
+func TestReviewB201OverlappingRebuildMustNotForgetServedRewrite(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase: {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+	})
+	ctx := t.Context()
+	rel := "dists/" + hideGroupBase + "/Release"
+	original, _ := archive.object(rel)
+	upstreamDate := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	archive.setObject(rel, "Date: "+upstreamDate.Format(time.RFC1123Z)+"\n"+original)
+	s.cache.MetadataTTL = 0
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	hidden := s.aptMirrorHidesFrom(ctx)
+	seedDate := upstreamDate.Add(-24 * time.Hour)
+	indexes, reusable := s.aptMirrorRewrites(ctx, hidden, seedDate, seedDate.Add(aptValidity))
+	if indexes[hideGroupBase] == nil {
+		t.Fatal("seed rewrite missing")
+	}
+	s.aptSnap.Store(&aptSnapshot{suites: indexes, hidden: hidden, mirrorRewritten: map[string]bool{hideGroupBase: true}, mirrorIndexes: reusable})
+
+	firstStarted, secondStarted := make(chan struct{}), make(chan struct{})
+	releaseFirst, releaseSecond := make(chan struct{}), make(chan struct{})
+	var firstOnce, secondOnce sync.Once
+	first := func() { firstOnce.Do(func() { close(releaseFirst) }) }
+	second := func() { secondOnce.Do(func() { close(releaseSecond) }) }
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/ubuntu/"+rel {
+			switch requests.Add(1) {
+			case 1:
+				close(firstStarted)
+				<-releaseFirst
+			case 2:
+				close(secondStarted)
+				<-releaseSecond
+			}
+		}
+		archive.ts.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+	s.cfg.AptUpstreams[hideGroupBase] = []config.AptUpstream{{URL: upstream.URL + "/ubuntu"}}
+	firstDone, secondDone := make(chan struct{}), make(chan struct{})
+	secondLaunched := false
+	defer func() {
+		first()
+		second()
+		<-firstDone
+		if secondLaunched {
+			<-secondDone
+		}
+	}()
+	go func() { s.rebuildAptSnapshot(ctx); close(firstDone) }()
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hidden rebuild did not reach upstream")
+	}
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatal(err)
+	}
+	secondLaunched = true
+	go func() { s.rebuildAptSnapshot(ctx); close(secondDone) }()
+	// A serialized rebuild cannot reach upstream until the first completes.
+	select {
+	case <-secondStarted:
+	case <-time.After(5 * time.Second):
+	}
+	first()
+	<-firstDone
+	servedDate, err := aptReleaseDate(verifyBodegaInRelease(t, s, hideGroupBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !servedDate.After(upstreamDate) {
+		t.Fatalf("served %s must be newer than upstream %s", servedDate, upstreamDate)
+	}
+	second()
+	<-secondDone
+	dates, err := s.auditDB.AptMirrorRewriteDates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dates[hideGroupBase].Before(servedDate) {
+		t.Errorf("overlapping unhide erased served rewrite Date %s (record now %s)", servedDate, dates[hideGroupBase])
+	}
+	if !s.aptMirrorRewritten(hideGroupBase) {
+		t.Errorf("unhide proxied upstream Date %s although a client can hold filtered rewrite Date %s", upstreamDate, servedDate)
+	}
+	if s.aptMirrorRewritten(hideGroupBase) {
+		got := aptIndexVersions(t, s, "/apt/dists/"+hideGroupBase+"/main/binary-amd64/Packages", "htop")
+		if !slices.Equal(got, []string{"1.0-1"}) {
+			t.Errorf("unhide kept filtered Packages: %v", got)
+		}
+	}
+	restarted := restartMirrorServer(t, s)
+	if !restarted.aptMirrorRewritten(hideGroupBase) {
+		t.Error("restart forgot the concurrently served rewrite and proxied the older upstream Release")
+	}
+}
+
+// ageAptUpstreamCache moves every cached upstream document back by d, which is
+// what d of wall time does to it.
+func ageAptUpstreamCache(s *Server, d time.Duration) {
+	s.aptUpstreamIdx.Range(func(k, v any) bool {
+		doc := *v.(*aptUpstreamDoc)
+		doc.at = doc.at.Add(-d)
+		doc.confirmed = doc.confirmed.Add(-d)
+		s.aptUpstreamIdx.Store(k, &doc)
+		return true
+	})
+}
+
+// A held group is rewritten on every rebuild and reuses its filtered Packages
+// while the Release digests are unchanged. When the hourly rebuild refetched
+// an expired Release and reused the Packages without reading them, the cached
+// Release became an hour younger than the cached Packages. The pocket's next
+// republish then left a pass that had to read Packages (a new hide) fetching
+// them fresh and checking them against the cached, older Release: the digest
+// check failed, the hide never reached the index, and every profile codename
+// over the same pocket failed with it, until that Release expired.
+func TestReviewB201HeldRewriteKeepsReleaseAndPackagesFromOneUpstreamRead(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase:    {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+		hideGroupUpdates: {"amd64": hideStanza("curl", "8.5-1", "amd64")},
+	})
+	ctx := t.Context()
+	rel := "dists/" + hideGroupBase + "/Release"
+	undated, _ := archive.object(rel)
+	archive.setObject(rel, "Date: "+time.Now().UTC().Add(-200*24*time.Hour).Format(time.RFC1123Z)+"\n"+undated)
+
+	recordHide(t, s, "htop", "1.0-1", hideGroupBase)
+	s.rebuildAptSnapshot(ctx)
+	if _, err := s.auditDB.DeleteAptMirrorHide(ctx, "htop", "1.0-1"); err != nil {
+		t.Fatalf("remove the hide: %v", err)
+	}
+	s.rebuildAptSnapshot(ctx)
+	if !s.aptMirrorRewritten(hideGroupUpdates) {
+		t.Fatal("the unhidden group is not held")
+	}
+
+	ageAptUpstreamCache(s, 2*s.cache.MetadataTTL)
+	s.rebuildAptSnapshot(ctx)
+
+	for rest, body := range hideGroupDists(hideGroupUpdates, map[string]string{
+		"amd64": hideStanza("curl", "8.5-1", "amd64") + hideStanza("curl", "8.5-2", "amd64"),
+	}) {
+		archive.setObject(rest, body)
+	}
+	recordHide(t, s, "curl", "8.5-1", hideGroupUpdates)
+	s.rebuildAptSnapshot(ctx)
+
+	packages := "/apt/dists/" + hideGroupUpdates + "/main/binary-amd64/Packages"
+	if got := aptIndexVersions(t, s, packages, "curl"); slices.Contains(got, "8.5-1") {
+		t.Errorf("the hide's rebuild did not reach the index: %s lists curl %v, want 8.5-1 dropped", hideGroupUpdates, got)
+	}
+}
+
+// The two other ways a path-keyed cache pairs a Packages with a Release from
+// another sync: a cached Packages outliving the Release it matched, and a
+// Release cached before the archive finished publishing the Packages beside
+// it. Both have to recover at the next rebuild, not when metadata_ttl runs
+// out.
+func TestReviewB201UpstreamCachePairsPackagesWithTheReleaseInHand(t *testing.T) {
+	s, archive := hideGroupServer(t, map[string]map[string]string{
+		hideGroupBase:    {"amd64": hideStanza("htop", "1.0-1", "amd64")},
+		hideGroupUpdates: {"amd64": hideStanza("curl", "8.5-1", "amd64")},
+	})
+	ctx := t.Context()
+	packages := "/apt/dists/" + hideGroupUpdates + "/main/binary-amd64/Packages"
+	publish := func(withRelease bool, stanzas string) {
+		t.Helper()
+		for rest, body := range hideGroupDists(hideGroupUpdates, map[string]string{"amd64": stanzas}) {
+			if withRelease || !strings.HasSuffix(rest, "/Release") {
+				archive.setObject(rest, body)
+			}
+		}
+	}
+	age := func(rest string) {
+		t.Helper()
+		key := hideGroupUpdates + "/" + rest
+		v, ok := s.aptUpstreamIdx.Load(key)
+		if !ok {
+			t.Fatalf("%s is not cached", key)
+		}
+		doc := *v.(*aptUpstreamDoc)
+		doc.confirmed = doc.confirmed.Add(-2 * s.cache.MetadataTTL)
+		s.aptUpstreamIdx.Store(key, &doc)
+	}
+
+	recordHide(t, s, "curl", "8.5-1", hideGroupUpdates)
+	s.rebuildAptSnapshot(ctx)
+
+	publish(true, hideStanza("curl", "8.5-1", "amd64")+hideStanza("curl", "8.5-2", "amd64"))
+	age("Release")
+	s.rebuildAptSnapshot(ctx)
+	if got := aptIndexVersions(t, s, packages, "curl"); !slices.Equal(got, []string{"8.5-2"}) {
+		t.Errorf("after the archive republished, the rewrite lists curl %v, want 8.5-2: the cached Packages from the earlier sync stood in for the one the new Release names", got)
+	}
+
+	publish(false, hideStanza("curl", "8.5-1", "amd64")+hideStanza("curl", "8.5-2", "amd64")+hideStanza("curl", "8.5-3", "amd64"))
+	age("main/binary-amd64/Packages.gz")
+	recordHide(t, s, "curl", "8.5-2", hideGroupUpdates)
+	s.rebuildAptSnapshot(ctx)
+	publish(true, hideStanza("curl", "8.5-1", "amd64")+hideStanza("curl", "8.5-2", "amd64")+hideStanza("curl", "8.5-3", "amd64"))
+	s.rebuildAptSnapshot(ctx)
+	if got := aptIndexVersions(t, s, packages, "curl"); !slices.Equal(got, []string{"8.5-3"}) {
+		t.Errorf("once the archive finished publishing, the rewrite lists curl %v, want 8.5-3: the Release cached mid-sync kept failing the digest check", got)
+	}
+}
+
+func TestAuditB201CacheRevalidationKeepsNamedPoolAuthority(t *testing.T) {
+	a := newFixtureArchive(t, map[string]string{})
+	b := newFixtureArchive(t, map[string]string{})
+	if a.URL() > b.URL() {
+		a, b = b, a
+	}
+	decoy, home := a, b
+	const decoyBody = "\x21<arch>\nnginx from the other archive root"
+	now := time.Now().UTC().Truncate(time.Second)
+	original := hideGroupDists("named", map[string]string{"amd64": fixturePackages(fixtureDeb, fixtureDebBody)})
+	original["dists/named/Release"] = "Date: " + now.Add(-48*time.Hour).Format(time.RFC1123Z) + "\n" + original["dists/named/Release"]
+	for rest, body := range original {
+		home.setObject(rest, body)
+	}
+	home.setObject(fixtureDeb, fixtureDebBody)
+	for rest, body := range hideGroupDists("other", map[string]string{"amd64": fixturePackages(fallbackDeb, fallbackDebBody)}) {
+		decoy.setObject(rest, body)
+	}
+	decoy.setObject(fixtureDeb, decoyBody)
+	s := mirrorServer(t)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"named": {{URL: home.URL()}}, "other": {{URL: decoy.URL()}},
+	}
+	ctx := t.Context()
+	names := s.cfg.MirroredAptCodenames()
+	before := s.buildAptPoolIndex(ctx, names)
+	if len(before.failed) != 0 {
+		t.Fatal(before.failed)
+	}
+	if _, ok := before.byKey[manifest.AptKey(fixtureDeb)]; !ok {
+		t.Fatal("initial paragraph missing")
+	}
+
+	for rest, body := range hideGroupDists("named", map[string]string{"amd64": ""}) {
+		if strings.HasSuffix(rest, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123Z) + "\n" + body
+		}
+		home.setObject(rest, body)
+	}
+	for _, rest := range []string{"Release", "main/binary-amd64/Packages.gz"} {
+		if code, _ := mirrorGet(t, s, "/apt/dists/named/"+rest); code != http.StatusOK {
+			t.Fatalf("read temporary %s: %d", rest, code)
+		}
+	}
+	original["dists/named/Release"] = strings.Replace(original["dists/named/Release"], now.Add(-48*time.Hour).Format(time.RFC1123Z), now.Format(time.RFC1123Z), 1)
+	for rest, body := range original {
+		home.setObject(rest, body)
+	}
+	ageAptUpstreamCache(s, 2*s.cache.MetadataTTL)
+	after := s.buildAptPoolIndexFrom(ctx, names, before)
+	if len(after.failed) != 0 {
+		t.Fatal(after.failed)
+	}
+	s.aptPoolIdx.idx = after
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Errorf("GET restored named path = %d %q, want 200 and %q from its declaring root", code, body, fixtureDebBody)
+	}
+	if n := decoy.count(fixtureDeb); n != 0 {
+		t.Errorf("unnamed root served restored named path %d times; want 0", n)
 	}
 }
