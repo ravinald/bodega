@@ -2,6 +2,7 @@ package clientconf
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -11,8 +12,10 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -439,6 +442,12 @@ type DockerDaemonFile struct {
 	// for none. Nothing here reads that host state, so a CA is not certified
 	// for a dockerd holding one.
 	StartUnmodeled string
+	// Snapshotter is features.containerd-snapshotter, nil where the file
+	// does not set it. StorageDriver is storage-driver and DataRoot
+	// data-root, each "" where unset. DockerContainerdStore reads them.
+	Snapshotter   *bool
+	StorageDriver string
+	DataRoot      string
 }
 
 // ParseDockerDaemonFile loads a daemon.json as dockerd v28.5.2 does with no flag
@@ -497,7 +506,10 @@ func ParseDockerDaemonFile(data []byte) (*DockerDaemonFile, error) {
 	if err := conf.validate(); err != nil {
 		return nil, err
 	}
-	d := &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries}
+	d := &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries, StorageDriver: conf.GraphDriver, DataRoot: conf.Root}
+	if on, ok := conf.Features[dockerSnapshotterFeature]; ok {
+		d.Snapshotter = &on
+	}
 	if err := conf.startError(set); err != nil {
 		d.StartError = err.Error()
 	}
@@ -870,6 +882,11 @@ func (conf *dockerDaemonConfig) startUnmodeled(set map[string]any) string {
 		if dockerStartModeled[key] {
 			continue
 		}
+		// The image store dockerd picks with containerd-snapshotter is one
+		// it starts with either way, and DockerContainerdStore decides it.
+		if f, ok := set[key].(map[string]any); ok && key == "features" && len(f) == 1 && f[dockerSnapshotterFeature] != nil {
+			continue
+		}
 		switch v := set[key].(type) {
 		case nil:
 			continue
@@ -1045,4 +1062,358 @@ func DockerCertsDirError(dir, planned string) error {
 		}
 	}
 	return nil
+}
+
+const dockerSnapshotterFeature = "containerd-snapshotter"
+
+// dockerGraphdrivers is the set graphdriver.IsRegistered answers from in a
+// linux dockerd v29.5.3 built without exclude tags: the drivers
+// daemon/graphdriver/register registers.
+var dockerGraphdrivers = map[string]bool{"btrfs": true, "fuse-overlayfs": true, "overlay2": true, "vfs": true, "zfs": true}
+
+// DockerContainerdStore reports whether the dockerd reading the daemon.json
+// under root keeps its images in the containerd image store, where it reads
+// /etc/docker/certs.d/<registry>/hosts.toml for every registry, rather than
+// a graphdriver such as overlay2, where registry-mirrors covers Docker Hub
+// alone. It is determineImageStoreChoice in daemon/image_store_choice.go at
+// moby docker-v29.5.3 for linux: features.containerd-snapshotter where set,
+// else the containerd store unless data-root holds a prior graphdriver's
+// directory (graphdriver.HasPriorDriver) or storage-driver names a
+// graphdriver. DOCKER_DRIVER and TEST_INTEGRATION_USE_GRAPHDRIVER in
+// dockerd's own environment outrank the file there and are not read: they
+// live in the service manager's unit, not in anything this reads.
+//
+// The error is the one dockerd exits on: containerd-snapshotter false with
+// a storage-driver no graphdriver registers. A daemon.json dockerd refuses
+// to load is LoadDockerDaemonFile's error.
+func DockerContainerdStore(root string) (bool, error) {
+	doc, err := LoadDockerDaemonFile(filepath.Join(root, DockerDaemonPath))
+	if err != nil {
+		return false, err
+	}
+	if doc == nil {
+		doc = &DockerDaemonFile{}
+	}
+	dataRoot := doc.DataRoot
+	if dataRoot == "" {
+		dataRoot = dockerStartDefaults["data-root"].(string)
+	}
+	containerd, explicit := true, doc.Snapshotter != nil
+	if explicit {
+		containerd = *doc.Snapshotter
+	}
+	if containerd && !explicit && dockerHasPriorDriver(filepath.Join(root, dataRoot)) {
+		return false, nil
+	}
+	if driver := doc.StorageDriver; driver != "" {
+		registered := dockerGraphdrivers[driver]
+		switch {
+		case !explicit && registered, !containerd && registered:
+			return false, nil
+		case !containerd:
+			return false, fmt.Errorf("graphdriver is explicitly enabled but %q is not registered", driver)
+		}
+		return true, nil
+	}
+	return containerd, nil
+}
+
+// dockerHasPriorDriver is graphdriver.HasPriorDriver: a directory under
+// dataRoot named for a registered driver other than vfs, holding anything
+// or unreadable, says dockerd has run with that graphdriver.
+func dockerHasPriorDriver(dataRoot string) bool {
+	for driver := range dockerGraphdrivers {
+		if driver == "vfs" {
+			continue
+		}
+		p := filepath.Join(dataRoot, driver)
+		if _, err := plannedfs.Stat(p); err != nil {
+			continue
+		}
+		if entries, err := plannedfs.ReadDir(p); err != nil || len(entries) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// DockerHubHostsPath is the hosts.toml dockerd on the containerd image store
+// reads for Docker Hub, and DockerHubCertsDir the directory holding it.
+const (
+	DockerHubCertsDir  = DockerCertsDir + "/docker.io"
+	DockerHubHostsPath = DockerHubCertsDir + "/hosts.toml"
+)
+
+// DockerHostDir is the directory under certs that dockerd on the containerd
+// image store reads for registry: HostDirFromRoot in
+// core/remotes/docker/config/hosts.go at containerd v2.2.4, the version moby
+// docker-v29.5.3 pins, over hostPaths in config_unix.go. It tries registry
+// with its ":port" written "_port_", then registry as named, then _default,
+// and takes the first that exists, file or directory. "" with no error is
+// none of them.
+func DockerHostDir(certs, registry string) (string, error) {
+	var paths []string
+	if i := strings.LastIndex(registry, ":"); i > 0 {
+		paths = append(paths, filepath.Join(certs, registry[:i]+"_"+registry[i+1:]+"_"))
+	}
+	paths = append(paths, filepath.Join(certs, registry), filepath.Join(certs, "_default"))
+	for _, p := range paths {
+		if _, err := plannedfs.Stat(p); err == nil {
+			return p, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+// DockerRegistryNamespace is the registry a directory under certs.d is named
+// for, its "_port_" suffix read back as ":port"; _default stays as it is.
+func DockerRegistryNamespace(dir string) string {
+	if m := dockerPortDir.FindStringSubmatch(dir); m != nil {
+		return m[1] + ":" + m[2]
+	}
+	return dir
+}
+
+var dockerPortDir = regexp.MustCompile(`^(.+)_([0-9]+)_$`)
+
+// DockerRegistries is the registries whose configuration under certs a
+// judgment of dockerd on the containerd image store covers: docker.io, each
+// of extra, and each one a directory there is named for, _default included
+// for every registry without a directory of its own. Sorted, each once.
+func DockerRegistries(certs string, extra []string) []string {
+	out := append([]string{"docker.io"}, extra...)
+	entries, _ := plannedfs.ReadDir(certs)
+	for _, e := range entries {
+		out = append(out, DockerRegistryNamespace(e.Name()))
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// DockerRegistryHost is one host dockerd on the containerd image store tries
+// for a registry, in the order it tries them.
+type DockerRegistryHost struct {
+	ContainerdRegistryHost
+	// Mirror marks a registry-mirrors entry dockerd put ahead of docker.io's
+	// one host, sharing that host's TLS settings.
+	Mirror bool
+	// Insecure is the insecure-registries entry dockerd applies to this
+	// host, which then verifies no certificate, "" for none. Legacy-merged
+	// hosts share one transport, so the entry covering any of them is every
+	// one's; InsecureHost names the host it was listed for.
+	Insecure     string
+	InsecureHost string
+	// Implicit marks the registry's own server, which containerd fills in
+	// where nothing names one: a pull reaches it by naming the registry,
+	// not by any configuration sending it there.
+	Implicit bool
+}
+
+// URL is where dockerd sends this host's requests.
+func (h DockerRegistryHost) URL() string { return h.Scheme + "://" + h.Host + h.Path }
+
+// DockerRegistry is what dockerd on the containerd image store resolves for
+// one registry namespace.
+type DockerRegistry struct {
+	Registry string
+	// Dir is the directory DockerHostDir selected, "" for none.
+	Dir string
+	// Source names what the hosts came from: Dir's hosts.toml, or Dir's
+	// certificate files where it holds no hosts.toml or one containerd
+	// discards (Discarded says why), or nothing at all.
+	Source    string
+	Discarded error
+	// Hosts are the hosts dockerd tries, in order, after the legacy merge.
+	Hosts []DockerRegistryHost
+	// Legacy reports that registry-mirrors and insecure-registries reached
+	// this registry: they do only where it resolves to one host.
+	Legacy bool
+	// Unread is a directory or file under certs.d this process could not
+	// read, which leaves the rest unknown.
+	Unread error
+	// TLSErr is the error containerd returns building the hosts' TLS
+	// settings, which fails every pull of the registry: dockerd resolves no
+	// host for it, its mirrors included. Hosts still says which ones it
+	// would have tried.
+	TLSErr error
+	// loaded is the hosts as containerd built them, before the legacy merge.
+	loaded []ContainerdRegistryHost
+}
+
+// tlsError is TLSErr for a plan about to replace the ca of the host table
+// keyed planned, and the certificate file plannedCA: neither is read, since
+// neither holds what the plan writes until it is applied.
+func (r DockerRegistry) tlsError(planned, plannedCA string) error {
+	hosts := slices.Clone(r.loaded)
+	for i := range hosts {
+		hosts[i].CA = slices.DeleteFunc(slices.Clone(hosts[i].CA), func(f string) bool { return f == plannedCA })
+	}
+	return (&ContainerdHostsFile{Hosts: hosts}).TLSError(planned)
+}
+
+// ResolveDockerRegistry is RegistryHosts in daemon/hosts.go at moby
+// docker-v29.5.3 for registry, under root: containerd v2.2.4's
+// ConfigureHosts over DockerHostDir, then mergeLegacyConfig with daemon,
+// the daemon.json dockerd loaded (nil for none).
+//
+// ConfigureHosts reads the selected directory with loadHostDir: its
+// hosts.toml, or with none, or one parseHostsFile refuses, loadCertFiles,
+// which takes each *.crt as a CA and each *.cert with the .key of its name
+// as a client pair, the key in the .cert's own file where none sits beside
+// it; any other file, an orphan .key included, is not read. A host left
+// without a server gets the registry's own. Each host's CA files must read
+// and hold a PEM certificate and its pairs must load (updateTLSConfigFromHost),
+// or the registry resolves nothing.
+//
+// mergeLegacyConfig runs only where daemon sets registry-mirrors or
+// insecure-registries, and only for a registry resolving one host: two or
+// more is a mirror configuration dockerd leaves as containerd built it. For
+// docker.io the mirrors go ahead of that host as copies of it, sharing its
+// transport and so its TLS settings, and insecure-registries then marks each
+// host it covers. Every merged host holds the same client, so the first
+// host insecure-registries covers sets InsecureSkipVerify on the one TLS
+// configuration they all send through: a mirror at bodega stops verifying
+// when registry-1.docker.io or another mirror is listed, not only when
+// bodega is. The transport's TLS configuration is never nil there, so
+// mergeLegacyConfig's own certs.d read never runs.
+func ResolveDockerRegistry(root string, daemon *DockerDaemonFile, registry string) DockerRegistry {
+	r := DockerRegistry{Registry: registry}
+	certs := filepath.Join(root, DockerCertsDir)
+	dir, err := DockerHostDir(certs, registry)
+	if err != nil {
+		r.Unread = err
+		return r
+	}
+	r.Dir = dir
+	var hosts []ContainerdRegistryHost
+	if dir != "" {
+		if hosts, err = r.loadHostDir(); err != nil {
+			r.Unread = err
+			return r
+		}
+	}
+	if hosts == nil {
+		hosts = []ContainerdRegistryHost{{Server: true}}
+		r.Source = "no directory under " + certs + " for " + registry
+	}
+	implicit := hosts[len(hosts)-1].Host == ""
+	if last := &hosts[len(hosts)-1]; implicit {
+		last.Scheme, last.Host, last.Path = "https", registry, "/v2"
+		last.Pull, last.Resolve = true, true
+		switch host, port, _ := net.SplitHostPort(registry); {
+		case registry == "docker.io":
+			last.Host = "registry-1.docker.io"
+		case cmp.Or(host, registry) == "localhost" || net.ParseIP(cmp.Or(host, registry)).IsLoopback():
+			if port != "" && port != "443" {
+				last.Scheme = "http"
+			}
+			if port != "80" {
+				skip := true
+				last.SkipVerify = &skip
+			}
+		}
+	}
+	r.loaded = hosts
+	r.TLSErr = (&ContainerdHostsFile{Hosts: hosts}).TLSError("")
+	for _, h := range hosts {
+		r.Hosts = append(r.Hosts, DockerRegistryHost{ContainerdRegistryHost: h})
+	}
+	r.Hosts[len(r.Hosts)-1].Implicit = implicit
+	if daemon == nil || len(daemon.Mirrors)+len(daemon.InsecureRegistries) == 0 || len(r.Hosts) != 1 {
+		return r
+	}
+	r.Legacy = true
+	if registry == "docker.io" && len(daemon.Mirrors) > 0 {
+		var merged []DockerRegistryHost
+		for _, m := range daemon.Mirrors {
+			merged = append(merged, dockerMirrorHost(m, r.Hosts[0]))
+		}
+		r.Hosts = append(merged, r.Hosts[0])
+	}
+	insecure, via := "", ""
+	for _, h := range r.Hosts {
+		if entry := daemon.Insecure(&url.URL{Scheme: h.Scheme, Host: h.Host}); entry != "" {
+			insecure, via = entry, h.Host
+			break
+		}
+	}
+	for i := range r.Hosts {
+		r.Hosts[i].Insecure, r.Hosts[i].InsecureHost = insecure, via
+	}
+	return r
+}
+
+// loadHostDir is containerd's loadHostDir over r.Dir.
+func (r *DockerRegistry) loadHostDir() ([]ContainerdRegistryHost, error) {
+	path := filepath.Join(r.Dir, "hosts.toml")
+	data, err := plannedfs.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if len(data) > 0 {
+		f, err := ParseContainerdHostsFile(r.Dir, data)
+		if err == nil {
+			r.Source = path
+			return f.Hosts, nil
+		}
+		r.Discarded = fmt.Errorf("%s: %w", path, err)
+	}
+	r.Source = "the certificate files in " + r.Dir
+	return dockerLoadCertFiles(r.Dir)
+}
+
+// dockerLoadCertFiles is containerd's loadCertFiles: one host, with no
+// server, carrying dir's certificate files.
+func dockerLoadCertFiles(dir string) ([]ContainerdRegistryHost, error) {
+	entries, err := plannedfs.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	h := ContainerdRegistryHost{Server: true}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".crt") {
+			h.CA = append(h.CA, filepath.Join(dir, name))
+		}
+		if strings.HasSuffix(name, ".cert") {
+			pair := [2]string{filepath.Join(dir, name), ""}
+			key := filepath.Join(dir, strings.TrimSuffix(name, ".cert")+".key")
+			if _, err := plannedfs.Stat(key); err == nil {
+				pair[1] = key
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return nil, err
+			}
+			h.ClientPairs = append(h.ClientPairs, pair)
+		}
+	}
+	return []ContainerdRegistryHost{h}, nil
+}
+
+// dockerMirrorHost is one entry of mirrorsToRegistryHosts: a copy of hub,
+// docker.io's one host, sent to the mirror.
+func dockerMirrorHost(mirror string, hub DockerRegistryHost) DockerRegistryHost {
+	h := hub
+	h.Key, h.Server, h.Mirror, h.Implicit = mirror, false, true, false
+	h.Pull, h.Resolve = true, true
+	u, err := url.Parse(mirror)
+	if err != nil || u.Host == "" {
+		u, err = url.Parse("dummy://" + mirror)
+	}
+	if err != nil || u.Host == "" {
+		h.Host, h.Path = mirror, "/v2"
+		return h
+	}
+	h.Host, h.Path = u.Host, strings.TrimSuffix(u.Path, "/")
+	if !strings.HasSuffix(h.Path, "/v2") {
+		h.Path = path.Join(h.Path, "/v2")
+	}
+	if u.Scheme != "dummy" {
+		h.Scheme = u.Scheme
+	}
+	return h
 }

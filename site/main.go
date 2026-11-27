@@ -656,7 +656,7 @@ func renderCoverage(file, base string) string {
 	fmt.Fprintf(&b, "<p>Evaluated %s against build <a href=\"%s/commit/%s\"><code>%s</code></a>. The <a href=\"/data/coverage.json\">current feed</a> may be newer than this page. Feature coverage and real-client test results are reported separately: a type can have every feature and still lack the runs that show it working.</p>\n",
 		e(strings.Replace(strings.TrimSuffix(f.EvaluatedAt, ":00Z"), "T", " ", 1)+" UTC"), repoURL, e(f.Revision), e(f.Revision))
 
-	b.WriteString("<h2 id=\"by-type\">By package type</h2>\n<p class=\"legend\">Features: <span class=\"v-yes\">yes</span> <span class=\"v-partial\">part</span> <span class=\"v-no\">no</span> <span class=\"v-na\">– not applicable</span></p>\n<div class=\"table\"><table class=\"coverage\">\n<thead><tr><th data-sort=\"type\" aria-sort=\"ascending\">Type</th><th data-sort=\"rank\">Verdict</th><th data-sort=\"coverage\">Coverage</th>")
+	b.WriteString("<h2 id=\"by-type\">By package type</h2>\n<p class=\"legend\">The verdict reads the feature columns and the real-client test runs together; a row can show every feature and still be Partial while a test run fails. Features: <span class=\"v-yes\">yes</span> <span class=\"v-partial\">part</span> <span class=\"v-no\">no</span> <span class=\"v-na\">– not applicable</span></p>\n<div class=\"table\"><table class=\"coverage\">\n<thead><tr><th data-sort=\"type\" aria-sort=\"ascending\">Type</th><th data-sort=\"rank\">Verdict</th><th data-sort=\"coverage\">Coverage</th>")
 	for _, ft := range f.Packages[0].Features {
 		fmt.Fprintf(&b, "<th class=\"feature\" title=\"%s\"><span>%s</span></th>", e(ft.Description), e(ft.Label))
 	}
@@ -664,7 +664,13 @@ func renderCoverage(file, base string) string {
 	marks := map[string]string{"yes": "yes", "no": "no", "partial": "part", "n/a": "–"}
 	for _, p := range f.Packages {
 		fmt.Fprintf(&b, "<tr data-type=\"%s\" data-rank=\"%d\" data-coverage=\"%d\"><th scope=\"row\">", e(p.ID), verdictRank(p.Verdict), coveragePercent(p.Coverage))
-		fmt.Fprintf(&b, "%s<a href=\"#%s\">%s</a></th><td class=\"verdict %s\">%s</td><td class=\"num\">%s</td>", labelIcon(base, p.ID), e(p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage))
+		// A verdict below Usable is the one a reader questions, and the cells beside it
+		// cannot answer: they rate features, and the failing runs live in the reason.
+		why := ""
+		if p.Verdict == "Partial" || p.Verdict == "Not yet" {
+			why = "<small class=\"why\">" + e(capitalize(p.Reason)) + "</small>"
+		}
+		fmt.Fprintf(&b, "%s<a href=\"#%s\">%s</a></th><td class=\"verdict %s\">%s%s</td><td class=\"num\">%s</td>", labelIcon(base, p.ID), e(p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), why, e(p.Coverage))
 		for _, ft := range p.Features {
 			mark, ok := marks[ft.Value]
 			if !ok {

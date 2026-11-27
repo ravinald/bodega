@@ -502,3 +502,19 @@ func TestRESTAPIOffersRawDownload(t *testing.T) {
 		t.Fatal("REST API offers no link to /api/openapi.yaml; the advertised document link leads to the viewer")
 	}
 }
+
+func TestCoverageVerdictCarriesItsReasonBelowUsable(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "coverage.json")
+	write(feed, []byte(`{"revision":"abc","evaluatedAt":"2026-01-01T00:00:00Z","summary":"s","packages":[`+
+		`{"id":"apt","verdict":"Partial","reason":"4 of 691 primary checks are not passing","coverage":"100%","features":[{"label":"L","description":"D","value":"yes"}]},`+
+		`{"id":"npm","verdict":"Ready","reason":"green on 6 test platforms","coverage":"100%","features":[{"label":"L","description":"D","value":"yes"}]}]}`))
+	html := renderCoverage(feed, "/")
+	partial := `<td class="verdict v-partial">Partial<small class="why">4 of 691 primary checks are not passing</small></td>`
+	if !strings.Contains(html, partial) {
+		t.Errorf("a Partial row's verdict cell lacks its reason: want %q", partial)
+	}
+	if strings.Contains(html, "green on 6 test platforms</small>") {
+		t.Error("a Ready row's verdict cell carries its reason; only Partial and Not yet should")
+	}
+}

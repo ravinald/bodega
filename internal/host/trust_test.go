@@ -89,7 +89,7 @@ func TestTrustProbeWarnsNamingTheStore(t *testing.T) {
 	writeTrustFile(t, filepath.Join(root, home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
 	writeTrustFile(t, filepath.Join(home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n")
 	writeTrustFile(t, filepath.Join(root, "etc/apt/sources.list.d/other.sources"), "Types: deb\nURIs: https://mirror.example/ubuntu\nSuites: stable\nComponents: main\n")
-	writeTrustFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"registry-mirrors":["`+base+`"]}`)
+	writeTrustFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":false},"registry-mirrors":["`+base+`"]}`)
 	writeTrustFile(t, filepath.Join(root, "etc/docker/certs.d", hostport, "ca.crt"), string(caPEM))
 	// cargo and podman are configured for bodega with no CA either reads;
 	// their rows are not this probe's to judge.
@@ -1657,16 +1657,16 @@ func TestAudit23OCICertificateFilesLoadAsTheRuntimeLoadsThem(t *testing.T) {
 		names       string
 	}{
 		{name: "docker with a ca.crt alone", check: "oci-docker", files: map[string]string{
-			"etc/docker/daemon.json":         `{"registry-mirrors":["BASE"]}`,
+			"etc/docker/daemon.json":         `{"features":{"containerd-snapshotter":false},"registry-mirrors":["BASE"]}`,
 			"etc/docker/certs.d/HOST/ca.crt": "PEM",
 		}, want: TrustVerified},
 		{name: "docker with a client certificate and no key", check: "oci-docker", files: map[string]string{
-			"etc/docker/daemon.json":              `{"registry-mirrors":["BASE"]}`,
+			"etc/docker/daemon.json":              `{"features":{"containerd-snapshotter":false},"registry-mirrors":["BASE"]}`,
 			"etc/docker/certs.d/HOST/ca.crt":      "PEM",
 			"etc/docker/certs.d/HOST/client.cert": "PEM",
 		}, want: TrustUnchecked, names: "missing key client.key"},
 		{name: "docker with a key and no client certificate", check: "oci-docker", files: map[string]string{
-			"etc/docker/daemon.json":             `{"registry-mirrors":["BASE"]}`,
+			"etc/docker/daemon.json":             `{"features":{"containerd-snapshotter":false},"registry-mirrors":["BASE"]}`,
 			"etc/docker/certs.d/HOST/client.key": "x",
 		}, want: TrustUnchecked, names: "missing client certificate client.cert"},
 		{name: "containerd with a ca that loads", check: "oci-containerd", files: map[string]string{
@@ -2594,11 +2594,11 @@ func TestAudit37DockerStartupValidityIsUnchecked(t *testing.T) {
 				t.Fatal(err)
 			}
 			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", strings.TrimPrefix(base, "https://"), "ca.crt"), string(data))
-			writeTrustFile(t, file, `{"registry-mirrors":["`+base+`"]}`)
+			writeTrustFile(t, file, `{"features":{"containerd-snapshotter":false},"registry-mirrors":["`+base+`"]}`)
 			if v, err := p.Judge([]string{"oci-docker"}, base); err != nil || len(v) != 1 || v[0].State != TrustVerified {
 				t.Fatalf("control: %v %v", v, err)
 			}
-			writeTrustFile(t, file, `{"registry-mirrors":["`+base+`"],`+policy+`}`)
+			writeTrustFile(t, file, `{"features":{"containerd-snapshotter":false},"registry-mirrors":["`+base+`"],`+policy+`}`)
 			v, err := p.Judge([]string{"oci-docker"}, base)
 			if err != nil || len(v) != 1 {
 				t.Fatalf("Judge: %v %v", v, err)
@@ -2640,9 +2640,9 @@ func TestDockerHostDecidedStartIsUnchecked(t *testing.T) {
 				t.Fatal(err)
 			}
 			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", strings.TrimPrefix(base, "https://"), "ca.crt"), string(data))
-			inert := `"registry-mirrors":["` + base + `"],"debug":true,"log-driver":"journald","iptables":true,"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"docker.slice"`
+			inert := `"features":{"containerd-snapshotter":false},"registry-mirrors":["` + base + `"],"debug":true,"log-driver":"journald","iptables":true,"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"docker.slice"`
 			if key == "cgroup-parent" {
-				inert = `"registry-mirrors":["` + base + `"]`
+				inert = `"features":{"containerd-snapshotter":false},"registry-mirrors":["` + base + `"]`
 			}
 			writeTrustFile(t, file, `{`+inert+`}`)
 			if v, err := p.Judge([]string{"oci-docker"}, base); err != nil || len(v) != 1 || v[0].State != TrustVerified {
@@ -3111,5 +3111,368 @@ func TestAptArchiveRootReachesBodegaForTheCACheck(t *testing.T) {
 				t.Errorf("verdict = %+v, want apt counted as reaching bodega and verified", v)
 			}
 		})
+	}
+}
+
+// B200 R5: a daemon.json key doctor does not decide on keeps doctor from
+// judging Docker's trust, and the remediation names the key, says why, and
+// hands over the openssl check rather than telling the operator to remove it.
+func TestDockerUndecidedKeyRemediationKeepsTheKey(t *testing.T) {
+	for _, c := range []struct{ key, daemon string }{
+		{"fixed-cidr-v6", `{"features":{"containerd-snapshotter":false},"registry-mirrors":["BASE/"],"fixed-cidr-v6":"2001:db8::/64"}`},
+		{"ip6tables", `{"features":{"containerd-snapshotter":false},"registry-mirrors":["BASE/"],"ip6tables":false}`},
+		{"tlskey", `{"features":{"containerd-snapshotter":false},"registry-mirrors":["BASE/"],"tlskey":"/client.key"}`},
+	} {
+		t.Run(c.key, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), strings.ReplaceAll(c.daemon, "BASE", base))
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/bodega.internal:8443/ca.crt"), "PEM")
+			f := p.Apply([]Finding{{Check: "oci-docker", Status: StatusOK}}, base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, c.key) {
+				t.Fatalf("row = %+v; want WARN naming %s", f, c.key)
+			}
+			for _, want := range []string{"keep " + c.key, "doctor cannot verify dockerd's trust while " + c.key + " is set",
+				"openssl s_client -connect bodega.internal:8443 -servername bodega.internal -verify_hostname bodega.internal -verify_return_error -CAfile /etc/docker/certs.d/bodega.internal:8443/ca.crt"} {
+				if !strings.Contains(f.Remediation, want) {
+					t.Errorf("remediation lacks %q: %s", want, f.Remediation)
+				}
+			}
+			if strings.Contains(f.Remediation, "remove") {
+				t.Errorf("remediation tells the operator to remove something: %s", f.Remediation)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerHostsTrust(t *testing.T) {
+	for _, mirrored := range []bool{false, true} {
+		for _, mode := range []string{"trusted", "wrong-ca", "missing-ca", "skip-verify"} {
+			t.Run(mode, func(t *testing.T) {
+				p, ca, base := reviewTrust(t)
+				daemon := `{"features":{"containerd-snapshotter":true}}`
+				if mirrored {
+					daemon = `{"features":{"containerd-snapshotter":true},"registry-mirrors":["` + base + `/"]}`
+					pem, err := os.ReadFile(ca)
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/docker.io/ca.crt"), string(pem))
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), daemon)
+				switch mode {
+				case "wrong-ca":
+					other, _ := trustFixture(t)
+					ca = filepath.Join(p.Root, "wrong.pem")
+					writeTrustFile(t, ca, string(other))
+				case "missing-ca":
+					ca = filepath.Join(p.Root, "missing.pem")
+				}
+				body := clientconf.ContainerdHosts(base, "ghcr.io", "https://ghcr.io").Content + "  ca = \"" + ca + "\"\n"
+				if mode == "skip-verify" {
+					body += "  skip_verify = true\n"
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), body)
+				rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"ghcr.io"}}).Check(base)
+				f := p.Apply(rows, base)[0]
+				want := StatusWarn
+				if mode == "trusted" {
+					want = StatusOK
+				}
+				if f.Status != want {
+					t.Fatalf("want %s, got %+v", want, f)
+				}
+			})
+		}
+	}
+}
+
+func TestB200ReviewDockerHandCheckVerifiesEndpoint(t *testing.T) {
+	for _, tc := range []struct{ base, want string }{
+		{"https://bodega.internal:8443", "-verify_hostname bodega.internal"},
+		{"https://192.0.2.10", "-verify_ip 192.0.2.10"},
+		{"https://[2001:db8::10]", "-verify_ip 2001:db8::10"},
+	} {
+		t.Run(tc.base, func(t *testing.T) {
+			p, _, _ := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"registry-mirrors":["`+tc.base+`/"],"fixed-cidr-v6":"2001:db8::/64"}`)
+			f := p.Apply([]Finding{{Check: "oci-docker", Status: StatusOK}}, tc.base)[0]
+			if !strings.Contains(f.Remediation, tc.want) {
+				t.Fatalf("certificate check lacks %q; SNI alone does not check the peer name: %s", tc.want, f.Remediation)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerEffectiveHostsTrust(t *testing.T) {
+	for _, mode := range []string{"hosts-ca-only", "old-mirror-ca", "old-insecure-entry", "overlay2-control"} {
+		t.Run(mode, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			daemon := `{"features":{"containerd-snapshotter":true},"registry-mirrors":["` + base + `/"]}`
+			if mode == "overlay2-control" {
+				daemon = `{"features":{"containerd-snapshotter":false},"registry-mirrors":["` + base + `/"]}`
+			}
+			if mode == "old-insecure-entry" {
+				daemon = `{"features":{"containerd-snapshotter":true},"registry-mirrors":["` + base + `/"],"insecure-registries":["bodega.internal:8443"]}`
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), daemon)
+			for _, reg := range []string{"docker.io", "ghcr.io"} {
+				body := clientconf.ContainerdHosts(base, reg, "https://"+reg).Content + "  ca = " + `"` + ca + "\"\n"
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", reg, "hosts.toml"), body)
+			}
+			if mode == "old-mirror-ca" {
+				other, _ := trustFixture(t)
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/bodega.internal:8443/ca.crt"), string(other))
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"docker.io", "ghcr.io"}}).Check(base)
+			f := p.Apply(rows, base)[0]
+			want := StatusOK
+			if mode == "overlay2-control" {
+				want = StatusWarn
+			}
+			if f.Status != want {
+				t.Fatalf("want %s from the effective image-store TLS settings; got %+v", want, f)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerHandCheckUsesHostsCA(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"fixed-cidr-v6":"2001:db8::/64"}`)
+	body := clientconf.ContainerdHosts(base, "ghcr.io", "https://ghcr.io").Content + "  ca = " + `"` + ca + "\"\n"
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), body)
+	rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"ghcr.io"}}).Check(base)
+	f := p.Apply(rows, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "keep fixed-cidr-v6") || !strings.Contains(f.Remediation, ca) {
+		t.Fatalf("hand check must retain the key and use the CA dockerd reads for ghcr.io: %+v", f)
+	}
+}
+
+// B200 R2/R5: on the containerd image store a registry-mirrors entry that
+// dockerd applies shares docker.io's transport, so the CA verifying it is
+// the one certs.d/docker.io or a single-host docker.io hosts.toml carries,
+// never certs.d/<mirror host>; the hand check offered under an undecided key
+// names that same file.
+func TestDockerContainerdMirrorTrustFollowsDockerHubHosts(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		place       func(root, ca string) map[string]string
+		want        Status
+		handNamesCA bool
+	}{
+		{name: "mirror host's certs.d only", want: StatusWarn, place: func(root, pem string) map[string]string {
+			return map[string]string{"etc/docker/certs.d/bodega.internal:8443/ca.crt": pem}
+		}},
+		{name: "certs.d/docker.io", want: StatusOK, place: func(root, pem string) map[string]string {
+			return map[string]string{"etc/docker/certs.d/docker.io/ca.crt": pem}
+		}},
+		{name: "single-host hosts.toml with ca", want: StatusOK, handNamesCA: true, place: func(root, pem string) map[string]string {
+			return map[string]string{"etc/docker/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\nca = \"" + filepath.Join(root, "ca.pem") + "\"\n"}
+		}},
+		{name: "single-host hosts.toml skipping verification", want: StatusWarn, place: func(root, pem string) map[string]string {
+			return map[string]string{"etc/docker/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\nskip_verify = true\n"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			pem, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, body := range tc.place(p.Root, string(pem)) {
+				writeTrustFile(t, filepath.Join(p.Root, name), body)
+			}
+			daemon := filepath.Join(p.Root, "etc/docker/daemon.json")
+			writeTrustFile(t, daemon, `{"features":{"containerd-snapshotter":true},"registry-mirrors":["`+base+`/"]}`)
+			rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"docker.io"}}).Check(base)
+			if f := p.Apply(rows, base)[0]; f.Status != tc.want {
+				t.Fatalf("want %s; got %+v", tc.want, f)
+			}
+			if !tc.handNamesCA {
+				return
+			}
+			writeTrustFile(t, daemon, `{"features":{"containerd-snapshotter":true},"registry-mirrors":["`+base+`/"],"fixed-cidr-v6":"2001:db8::/64"}`)
+			rows = (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"docker.io"}}).Check(base)
+			if f := p.Apply(rows, base)[0]; !strings.Contains(f.Remediation, "-CAfile "+ca) || !strings.Contains(f.Remediation, "keep fixed-cidr-v6") {
+				t.Fatalf("hand check must name the ca dockerd verifies the mirror with: %+v", f)
+			}
+		})
+	}
+}
+
+// B200 R5: on overlay2 the hand check names the mirror host's certs.d, and
+// on the containerd store certs.d/docker.io where the mirror reads it.
+func TestDockerHandCheckFollowsImageStore(t *testing.T) {
+	for _, snapshotter := range []string{"true", "false"} {
+		t.Run(snapshotter, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"registry-mirrors":["`+base+`/"],"ip6tables":false}`)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/bodega.internal:8443/ca.crt"), "PEM")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/docker.io/ca.crt"), "PEM")
+			rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"docker.io"}}).Check(base)
+			f := p.Apply(rows, base)[0]
+			want, not := "-CAfile /etc/docker/certs.d/docker.io/ca.crt", "-CAfile /etc/docker/certs.d/bodega.internal:8443/ca.crt"
+			if snapshotter == "false" {
+				want, not = not, want
+			}
+			if !strings.Contains(f.Remediation, want) || strings.Contains(f.Remediation, not) {
+				t.Fatalf("hand check wants %q and not %q: %+v", want, not, f)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerEffectiveDirectory(t *testing.T) {
+	for _, mode := range []string{"default-over-mirror", "encoded-over-literal"} {
+		t.Run(mode, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"registry-mirrors":["`+base+`/"]}`)
+			reg, dir := "docker.io", "_default"
+			if mode == "encoded-over-literal" {
+				reg, dir = "registry.example:5000", "registry.example_5000_"
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", reg, "hosts.toml"), clientconf.ContainerdHosts(base, reg, "https://"+reg).Content)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, "hosts.toml"), clientconf.ContainerdHosts("https://elsewhere.example", reg, "https://"+reg).Content)
+			f := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{reg}}).Check(base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, reg) {
+				t.Fatalf("the selected %s configuration bypasses bodega; want WARN naming %s, got %+v", dir, reg, f)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerCertificateDirectoryUsesContainerdRules(t *testing.T) {
+	for _, snapshotter := range []string{"true", "false"} {
+		for _, mode := range []string{"bad-crt", "orphan-key"} {
+			t.Run(snapshotter+"/"+mode, func(t *testing.T) {
+				p, ca, base := reviewTrust(t)
+				pem, err := os.ReadFile(ca)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"registry-mirrors":["`+base+`/"]}`)
+				dir := "docker.io"
+				if snapshotter == "false" {
+					dir = "bodega.internal:8443"
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, "ca.crt"), string(pem))
+				filename, want := "broken.crt", TrustUnchecked
+				if mode == "orphan-key" {
+					filename, want = "unused.key", TrustVerified
+				}
+				if snapshotter == "false" {
+					want = TrustVerified
+					if mode == "orphan-key" {
+						want = TrustUnchecked
+					}
+				}
+				writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, filename), "not a certificate or key")
+				vs, err := p.Judge([]string{"oci-docker"}, base)
+				if err != nil || len(vs) != 1 || vs[0].State != want {
+					t.Fatalf("want %v from the selected runtime's cert-file loader; got %+v, %v", want, vs, err)
+				}
+			})
+		}
+	}
+}
+
+func TestB200ReviewDockerSingleHostLegacyInsecure(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"insecure-registries":["bodega.internal:8443"]}`)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), "server = \""+base+"\"\ncapabilities = [\"pull\", \"resolve\"]\nca = \""+ca+"\"\n")
+	vs, err := p.Judge([]string{"oci-docker"}, base)
+	if err != nil || len(vs) != 1 || vs[0].State != TrustUnchecked || !strings.Contains(vs[0].Detail, "insecure") {
+		t.Fatalf("Moby merges insecure-registries into a single resolved host for ghcr.io; got %+v, %v", vs, err)
+	}
+}
+
+func TestB200ReviewDockerHandCheckDoesNotDropBrokenHostsCA(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	missing := filepath.Join(p.Root, "missing-ca.pem")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"fixed-cidr-v6":"2001:db8::/64"}`)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), clientconf.ContainerdHosts(base, "ghcr.io", "https://ghcr.io").Content+"  ca = \""+missing+"\"\n")
+	rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"ghcr.io"}}).Check(base)
+	f := p.Apply(rows, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "keep fixed-cidr-v6") || !strings.Contains(f.Detail+f.Remediation, missing) {
+		t.Fatalf("cannot replace an unread active hosts CA with a system-only hand check: %+v", f)
+	}
+}
+
+func TestB200ReviewDockerLegacyTransportSharesInsecure(t *testing.T) {
+	for _, snapshotter := range []string{"true", "false"} {
+		t.Run(snapshotter, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			pem, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":`+snapshotter+`},"registry-mirrors":["`+base+`/"],"insecure-registries":["registry-1.docker.io"]}`)
+			dir := "docker.io"
+			want := TrustUnchecked
+			if snapshotter == "false" {
+				dir, want = "bodega.internal:8443", TrustVerified
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", dir, "ca.crt"), string(pem))
+			vs, err := p.Judge([]string{"oci-docker"}, base)
+			if err != nil || len(vs) != 1 || vs[0].State != want {
+				t.Fatalf("want %v: Moby's merged mirror shares the upstream transport's insecure flag on the containerd store; got %+v, %v", want, vs, err)
+			}
+		})
+	}
+}
+
+func TestB200ReviewDockerDistinctHostTLSIsNotDeduplicated(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "wrong-ca.pem")
+	writeTrustFile(t, wrong, string(other))
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true}}`)
+	body := "server = \"https://ghcr.io\"\n" +
+		"[host.\"" + base + "/v2\"]\ncapabilities = [\"resolve\"]\nca = \"" + ca + "\"\n" +
+		"[host.\"" + base + "\"]\ncapabilities = [\"pull\", \"resolve\"]\nca = \"" + wrong + "\"\n"
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), body)
+	rows := (OCIHost{Root: p.Root, LookPath: onlyRuntime("dockerd"), Registries: []string{"ghcr.io"}}).Check(base)
+	f := p.Apply(rows, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "certificate") {
+		t.Fatalf("the pull host has its own wrong CA even though the resolve host verifies the same peer; got %+v", f)
+	}
+}
+
+func TestB200ReviewDockerHandCheckPreservesCAPath(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	pem, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca = filepath.Join(p.Root, "Corporate Root CA.pem")
+	writeTrustFile(t, ca, string(pem))
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/daemon.json"), `{"features":{"containerd-snapshotter":true},"fixed-cidr-v6":"2001:db8::/64"}`)
+	body := clientconf.ContainerdHosts(base, "ghcr.io", "https://ghcr.io").Content + "  ca = \"" + ca + "\"\n"
+	writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d/ghcr.io/hosts.toml"), body)
+	f := p.Apply([]Finding{{Check: "oci-docker", Status: StatusOK}}, base)[0]
+	_, command, ok := strings.Cut(f.Remediation, "openssl s_client ")
+	if !ok {
+		t.Fatalf("missing hand check: %+v", f)
+	}
+	command, _, ok = strings.Cut(command, " </dev/null")
+	if !ok {
+		t.Fatalf("missing command end: %+v", f)
+	}
+	script := `openssl() { while [ "$#" -gt 0 ]; do if [ "$1" = "-CAfile" ]; then printf '%s\n' "$2"; return; fi; shift; done; }; openssl s_client ` + command + " </dev/null"
+	got, err := exec.Command("sh", "-c", script).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(got)) != ca {
+		t.Fatalf("hand check must pass the active CA path as one argument; got %q, %v; want %q; command: %s", got, err, ca, command)
+	}
+}
+
+// Every dynamic word of the hand check reaches openssl as itself: a CA path
+// carrying quotes, expansions and globs, and an IPv6 -connect address that
+// sh and zsh would otherwise read as a bracket glob.
+func TestDockerHandCheckWordsSurviveTheShell(t *testing.T) {
+	for _, s := range []string{"/etc/docker/certs.d/bodega.internal:8443/ca.crt", "[2001:db8::10]:443", "/ca/it's $(id) `id` *.pem", "/ca/tab\there\nnewline", ""} {
+		got, err := exec.Command("sh", "-c", `printf '%s' `+shellWord(s)).Output()
+		if err != nil || string(got) != s {
+			t.Errorf("shellWord(%q) = %s; sh read %q, %v", s, shellWord(s), got, err)
+		}
 	}
 }

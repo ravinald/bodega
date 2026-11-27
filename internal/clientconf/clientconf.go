@@ -287,10 +287,12 @@ func HelmDocument(repositories string) string {
 }
 
 // OCI renders the files a pane shows for pointing a container runtime at
-// bodega: Docker Engine's daemon.json, which mirrors Docker Hub and nothing
-// else, and containerd's hosts.toml for docker.io. `bodega doctor
-// --configure oci` installs the full set OCIClient renders, one hosts.toml
-// per registry the server's oci_upstreams names.
+// bodega: Docker Engine's daemon.json, which mirrors Docker Hub alone under
+// the overlay2 image store, and containerd's hosts.toml for docker.io, the
+// format Docker Engine on the containerd image store also reads, for every
+// registry, from /etc/docker/certs.d. `bodega doctor --configure oci`
+// installs the full set OCIClient renders, one hosts.toml per registry the
+// server's oci_upstreams names, under each runtime that reads one.
 func OCI(base string) []File {
 	daemon := DockerDaemon(base, nil)
 	daemon.Paths = map[string]string{OSLinux: DockerDaemonPath, OSDarwin: "~/.docker/daemon.json"}
