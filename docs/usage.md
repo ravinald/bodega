@@ -9069,6 +9069,8 @@ osquery speaks only HTTPS to a tls plugin, so bodega must answer TLS at `--tls_h
 
 A successful enroll hands out a fresh random `node_key` and maps the key's sha256 to the secret's identity in the [host mapping](#host-mapping), so reports carry that identity from the first one. bodega keeps only the sha256. Every failed check (an unknown, revoked or expired secret, another instance's secret, an unknown or revoked `node_key`, a malformed body) gets the same `200 {"node_invalid": true}`, which tells osquery to re-enroll. The response never says which check failed; the server's `WARN` line and a `denied` audit row do, with the check in `details`. A body over the cap is `413`, and an unknown `log_type` is `400`.
 
+Each `config` answer to a known node writes a `serve_fetch` row with `pkg_type` `osquery`, the instance as its name, the node's identity, and the route and `host_identifier` in `details`, so `bodega audit events --type serve_fetch --pkg-type osquery --client <ip>` shows a host reaching bodega once per `--config_refresh`. It names no stored object, so `bodega audit served` and the attestation reports leave it out. `enroll` and `log` write no row on success; the rest of `/api/` writes none either.
+
 `--expires` stops new enrollments after that time; node keys already handed out keep working. `bodega osquery secret revoke <id>` deletes the secret and every node key enrolled with it, so each of those hosts gets `node_invalid` on its next request. Reports already stored keep their identity, and the mapping rows stay. A host that re-enrolls gets a new key and a new external id.
 
 ##### Mode B: the result-log shipper

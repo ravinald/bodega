@@ -358,15 +358,26 @@ bodega audit events --type serve_fetch --pkg-type pypi --client 192.0.2.10
 
 ## npm
 
-npm reads the registry from the user's `.npmrc`, so run doctor as the user whose installs it is; as root it also writes the host-wide node-gyp file:
+npm reads the registry from the `.npmrc` in the home of the account running it, and doctor writes the file into the home of the account running doctor.
+Run it as the user whose installs go through bodega, without `sudo`:
+
+```bash
+bodega doctor --configure npm --apply --url https://bodega.example
+```
+
+That writes the user's `~/.npmrc` and, for node-gyp, the user's `~/.config/environment.d/60-bodega-node.conf`.
+To send node-gyp through bodega for every account on the host, run doctor a second time as root:
 
 ```bash
 sudo bodega doctor --configure npm --apply --url https://bodega.example
 ```
 
+The root run writes `/etc/profile.d/bodega-node.sh`, and `/root/.npmrc` for root's own npm.
+It leaves every other user's `.npmrc` as it is, so it never replaces the first step.
+
 ### Files
 
-`~/.npmrc`:
+`~/.npmrc`, in the home of the account that ran doctor:
 
 <!-- clientconf: npm .npmrc -->
 
@@ -384,7 +395,8 @@ The trailing slash is what matches the `//bodega.example/npm/:_authToken=` line 
 export NODEJS_ORG_MIRROR='https://bodega.example/binaries/nodejs/dist'
 ```
 
-Run as a user instead, doctor writes `~/.config/environment.d/60-bodega-node.conf` holding the same line without `export`.
+That is the root run's file.
+The user run writes `~/.config/environment.d/60-bodega-node.conf` instead, holding the same line without `export`, which the user's systemd session reads at the next login.
 
 ### Check
 
@@ -987,23 +999,30 @@ The name column is the namespace, `github`.
 
 ## osquery
 
-doctor loads bodega's osquery extension, which an `origins` source needs; the setup script merges bodega's flags into the flagfile `osqueryd` reads, writes the enroll secret and restarts `osqueryd`:
+Two tools connect `osqueryd`, and a source that sets `origins` needs both.
+The setup script merges bodega's flags into the flagfile `osqueryd` reads, writes the enroll secret and restarts `osqueryd`.
+doctor installs bodega's osquery extension, which the schedule of an `origins` source reads; for any other source it refuses with `osquery source "osq" does not set origins, so its schedule reads no extension and --configure osquery has nothing to install`, and the setup script is all the host needs.
+
+For a source that sets `origins`, as root:
 
 ```bash
-sudo bodega doctor --configure osquery --apply --url https://bodega.example
 read -r BODEGA_OSQUERY_SECRET && export BODEGA_OSQUERY_SECRET
 sudo -E sh setup.sh --url https://bodega.example --systems osquery --apply   # setup.sh fetched and checked as the setup script describes
+sudo bodega doctor --configure osquery --apply --url https://bodega.example
+sudo systemctl restart osqueryd   # service osqueryd restart on FreeBSD
 ```
 
+The setup script restarts `osqueryd` before the extension exists, so the last restart is what loads it.
+doctor links the binary it runs as, and `osqueryd` autoloads only an extension owned by root and writable by no one else: install bodega with `install -o root -m 0755 bodega /usr/local/bin/bodega` first.
 Mint the secret on the server with `bodega osquery secret create osq web-01`.
 [Mode A](usage.md#mode-a-bodega-as-the-osquery-server) covers which flags bodega owns and how the merge keeps the rest.
 
 ### Files
 
-`/etc/osquery/osquery.flags` on Linux, `/usr/local/etc/osquery/osquery.flags` on FreeBSD, or the file `FLAG_FILE` or `osqueryd_flagfile` names.
-A Linux host with no flags file ends up with:
+The setup script writes the flagfile: `/etc/osquery/osquery.flags` on Linux, `/usr/local/etc/osquery/osquery.flags` on FreeBSD, or the file `FLAG_FILE` or `osqueryd_flagfile` names.
+A Linux host with no flagfile ends up with the following, and one that has a flagfile keeps its own lines beside these:
 
-<!-- clientconf: osquery osquery.flags -->
+<!-- clientconf: osquery osqueryd flagfile (linux) -->
 
 ```text
 --tls_hostname=bodega.example
@@ -1016,23 +1035,66 @@ A Linux host with no flags file ends up with:
 --host_identifier=uuid
 --logger_plugin=filesystem,tls
 --logger_tls_endpoint=/api/v1/inventory/sources/osq/log
+--extensions_autoload=/etc/osquery/extensions.load
 ```
 
-`/etc/osquery/bodega.secret` holds the enroll secret, mode 0600, owned by root.
-On FreeBSD `--tls_server_certs` is `/etc/ssl/cert.pem` and the secret is `/usr/local/etc/osquery/bodega.secret`.
+The last line appears only for a source that sets `origins`.
+On FreeBSD:
+
+<!-- clientconf: osquery osqueryd flagfile (freebsd) -->
+
+```text
+--tls_hostname=bodega.example
+--tls_server_certs=/etc/ssl/cert.pem
+--enroll_secret_path=/usr/local/etc/osquery/bodega.secret
+--enroll_tls_endpoint=/api/v1/inventory/sources/osq/enroll
+--config_plugin=tls
+--config_tls_endpoint=/api/v1/inventory/sources/osq/config
+--config_refresh=3600
+--host_identifier=uuid
+--logger_plugin=filesystem,tls
+--logger_tls_endpoint=/api/v1/inventory/sources/osq/log
+--extensions_autoload=/usr/local/etc/osquery/extensions.load
+```
+
+`/etc/osquery/bodega.secret` (`/usr/local/etc/osquery/bodega.secret` on FreeBSD) holds the enroll secret, mode 0600, owned by root.
+
+doctor writes three things, on Linux and FreeBSD alike apart from the autoload path:
+
+- `/usr/local/lib/bodega/bodega.ext`, a symbolic link to the bodega binary:
+
+  ```bash
+  sudo install -d -o root -m 0755 /usr/local/lib/bodega
+  sudo ln -sfn /usr/local/bin/bodega /usr/local/lib/bodega/bodega.ext
+  ```
+
+- the autoload file, `/etc/osquery/extensions.load` on Linux and `/usr/local/etc/osquery/extensions.load` on FreeBSD, gaining one line and keeping every other:
+
+  ```text
+  /usr/local/lib/bodega/bodega.ext
+  ```
+
+- `--extensions_autoload=/etc/osquery/extensions.load` (`/usr/local/etc/osquery/extensions.load` on FreeBSD), appended to the flagfile only when no line there sets `--extensions_autoload`.
+  After the setup script, the line is already there and doctor leaves the flagfile alone.
+
+A flagfile whose `--extensions_autoload` names another file keeps it: doctor adds its line to that file instead of the default, because replacing the flag would drop every extension the file lists.
+A value that is not a clean absolute path is refused, naming the flagfile, and nothing is written.
 
 ### Check
 
-osqueryd talks to bodega's API, which writes no `serve_fetch` row.
-A failed enrollment is a `denied` row naming the check that failed, and a working host shows in `bodega inventory hosts`:
+`osqueryd` fetches its config at start and every `--config_refresh` seconds after, and each fetch bodega answers is a `serve_fetch` row whose name is the source and whose identity is the secret's:
 
 ```bash
-bodega audit events --type denied --client 192.0.2.10
-bodega inventory hosts
+bodega audit events --type serve_fetch --pkg-type osquery --client 192.0.2.10
+bodega audit events --type denied --client 192.0.2.10   # a failed enrollment, naming the check
 ```
+
+A host that has reported shows in `bodega inventory hosts`.
 
 ### Traps
 
+- **A bodega binary root does not own.** `osqueryd` skips such an extension without loading it, so doctor refuses first.
+  You see `osqueryd autoloads only an extension owned by root and writable by no one else`, with the `install` command that fixes it.
 - **A plaintext `public_url`.** osquery speaks only HTTPS to its tls plugins, so the plan skips osquery.
   You see the plan's `osquery` record skip with `osqueryd speaks only https to its server`.
 - **A private CA added only to osquery's own bundle.** `--tls_server_certs` names the system trust store.

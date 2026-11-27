@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -33,6 +34,9 @@ func (s *Server) setupInventory() {
 	s.inventory.OnRefusal = func(r *http.Request, reason string, details map[string]string) {
 		recordDenial(s.auditDB, r, reason, details)
 	}
+	s.inventory.OnServed = func(r *http.Request, identity string, details map[string]string) {
+		recordInventoryServed(s.auditDB, r, identity, details)
+	}
 	s.reconciler = s.newReconciler(instances)
 	s.inventory.OnReport = s.reconciler.Ingested
 	s.inventory.HashSecret = func(secret string) (string, error) {
@@ -48,6 +52,37 @@ func (s *Server) setupInventory() {
 		s.logger.Info("inventory source configured", "instance", inst.Name,
 			"type", inst.Source.Type(), "mode", inst.Source.Mode(), "enabled", inst.Enabled)
 	}
+}
+
+// recordInventoryServed writes the serve_fetch row for an inventory route
+// that answered a client: osqueryd's config fetch. AuditMiddleware leaves
+// every /api/ path out, because the rest of the API is operators and tools
+// rather than hosts, so the one route a host polls records its own row, under
+// the source's instance as the name, rather than the exclusion being lifted.
+func recordInventoryServed(db *audit.DB, r *http.Request, identity string, details map[string]string) {
+	if db == nil || !db.ShouldRecord(audit.EventServeFetch) {
+		return
+	}
+	extra := map[string]string{"method": r.Method, "path": truncateField(r.URL.Path, maxDetailField)}
+	for k, v := range details {
+		extra[k] = truncateField(v, maxDetailField)
+	}
+	blob, err := json.Marshal(extra)
+	if err != nil {
+		blob = []byte("{}")
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	_ = db.Record(ctx, audit.Event{
+		EventType: audit.EventServeFetch,
+		PkgType:   clientconf.SystemOsquery,
+		PkgName:   details["instance"],
+		ClientIP:  ClientIP(r),
+		Identity:  identity,
+		UserAgent: truncateField(r.UserAgent(), maxDetailField),
+		Status:    "success",
+		Details:   string(blob),
+	})
 }
 
 // freeBSDPlanTags are the pkg repository names planFreeBSD writes for any

@@ -1,7 +1,6 @@
 package clientconf
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,9 +23,11 @@ const clientsDocBase = "https://bodega.example"
 var clientsDocPath = filepath.Join("..", "..", "docs", "clients.md")
 
 // clientsDocInputs is a server serving every type: one namespace per
-// upstream map, Ubuntu's noble with its pockets, FreeBSD's latest, two dnf
-// repositories, a binary link and an osquery server-mode source. Each input
-// is the smallest one that makes ForType render the type's file.
+// upstream map, Ubuntu's noble with its pockets and a tailscale vendor
+// archive, FreeBSD's latest, a Rocky 9 host with its three repositories
+// configured, three oci_upstreams registries, a binary link and an osquery
+// server-mode source that sets origins. Each input is the smallest one that
+// makes ForType render the file the page shows.
 func clientsDocInputs(t *testing.T) Inputs {
 	t.Helper()
 	repo, err := pkgrepos.Render(pkgrepos.State{
@@ -38,6 +39,10 @@ func clientsDocInputs(t *testing.T) Inputs {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rocky, ok := RpmDistroFor("rocky", "9")
+	if !ok {
+		t.Fatal("the rpm table has no rocky 9 row")
+	}
 	return Inputs{
 		Base:            clientsDocBase,
 		GitUpstreams:    map[string]config.GitUpstream{"github": {URL: "https://github.com/"}},
@@ -47,40 +52,17 @@ func clientsDocInputs(t *testing.T) Inputs {
 			Suites:    []string{"noble", "noble-updates", "noble-security"},
 			Mirrored:  true,
 		})},
-		FreeBSD:  []pkgrepos.Repo{repo},
-		Binary:   []BinaryLink{{Filename: "kubectl", Path: "kubernetes/release/v1.34.2/bin/linux/amd64/kubectl"}},
-		Osquery:  &OsqueryPlan{Instance: "osq", Mode: "server", Endpoint: clientsDocBase + "/api/v1/inventory/sources/osq", Interval: 3600},
-		RpmRepos: []string{"rocky-appstream", "rocky-baseos", "epel"},
-	}
-}
-
-// clientsDocCompanions are the files a plan serves beside ForType's: under a
-// file= or archive= parameter, the dnf file a Rocky 9 host's plan carries,
-// and the osquery flags a host with no flags file ends up with. Each comes
-// from the renderer that serves it, so a block they back is checked like any
-// other.
-func clientsDocCompanions(t *testing.T) map[string][]File {
-	t.Helper()
-	rocky, ok := RpmDistroFor("rocky", "9")
-	if !ok {
-		t.Fatal("the rpm table has no rocky 9 row")
-	}
-	dnf, _ := RpmHost(clientsDocBase, rocky, func(string) bool { return true })
-	var flags strings.Builder
-	for _, f := range OsqueryFlags(clientsDocBase, OsqueryPlan{Endpoint: clientsDocBase + "/api/v1/inventory/sources/osq", Interval: 3600}, OSLinux) {
-		if f.Rule != OsqueryFlagInclude {
-			fmt.Fprintf(&flags, "--%s=%s\n", f.Name, f.Value)
-		}
-	}
-	return map[string][]File{
-		manifest.TypeApt: {AptArchiveIn(clientsDocBase, "tailscale", "tailscale/noble", []string{"main"})},
-		manifest.TypeOCI: {
-			ContainerdHosts(clientsDocBase, "ghcr.io", "https://ghcr.io"),
-			ContainerdConfig(clientsDocBase),
-			RegistriesConf(clientsDocBase, []string{"docker.io", "ghcr.io", "quay.io"}),
+		FreeBSD:     []pkgrepos.Repo{repo},
+		Binary:      []BinaryLink{{Filename: "kubectl", Path: "kubernetes/release/v1.34.2/bin/linux/amd64/kubectl"}},
+		Osquery:     &OsqueryPlan{Instance: "osq", Mode: "server", Endpoint: clientsDocBase + "/api/v1/inventory/sources/osq", Interval: 3600, Origins: true},
+		RpmRepos:    []string{"rocky-appstream", "rocky-baseos", "epel"},
+		AptArchives: []AptArchiveRef{{Archive: "tailscale", Key: "tailscale/noble", Components: []string{"main"}}},
+		RpmDistro:   &rocky,
+		OCIUpstreams: map[string]string{
+			"docker.io": "https://registry-1.docker.io",
+			"ghcr.io":   "https://ghcr.io",
+			"quay.io":   "https://quay.io",
 		},
-		manifest.TypeRpm: {dnf},
-		SystemOsquery:    {{System: SystemOsquery, Label: "osquery.flags", Content: flags.String()}},
 	}
 }
 
@@ -189,9 +171,8 @@ func TestClientsDocFilesMatchRenderer(t *testing.T) {
 		t.Fatal("docs/clients.md carries no <!-- clientconf: {system} {label} --> marker")
 	}
 	in := clientsDocInputs(t)
-	companions := clientsDocCompanions(t)
 	for _, b := range blocks {
-		files := append(ForType(b.system, in), companions[b.system]...)
+		files := ForType(b.system, in)
 		var match []File
 		var labels []string
 		for _, f := range files {
@@ -341,5 +322,54 @@ func TestClientsDocLinksUsageAndIsListed(t *testing.T) {
 	}
 	if !strings.Contains(docs, "(docs/clients.md)") {
 		t.Error("README.md's Documentation section does not list docs/clients.md")
+	}
+}
+
+func TestReviewF124NpmCommandTargetsInstallingUser(t *testing.T) {
+	sections, _ := clientsDocSections(readClientsDoc(t))
+	command := regexp.MustCompile(`(?m)^(?:sudo )?bodega doctor --configure npm[^\n]*`).FindString(sections["npm"])
+	if command == "" {
+		t.Fatal("npm section has no doctor command")
+	}
+	home := "/home/operator"
+	if strings.HasPrefix(command, "sudo ") {
+		home = "/root"
+	}
+	target, err := TargetPath(Npm(clientsDocBase, nil).Path(OSLinux), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "/home/operator/.npmrc" {
+		t.Fatalf("documented command %q configures %s, leaving /home/operator/.npmrc unchanged", command, target)
+	}
+}
+
+func TestReviewF124OsqueryListsDoctorFiles(t *testing.T) {
+	sections, _ := clientsDocSections(readClientsDoc(t))
+	body := sections["osquery"]
+	for _, goos := range []string{OSLinux, OSFreeBSD} {
+		for _, path := range []string{OsqueryExtensionPaths[goos], OsqueryAutoloadPaths[goos]} {
+			if !strings.Contains(body, path) {
+				t.Errorf("osquery section omits doctor's %s file %s", goos, path)
+			}
+		}
+	}
+	if !strings.Contains(body, "--extensions_autoload=") {
+		t.Error("osquery section omits the flag that makes osqueryd load the extension")
+	}
+}
+
+func TestReviewF124EveryMarkerNamesForTypeFile(t *testing.T) {
+	in := clientsDocInputs(t)
+	for _, block := range clientsDocBlocks(t, readClientsDoc(t)) {
+		found := false
+		for _, file := range ForType(block.system, in) {
+			if file.Label == block.label || file.Label+" ("+file.Scope+")" == block.label {
+				found = strings.TrimRight(file.Content, "\n") == strings.TrimRight(block.body, "\n")
+			}
+		}
+		if !found {
+			t.Errorf("docs/clients.md:%d: ForType(%q) has no matching file %q", block.line, block.system, block.label)
+		}
 	}
 }

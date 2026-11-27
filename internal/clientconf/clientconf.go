@@ -695,6 +695,36 @@ func Osquery(base string, src OsqueryPlan) []File {
 	return out
 }
 
+// OsqueryFlagfile renders the flagfile setup.sh leaves on a goos host that
+// had none: every flag OsqueryFlags sets or defaults, in that order. A host
+// with a flagfile keeps its own lines beside these, so this is the file to
+// write by hand, not one to install over an existing one. Content is empty
+// when base or the endpoint does not parse.
+func OsqueryFlagfile(base string, src OsqueryPlan, goos string) File {
+	var sb strings.Builder
+	for _, f := range OsqueryFlags(base, src, goos) {
+		if f.Rule != OsqueryFlagInclude {
+			sb.WriteString("--" + f.Name + "=" + f.Value + "\n")
+		}
+	}
+	return File{
+		System:  SystemOsquery,
+		Label:   "osqueryd flagfile",
+		Scope:   goos,
+		Paths:   map[string]string{goos: OsqueryFlagsPaths[goos]},
+		Content: sb.String(),
+	}
+}
+
+// AptArchiveRef is one vendor archive a host asks for with archive=: the
+// apt_upstreams key, the archive it is mirrored in ("" for the default), and
+// the components its stanza lists.
+type AptArchiveRef struct {
+	Archive    string
+	Key        string
+	Components []string
+}
+
 // Inputs are the facts a type's rendering needs beyond the base URL. Apt and
 // FreeBSD arrive rendered, because their state differs between the running
 // server and the TUI's view of the key files, and each resolves its own.
@@ -713,6 +743,18 @@ type Inputs struct {
 	Osquery *OsqueryPlan
 	// RpmRepos is the rpm_upstreams keys, one dnf repository section each.
 	RpmRepos []string
+	// AptArchives are the vendor archives a host installs beside Apt's
+	// stanzas, one stanza each.
+	AptArchives []AptArchiveRef
+	// RpmDistro is the distribution a host runs. Set, the rpm file is the
+	// one that host's plan installs: its distribution's repositories that
+	// RpmRepos configures, each naming the local key files, rather than
+	// every repository with the keys as URLs.
+	RpmDistro *RpmDistro
+	// OCIUpstreams is oci_upstreams, registry name to fetch URL. Set, the oci
+	// files are the set doctor installs for those registries rather than the
+	// pane's daemon.json and one hosts.toml.
+	OCIUpstreams map[string]string
 }
 
 // ForType renders every file a client of entryType installs. It is the one
@@ -737,9 +779,20 @@ func ForType(entryType string, in Inputs) []File {
 	case manifest.TypeComposer:
 		out = append(out, Composer(in.Base))
 	case manifest.TypeOCI:
-		out = append(out, OCI(in.Base)...)
+		if in.OCIUpstreams == nil {
+			out = append(out, OCI(in.Base)...)
+			break
+		}
+		for _, f := range OCIClient(in.Base, in.OCIUpstreams) {
+			out = append(out, f.File)
+		}
 	case manifest.TypeRpm:
-		out = append(out, Rpm(in.Base, in.RpmRepos))
+		if in.RpmDistro == nil {
+			out = append(out, Rpm(in.Base, in.RpmRepos))
+			break
+		}
+		f, _ := RpmHost(in.Base, *in.RpmDistro, func(up string) bool { return slices.Contains(in.RpmRepos, up) })
+		out = append(out, f)
 	case manifest.TypeGomod:
 		out = append(out, Gomod(in.Base))
 	case manifest.TypeHelm:
@@ -755,6 +808,9 @@ func ForType(entryType string, in Inputs) []File {
 		for _, src := range in.Apt {
 			out = append(out, Apt(src))
 		}
+		for _, a := range in.AptArchives {
+			out = append(out, AptArchiveIn(in.Base, a.Archive, a.Key, a.Components))
+		}
 	case manifest.TypeFreeBSD:
 		for _, repo := range in.FreeBSD {
 			out = append(out, FreeBSD(repo))
@@ -766,6 +822,9 @@ func ForType(entryType string, in Inputs) []File {
 	case SystemOsquery:
 		if in.Osquery != nil {
 			out = append(out, Osquery(in.Base, *in.Osquery)...)
+			for _, goos := range []string{OSLinux, OSFreeBSD} {
+				out = append(out, OsqueryFlagfile(in.Base, *in.Osquery, goos))
+			}
 		}
 	}
 	kept := out[:0]
