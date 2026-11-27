@@ -1333,3 +1333,66 @@ func TestReviewB201UpstreamCachePairsPackagesWithTheReleaseInHand(t *testing.T) 
 		t.Errorf("once the archive finished publishing, the rewrite lists curl %v, want 8.5-3: the Release cached mid-sync kept failing the digest check", got)
 	}
 }
+
+func TestAuditB201CacheRevalidationKeepsNamedPoolAuthority(t *testing.T) {
+	a := newFixtureArchive(t, map[string]string{})
+	b := newFixtureArchive(t, map[string]string{})
+	if a.URL() > b.URL() {
+		a, b = b, a
+	}
+	decoy, home := a, b
+	const decoyBody = "\x21<arch>\nnginx from the other archive root"
+	now := time.Now().UTC().Truncate(time.Second)
+	original := hideGroupDists("named", map[string]string{"amd64": fixturePackages(fixtureDeb, fixtureDebBody)})
+	original["dists/named/Release"] = "Date: " + now.Add(-48*time.Hour).Format(time.RFC1123Z) + "\n" + original["dists/named/Release"]
+	for rest, body := range original {
+		home.setObject(rest, body)
+	}
+	home.setObject(fixtureDeb, fixtureDebBody)
+	for rest, body := range hideGroupDists("other", map[string]string{"amd64": fixturePackages(fallbackDeb, fallbackDebBody)}) {
+		decoy.setObject(rest, body)
+	}
+	decoy.setObject(fixtureDeb, decoyBody)
+	s := mirrorServer(t)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"named": {{URL: home.URL()}}, "other": {{URL: decoy.URL()}},
+	}
+	ctx := t.Context()
+	names := s.cfg.MirroredAptCodenames()
+	before := s.buildAptPoolIndex(ctx, names)
+	if len(before.failed) != 0 {
+		t.Fatal(before.failed)
+	}
+	if _, ok := before.byKey[manifest.AptKey(fixtureDeb)]; !ok {
+		t.Fatal("initial paragraph missing")
+	}
+
+	for rest, body := range hideGroupDists("named", map[string]string{"amd64": ""}) {
+		if strings.HasSuffix(rest, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123Z) + "\n" + body
+		}
+		home.setObject(rest, body)
+	}
+	for _, rest := range []string{"Release", "main/binary-amd64/Packages.gz"} {
+		if code, _ := mirrorGet(t, s, "/apt/dists/named/"+rest); code != http.StatusOK {
+			t.Fatalf("read temporary %s: %d", rest, code)
+		}
+	}
+	original["dists/named/Release"] = strings.Replace(original["dists/named/Release"], now.Add(-48*time.Hour).Format(time.RFC1123Z), now.Format(time.RFC1123Z), 1)
+	for rest, body := range original {
+		home.setObject(rest, body)
+	}
+	ageAptUpstreamCache(s, 2*s.cache.MetadataTTL)
+	after := s.buildAptPoolIndexFrom(ctx, names, before)
+	if len(after.failed) != 0 {
+		t.Fatal(after.failed)
+	}
+	s.aptPoolIdx.idx = after
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Errorf("GET restored named path = %d %q, want 200 and %q from its declaring root", code, body, fixtureDebBody)
+	}
+	if n := decoy.count(fixtureDeb); n != 0 {
+		t.Errorf("unnamed root served restored named path %d times; want 0", n)
+	}
+}
